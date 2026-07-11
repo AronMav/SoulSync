@@ -4798,11 +4798,11 @@ async function openBlacklistModal() {
             return;
         }
 
-        const serviceIcons = { soulseek: '🔍', youtube: '▶️', tidal: '🌊', qobuz: '🎵', hifi: '🎧', deezer_dl: '💜' };
+        const serviceIcons = { soulseek: '🔍', youtube: '▶️', tidal: '🌊', qobuz: '🎵', yandex: '🟡', hifi: '🎧', deezer_dl: '💜' };
 
         body.innerHTML = data.entries.map(e => {
             const displayFile = (e.blocked_filename || '').replace(/\\/g, '/').split('/').pop() || 'Unknown';
-            const svc = e.blocked_username && ['youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl'].includes(e.blocked_username) ? e.blocked_username : 'soulseek';
+            const svc = e.blocked_username && ['youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'yandex'].includes(e.blocked_username) ? e.blocked_username : 'soulseek';
             const icon = serviceIcons[svc] || '🔍';
             const ago = e.created_at ? timeAgo(e.created_at) : '';
             return `

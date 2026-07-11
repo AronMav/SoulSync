@@ -3863,7 +3863,7 @@ function updateServiceStatus(service, statusData, spotifyStatus = null) {
 
     // Update download source title on dashboard card
     if (service === 'soulseek' && statusData.source) {
-        const sourceNames = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', hifi: 'HiFi', deezer_dl: 'Deezer', amazon: 'Amazon', lidarr: 'Lidarr', soundcloud: 'SoundCloud', torrent: 'Torrent', usenet: 'Usenet', hybrid: 'Hybrid' };
+        const sourceNames = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', yandex: 'Yandex Music', hifi: 'HiFi', deezer_dl: 'Deezer', amazon: 'Amazon', lidarr: 'Lidarr', soundcloud: 'SoundCloud', torrent: 'Torrent', usenet: 'Usenet', hybrid: 'Hybrid' };
         const displayName = sourceNames[statusData.source] || 'Download Source';
         const titleEl = document.getElementById('download-source-title');
         if (titleEl) titleEl.textContent = displayName;
@@ -3908,7 +3908,7 @@ function updateSidebarServiceStatus(service, statusData, spotifyStatus = null) {
 
         // Update download source name based on configured mode
         if (service === 'soulseek' && statusData.source) {
-            const sourceNames = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', hifi: 'HiFi', deezer_dl: 'Deezer', amazon: 'Amazon', lidarr: 'Lidarr', soundcloud: 'SoundCloud', torrent: 'Torrent', usenet: 'Usenet', hybrid: 'Hybrid' };
+            const sourceNames = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', yandex: 'Yandex Music', hifi: 'HiFi', deezer_dl: 'Deezer', amazon: 'Amazon', lidarr: 'Lidarr', soundcloud: 'SoundCloud', torrent: 'Torrent', usenet: 'Usenet', hybrid: 'Hybrid' };
             const displayName = sourceNames[statusData.source] || 'Download Source';
             const sidebarName = document.getElementById('download-source-name');
             if (sidebarName) sidebarName.textContent = displayName;

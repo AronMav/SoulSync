@@ -559,6 +559,12 @@ class ConfigManager:
                     "user_auth_token": ""
                 }
             },
+            "yandex": {
+                # RU-native lossless (FLAC 16/44.1). Requires Yandex Plus + OAuth token.
+                # Token read from this setting or the YANDEX_MUSIC_TOKEN env var.
+                "token": "",
+                "ymdl_bin": "yandex-music-downloader"
+            },
             "hifi_download": {
                 "quality": "lossless",  # Options: "low", "high", "lossless", "hires"
             },

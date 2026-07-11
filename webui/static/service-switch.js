@@ -35,7 +35,7 @@ const _SS_BRAND = {
     discogs: '#ff5500', musicbrainz: '#ba478f', amazon: '#ff9900', jiosaavn: '#2bc5b4',
     plex: '#e5a00d', jellyfin: '#aa5cc3', navidrome: '#3b6cf6', soulsync: '#7c5cff',
     soulseek: '#22a7f0', youtube: '#ff0000', tidal: '#00cfe8', qobuz: '#0a6e9e',
-    hifi: '#16c79a', torrent: '#8a2be2', usenet: '#e67e22',
+    yandex: '#ffcc00', hifi: '#16c79a', torrent: '#8a2be2', usenet: '#e67e22',
 };
 function _ssBrand(id) { return _SS_BRAND[id] || 'var(--accent-light-rgb-hex, #7c5cff)'; }
 

@@ -810,6 +810,7 @@ const HYBRID_SOURCES = [
     { id: 'youtube', name: 'YouTube', icon: 'https://www.svgrepo.com/show/13671/youtube.svg', emoji: '▶️' },
     { id: 'tidal', name: 'Tidal', icon: 'https://www.svgrepo.com/show/519734/tidal.svg', emoji: '🌊' },
     { id: 'qobuz', name: 'Qobuz', icon: 'https://www.svgrepo.com/show/504778/qobuz.svg', emoji: '🎧' },
+    { id: 'yandex', name: 'Yandex Music', icon: null, emoji: '🟡' },
     { id: 'hifi', name: 'HiFi', icon: null, emoji: '🎶' },
     { id: 'deezer_dl', name: 'Deezer', icon: 'https://www.svgrepo.com/show/519734/deezer.svg', emoji: '🎧' },
     { id: 'amazon', name: 'Amazon Music', icon: null, emoji: '🛒' },
@@ -821,7 +822,7 @@ const HYBRID_SOURCES = [
 const ALBUM_LEVEL_HYBRID_SOURCES = new Set(['soulseek', 'torrent', 'usenet']);
 
 let _hybridSourceOrder = ['soulseek', 'youtube'];
-let _hybridSourceEnabled = { soulseek: true, youtube: true, tidal: false, qobuz: false, hifi: false, deezer_dl: false, amazon: false, lidarr: false, soundcloud: false, torrent: false, usenet: false };
+let _hybridSourceEnabled = { soulseek: true, youtube: true, tidal: false, qobuz: false, yandex: false, hifi: false, deezer_dl: false, amazon: false, lidarr: false, soundcloud: false, torrent: false, usenet: false };
 let _hybridVisualOrder = null; // Full visual order including disabled sources
 // In hybrid mode, only one source's config panel is shown at a time (clicked
 // open from its row), so the long per-source config blocks don't all stack up.
@@ -2282,6 +2283,7 @@ function updateHybridSecondaryOptions() {
         { value: 'youtube', label: 'YouTube' },
         { value: 'tidal', label: 'Tidal' },
         { value: 'qobuz', label: 'Qobuz' },
+        { value: 'yandex', label: 'Yandex Music' },
         { value: 'hifi', label: 'HiFi' },
         { value: 'deezer_dl', label: 'Deezer' },
         { value: 'amazon', label: 'Amazon Music' },

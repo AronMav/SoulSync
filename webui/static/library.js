@@ -5015,8 +5015,8 @@ async function showTrackSourceInfo(track, anchorEl) {
             return;
         }
 
-        const serviceIcons = { soulseek: '🔍', youtube: '▶️', tidal: '🌊', qobuz: '🎵', hifi: '🎧', deezer: '💜', lidarr: '📦', amazon: '🛒', soundcloud: '☁️', auto_import: '📥', staging: '📥', torrent: '🧲', usenet: '📰' };
-        const serviceLabels = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', hifi: 'HiFi', deezer: 'Deezer', lidarr: 'Lidarr', amazon: 'Amazon Music', soundcloud: 'SoundCloud', auto_import: 'Auto-Import', staging: 'Staging', torrent: 'Torrent', usenet: 'Usenet' };
+        const serviceIcons = { soulseek: '🔍', youtube: '▶️', tidal: '🌊', qobuz: '🎵', yandex: '🟡', hifi: '🎧', deezer: '💜', lidarr: '📦', amazon: '🛒', soundcloud: '☁️', auto_import: '📥', staging: '📥', torrent: '🧲', usenet: '📰' };
+        const serviceLabels = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', yandex: 'Yandex Music', hifi: 'HiFi', deezer: 'Deezer', lidarr: 'Lidarr', amazon: 'Amazon Music', soundcloud: 'SoundCloud', auto_import: 'Auto-Import', staging: 'Staging', torrent: 'Torrent', usenet: 'Usenet' };
 
         const dl = data.downloads[0]; // Most recent download
         const icon = serviceIcons[dl.source_service] || '📦';
@@ -5346,8 +5346,8 @@ async function _streamRedownloadSources(overlay, track, metadata) {
     const startBtn = document.getElementById('redownload-start-btn');
     if (!columnsEl) return;
 
-    const serviceIcons = { soulseek: '🔍', youtube: '▶️', tidal: '🌊', qobuz: '🎵', hifi: '🎧', deezer_dl: '💜', hybrid: '⚡', lidarr: '📦', amazon: '🛒', soundcloud: '☁️', torrent: '🧲', usenet: '📰' };
-    const serviceLabels = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', hifi: 'HiFi', deezer_dl: 'Deezer', hybrid: 'Auto', lidarr: 'Lidarr', amazon: 'Amazon Music', soundcloud: 'SoundCloud', torrent: 'Torrent', usenet: 'Usenet' };
+    const serviceIcons = { soulseek: '🔍', youtube: '▶️', tidal: '🌊', qobuz: '🎵', yandex: '🟡', hifi: '🎧', deezer_dl: '💜', hybrid: '⚡', lidarr: '📦', amazon: '🛒', soundcloud: '☁️', torrent: '🧲', usenet: '📰' };
+    const serviceLabels = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', yandex: 'Yandex Music', hifi: 'HiFi', deezer_dl: 'Deezer', hybrid: 'Auto', lidarr: 'Lidarr', amazon: 'Amazon Music', soundcloud: 'SoundCloud', torrent: 'Torrent', usenet: 'Usenet' };
 
     let allCandidates = [];
     let firstResult = true;
@@ -5469,8 +5469,8 @@ async function _streamRedownloadSources(overlay, track, metadata) {
 
 /* _renderRedownloadStep2 removed — replaced by _streamRedownloadSources above */
 if (false) {
-    const serviceIcons = { soulseek: '🔍', youtube: '▶️', tidal: '🌊', qobuz: '🎵', hifi: '🎧', deezer_dl: '💜', hybrid: '⚡', lidarr: '📦', amazon: '🛒', soundcloud: '☁️', torrent: '🧲', usenet: '📰' };
-    const serviceLabels = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', hifi: 'HiFi', deezer_dl: 'Deezer', hybrid: 'Auto', lidarr: 'Lidarr', amazon: 'Amazon Music', soundcloud: 'SoundCloud', torrent: 'Torrent', usenet: 'Usenet' };
+    const serviceIcons = { soulseek: '🔍', youtube: '▶️', tidal: '🌊', qobuz: '🎵', yandex: '🟡', hifi: '🎧', deezer_dl: '💜', hybrid: '⚡', lidarr: '📦', amazon: '🛒', soundcloud: '☁️', torrent: '🧲', usenet: '📰' };
+    const serviceLabels = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', yandex: 'Yandex Music', hifi: 'HiFi', deezer_dl: 'Deezer', hybrid: 'Auto', lidarr: 'Lidarr', amazon: 'Amazon Music', soundcloud: 'SoundCloud', torrent: 'Torrent', usenet: 'Usenet' };
 
     // Group candidates by source service
     const grouped = {};

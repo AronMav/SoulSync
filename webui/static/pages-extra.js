@@ -2910,7 +2910,7 @@ const _VERIF_QUAR_TRIGGERS = {
 // Streaming sources carry their service name in source_username; a Soulseek
 // download carries the uploader's peer name instead — collapse that to
 // 'soulseek' so the label matches the Completed view's download-source line.
-const _VERIF_QUAR_STREAMING_SOURCES = ['youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'torrent', 'usenet'];
+const _VERIF_QUAR_STREAMING_SOURCES = ['youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex', 'torrent', 'usenet'];
 
 function _verifQuarSourceLabel(q) {
     const u = String(q.source_username || '').toLowerCase();

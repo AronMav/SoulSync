@@ -104,7 +104,7 @@ class StatusDeps:
 # slskd's live_transfers path and must NOT hit the engine fallback.
 _STREAMING_SOURCE_NAMES = frozenset((
     'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon',
-    'torrent', 'usenet',
+    'yandex', 'torrent', 'usenet',
 ))
 _RELEASE_SOURCE_NAMES = frozenset(('torrent', 'usenet'))
 

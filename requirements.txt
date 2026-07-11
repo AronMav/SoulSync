@@ -82,3 +82,11 @@ simple-websocket==1.1.0
 # it's missing or fails, so this is never a hard runtime requirement.
 spotipyFree>=1.1.2,<2
 websockets>=12  # required by SpotipyFree/spotapi, not pulled in automatically
+
+# --- Yandex Music source (custom, RU-native lossless) ---
+# Search via yandex-music lib; download via the yandex-music-downloader CLI (ymd).
+# ymd is GitHub-only (not on PyPI); install in the Dockerfile with:
+#   pip install https://github.com/llistochek/yandex-music-downloader/archive/refs/heads/main.zip
+yandex-music>=3.0.0
+pycryptodome>=3.20
+StrEnum>=0.4.15

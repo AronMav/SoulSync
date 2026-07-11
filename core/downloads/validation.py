@@ -116,7 +116,7 @@ def get_valid_candidates(results, spotify_track, query):
     # a slskd-style ``Artist/Album/Track.flac`` path, so the Soulseek matcher would extract
     # garbage segments from it. Routing them through the streaming path means score_track_match
     # reads ``r.title`` and ``r.artist`` directly (which the torrent/usenet projections pre-fill).
-    _streaming_sources = ("youtube", "tidal", "qobuz", "hifi", "deezer_dl", "soundcloud", "amazon", "torrent", "usenet")
+    _streaming_sources = ("youtube", "tidal", "qobuz", "hifi", "deezer_dl", "soundcloud", "amazon", "yandex", "torrent", "usenet")
     if results[0].username in _streaming_sources:
         source_label = results[0].username.replace('_dl', '').title()
         expected_artists = spotify_track.artists if spotify_track else []
@@ -135,6 +135,11 @@ def get_valid_candidates(results, spotify_track, query):
         expected_is_version = any(kw in expected_title_lower for kw in _version_keywords)
 
         scored = []
+        # NB: 'yandex' intentionally NOT here — Yandex track durations often differ from
+        # Spotify's by more than the integrity tolerance for the *same* recording (different
+        # masters/edits), so a strict pre-download duration gate causes false rejections.
+        # The version-keyword penalty, artist gate, 0.60 score threshold and post-download
+        # AcoustID verification already guard against wrong-version/wrong-track downloads.
         _strict_duration_sources = {'tidal', 'qobuz', 'hifi', 'deezer_dl', 'amazon'}
         for r in results:
             if (

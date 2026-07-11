@@ -5463,7 +5463,7 @@ async function streamTrack(index) {
         console.log(`🎵 Streaming track:`, result);
 
         // Check for unsupported formats before streaming (streaming sources use encoded filenames, skip check)
-        const isStreamingSource = result.username === 'youtube' || result.username === 'tidal' || result.username === 'qobuz' || result.username === 'hifi';
+        const isStreamingSource = result.username === 'youtube' || result.username === 'tidal' || result.username === 'qobuz' || result.username === 'hifi' || result.username === 'yandex';
         if (!isStreamingSource && result.filename) {
             const format = getFileExtension(result.filename);
             console.log(`🎵 [STREAM CHECK] File: ${result.filename}, Extension: ${format}`);
@@ -5502,7 +5502,7 @@ async function streamAlbumTrack(albumIndex, trackIndex) {
         console.log(`🎵 Album data:`, album);
 
         // Surgical Fix: Handle YouTube/Tidal results which are "flat" (no tracks array)
-        if (album.username === 'youtube' || album.username === 'tidal' || album.username === 'qobuz' || album.username === 'hifi') {
+        if (album.username === 'youtube' || album.username === 'tidal' || album.username === 'qobuz' || album.username === 'hifi' || album.username === 'yandex') {
             // For YouTube/Tidal results, the "album" is actually the track itself
             const track = album;
             const trackData = {
@@ -5539,7 +5539,7 @@ async function streamAlbumTrack(albumIndex, trackIndex) {
         console.log(`🎵 Enhanced track data:`, trackData);
 
         // Check for unsupported formats before streaming (streaming sources use encoded filenames, skip check)
-        const isStreamingSource2 = trackData.username === 'youtube' || trackData.username === 'tidal' || trackData.username === 'qobuz' || trackData.username === 'hifi';
+        const isStreamingSource2 = trackData.username === 'youtube' || trackData.username === 'tidal' || trackData.username === 'qobuz' || trackData.username === 'hifi' || trackData.username === 'yandex';
         if (!isStreamingSource2 && trackData.filename && !isAudioFormatSupported(trackData.filename)) {
             const format = getFileExtension(trackData.filename);
             showToast(`Sorry, ${format.toUpperCase()} format is not supported in web browsers. Try downloading instead.`, 'error');
