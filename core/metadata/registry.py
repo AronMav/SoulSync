@@ -18,11 +18,12 @@ logger = get_logger("metadata.registry")
 
 MetadataClientFactory = Callable[[], Any]
 
-METADATA_SOURCE_PRIORITY = ("deezer", "itunes", "spotify", "discogs", "hydrabase", "musicbrainz", "jiosaavn", "bandcamp")
+METADATA_SOURCE_PRIORITY = ("deezer", "yandex", "itunes", "spotify", "discogs", "hydrabase", "musicbrainz", "jiosaavn", "bandcamp")
 METADATA_SOURCE_LABELS = {
     "spotify": "Spotify",
     "itunes": "iTunes",
     "deezer": "Deezer",
+    "yandex": "Yandex Music",
     "discogs": "Discogs",
     "hydrabase": "Hydrabase",
     "musicbrainz": "MusicBrainz",
@@ -764,5 +765,9 @@ def get_client_for_source(
 
     if source == "bandcamp":
         return get_bandcamp_client()
+
+    if source == "yandex":
+        from core.yandex_metadata_client import get_yandex_metadata_client
+        return get_yandex_metadata_client()
 
     return None

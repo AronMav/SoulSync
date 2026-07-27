@@ -29378,7 +29378,7 @@ def start_watchlist_scan():
         provider_info = metadata_service.get_provider_info()
 
         # Verify we have at least one working provider
-        if not provider_info['spotify_authenticated'] and not provider_info['itunes_available']:
+        if not provider_info['spotify_authenticated'] and not provider_info['itunes_available'] and provider_info.get('active_provider') not in ('yandex',):
             fallback_name = provider_info.get('fallback_source', 'iTunes').capitalize()
             return jsonify({
                 "success": False,

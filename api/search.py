@@ -173,8 +173,8 @@ def _serialize_artist(a):
     return {
         "id": a.id,
         "name": a.name,
-        "popularity": a.popularity,
-        "genres": a.genres,
-        "followers": a.followers,
-        "image_url": a.image_url,
+        "popularity": getattr(a, "popularity", 0),
+        "genres": getattr(a, "genres", []),
+        "followers": getattr(a, "followers", 0),
+        "image_url": getattr(a, "image_url", None),
     }
