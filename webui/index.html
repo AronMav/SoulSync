@@ -10971,6 +10971,7 @@
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
                             Ignored
                         </button>
+                        <button class="btn btn--secondary" onclick="openDeletedBlacklistModal()" title="Tracks you deleted from the library — never re-downloaded by automation. Un-block to allow them back.">🗑️ Deleted</button>
                         <button class="btn btn--secondary" onclick="cleanupWishlistOverview()">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/></svg>
                             Cleanup
@@ -12141,6 +12142,7 @@
     <script src="{{ url_for('static', filename='origin-history.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='watchlist-history.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='blocklist.js', v=static_v) }}"></script>
+    <script src="{{ url_for('static', filename='deleted-blacklist.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='service-switch.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='my-accounts.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='sync-services.js', v=static_v) }}"></script>
