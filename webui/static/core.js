@@ -472,6 +472,7 @@ function initializeWebSocket() {
     socket.on('enrichment:audiodb', (data) => updateAudioDBStatusFromData(data));
     socket.on('enrichment:discogs', (data) => updateDiscogsStatusFromData(data));
     socket.on('enrichment:deezer', (data) => updateDeezerStatusFromData(data));
+    socket.on('enrichment:yandex', (data) => updateYandexStatusFromData(data));
     socket.on('enrichment:jiosaavn', (data) => updateJioSaavnStatusFromData(data));
     socket.on('enrichment:spotify-enrichment', (data) => updateSpotifyEnrichmentStatusFromData(data));
     socket.on('enrichment:itunes-enrichment', (data) => updateiTunesEnrichmentStatusFromData(data));
