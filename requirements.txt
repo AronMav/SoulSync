@@ -83,3 +83,4 @@ simple-websocket==1.1.0
 spotipyFree>=1.1.2,<2
 websockets>=12  # required by SpotipyFree/spotapi, not pulled in automatically
 yandex-music>=3.0.0  # Yandex Music metadata + search (optional, used when YANDEX_MUSIC_TOKEN is set)
+yandex-music-downloader @ https://github.com/llistochek/yandex-music-downloader/archive/refs/heads/master.zip

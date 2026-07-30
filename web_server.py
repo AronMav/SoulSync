@@ -237,6 +237,7 @@ from core.musicbrainz_worker import MusicBrainzWorker
 from core.audiodb_worker import AudioDBWorker
 from core.discogs_worker import DiscogsWorker
 from core.deezer_worker import DeezerWorker
+from core.yandex_worker import YandexWorker
 from core.jiosaavn_worker import JioSaavnWorker
 from core.spotify_worker import SpotifyWorker
 from core.itunes_worker import iTunesWorker
@@ -2382,6 +2383,7 @@ SERVICE_CONFIG_REGISTRY = {
     'spotify':      {'required': ['client_id', 'client_secret']},
     'itunes':       {'always': True},   # default storefront works anon
     'deezer':       {'always': True},   # anon search works, premium ARL is optional
+    'yandex':       {'required': ['token']},   # one token = metadata + new-releases + enrichment + downloads
     'musicbrainz':  {'always': True},   # public API, no credentials required
     'amazon':       {'always': True},   # T2Tunes proxy, no credentials required
     'jiosaavn':     {'always': True},   # public proxy API, no credentials required
@@ -2528,6 +2530,7 @@ def _get_enrichment_status():
         ('spotify_enrichment', 'Spotify', lambda: spotify_enrichment_worker),
         ('itunes_enrichment', 'iTunes', lambda: itunes_enrichment_worker),
         ('deezer_enrichment', 'Deezer', lambda: deezer_worker),
+        ('yandex_enrichment', 'Yandex Music', lambda: yandex_worker),
         ('tidal_enrichment', 'Tidal', lambda: tidal_enrichment_worker),
         ('qobuz_enrichment', 'Qobuz', lambda: qobuz_enrichment_worker),
         ('lastfm', 'Last.fm', lambda: lastfm_worker),
@@ -2667,7 +2670,7 @@ def get_status():
             # don't depend on slskd being reachable — when one of these is the
             # active source, surface "connected" without probing slskd so the
             # dashboard / sidebar indicator stays green.
-            serverless_sources = ('youtube', 'hifi', 'qobuz', 'tidal', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon')
+            serverless_sources = ('youtube', 'hifi', 'qobuz', 'tidal', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex')
             is_serverless = (download_mode in serverless_sources or
                              (download_mode == 'hybrid' and
                               hybrid_order and any(s in serverless_sources for s in hybrid_order)))
@@ -7232,7 +7235,7 @@ def start_download():
             if download_id:
                 # Register download for post-processing (simple transfer to /Transfer)
                 context_key = _make_context_key(username, filename)
-                is_streaming_source = username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon')
+                is_streaming_source = username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex')
                 # Per-download check overrides: skip AcoustID and/or
                 # quality-quarantine checks on request.
                 _skip_checks = []
@@ -7668,7 +7671,7 @@ def get_download_status():
             all_streaming_downloads = run_async(download_orchestrator.get_all_downloads())
 
             for download in all_streaming_downloads:
-                if download.username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon'):
+                if download.username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex'):
                     source_label = download.username.title()
                     # Convert DownloadStatus to transfer format that frontend expects
                     streaming_transfer = {
@@ -7856,7 +7859,7 @@ def clear_finished_downloads():
 # (Soulseek uses a real peer username; everything else stamps the source string).
 _STREAMING_SOURCE_NAMES = frozenset((
     'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon',
-    'torrent', 'usenet',
+    'torrent', 'usenet', 'yandex',
 ))
 
 
@@ -8881,7 +8884,7 @@ def get_quarantine_audit_entry(entry_id):
         osr = ctx.get('original_search_result') if isinstance(ctx.get('original_search_result'), dict) else {}
         username = (osr.get('username') or '') if isinstance(osr, dict) else ''
         streaming = ('tidal', 'youtube', 'qobuz', 'hifi', 'deezer_dl',
-                     'lidarr', 'soundcloud', 'amazon')
+                     'lidarr', 'soundcloud', 'amazon', 'yandex')
         ti = ctx.get('track_info') if isinstance(ctx.get('track_info'), dict) else {}
         album_raw = ti.get('album', '')
         album_name = album_raw.get('name', '') if isinstance(album_raw, dict) else str(album_raw or '')
@@ -14188,6 +14191,17 @@ def _run_single_enrichment(service, entity_type, entity_id, name, artist_name):
             bandcamp_worker._process_track(entity_id, name, artist_name)
         return {"success": True, "message": f"Bandcamp lookup complete for {entity_type}"}
 
+    elif service == 'yandex':
+        if not yandex_worker:
+            return {"success": False, "error": "Yandex worker not initialized"}
+        if entity_type == 'artist':
+            yandex_worker._process_artist(entity_id, name)
+        elif entity_type == 'album':
+            yandex_worker._process_album(entity_id, name, artist_name)
+        elif entity_type == 'track':
+            yandex_worker._process_track(entity_id, name, artist_name)
+        return {"success": True, "message": f"Yandex lookup complete for {entity_type}"}
+
     else:
         return {"success": False, "error": f"Unknown service: {service}"}
 
@@ -14231,6 +14245,7 @@ _SERVICE_ID_COLUMNS = {
     'spotify': {'artist': 'spotify_artist_id', 'album': 'spotify_album_id', 'track': 'spotify_track_id'},
     'musicbrainz': {'artist': 'musicbrainz_id', 'album': 'musicbrainz_release_id', 'track': 'musicbrainz_recording_id'},
     'deezer': {'artist': 'deezer_id', 'album': 'deezer_id', 'track': 'deezer_id'},
+    'yandex': {'artist': 'yandex_id', 'album': 'yandex_id', 'track': 'yandex_id'},
     'audiodb': {'artist': 'audiodb_id', 'album': 'audiodb_id', 'track': 'audiodb_id'},
     'discogs': {'artist': 'discogs_id', 'album': 'discogs_id'},
     'itunes': {'artist': 'itunes_artist_id', 'album': 'itunes_album_id', 'track': 'itunes_track_id'},
@@ -14769,7 +14784,7 @@ def redownload_search_sources(track_id):
                         quality = ext if ext in ('FLAC', 'MP3', 'OPUS', 'OGG', 'M4A', 'WAV') else candidate.quality or ''
                         svc = source_name if source_name != 'default' else 'hybrid'
                         uname = candidate.username
-                        if uname in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon'):
+                        if uname in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex'):
                             svc = uname
                         source_candidates.append({
                             'username': uname,
@@ -20548,7 +20563,7 @@ def _try_source_reuse(task_id, batch_id, track):
     if not source_tracks or not last_source:
         _sr.info("Skipped — no source_tracks or no last_source")
         return False
-    if last_source.get('username') in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon'):
+    if last_source.get('username') in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex'):
         _sr.info(f"Skipped — {last_source.get('username')} source (no folder-based reuse)")
         return False
 
@@ -20650,7 +20665,7 @@ def _store_batch_source(batch_id, username, filename):
     """Browse the successful download's folder and store results on the batch for reuse."""
     _sr = source_reuse_logger
     _sr.info(f"_store_batch_source called: batch={batch_id}, user={username}, file={filename}")
-    if not batch_id or username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'torrent', 'usenet'):
+    if not batch_id or username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex', 'torrent', 'usenet'):
         _sr.info(f"Skipped — no batch_id or streaming source ({username})")
         return
 
@@ -24694,6 +24709,64 @@ def qobuz_auth_logout():
     try:
         download_orchestrator.client("qobuz").logout()
         _sync_qobuz_credentials_to_worker()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _yandex_account_login(token):
+    """Validate a Yandex token by initialising a client; return the account
+    login/display name, or raise on failure."""
+    import yandex_music
+    client = yandex_music.Client(token).init()
+    acct = getattr(getattr(client, 'me', None), 'account', None)
+    return getattr(acct, 'login', None) or getattr(acct, 'display_name', None) or 'Yandex account'
+
+
+@app.route('/api/yandex/auth/token', methods=['POST'])
+def yandex_auth_token():
+    """Validate + save a Yandex Music token. One token powers everything Yandex:
+    downloads, the new-release (watchlist) scan, and library enrichment — they
+    all read ``yandex.token``."""
+    try:
+        data = request.get_json(silent=True) or {}
+        token = (data.get('token') or '').strip()
+        if not token:
+            return jsonify({"success": False, "error": "Yandex token required"}), 400
+        try:
+            login = _yandex_account_login(token)
+        except Exception as e:
+            return jsonify({"success": False, "error": f"Invalid token: {e}"}), 400
+        config_manager.set('yandex.token', token)
+        # Refresh the shared metadata client so it re-inits with the new token.
+        try:
+            from core.yandex_metadata_client import get_yandex_metadata_client
+            get_yandex_metadata_client()
+        except Exception:
+            pass
+        return jsonify({"success": True, "account": login})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/yandex/auth/status', methods=['GET'])
+def yandex_auth_status():
+    """Whether a Yandex token is configured (+ account login if it validates)."""
+    token = (config_manager.get('yandex.token') or '').strip()
+    if not token:
+        return jsonify({"authenticated": False})
+    try:
+        login = _yandex_account_login(token)
+        return jsonify({"authenticated": True, "user": {"display_name": login}})
+    except Exception as e:
+        return jsonify({"authenticated": False, "error": str(e)})
+
+
+@app.route('/api/yandex/auth/logout', methods=['POST'])
+def yandex_auth_logout():
+    """Clear the saved Yandex token."""
+    try:
+        config_manager.set('yandex.token', '')
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -29524,12 +29597,12 @@ def select_my_service_credential():
 def _qs_metadata_sources():
     """Metadata sources offered in Connections / quick-switch UI."""
     from core.metadata.registry import EXPERIMENTAL_SOURCES, is_source_enabled
-    sources = ['spotify', 'spotify_free', 'itunes', 'deezer', 'discogs', 'musicbrainz']
+    sources = ['spotify', 'spotify_free', 'itunes', 'deezer', 'yandex', 'discogs', 'musicbrainz']
     sources += [name for name in EXPERIMENTAL_SOURCES if is_source_enabled(name)]
     return sources
 _QS_MEDIA_SERVERS = ['plex', 'jellyfin', 'navidrome', 'soulsync']
 # Single download sources (everything the mode accepts except 'hybrid').
-_QS_DOWNLOAD_SOURCES = ['soulseek', 'youtube', 'tidal', 'qobuz', 'hifi', 'torrent', 'usenet']
+_QS_DOWNLOAD_SOURCES = ['soulseek', 'youtube', 'tidal', 'qobuz', 'hifi', 'yandex', 'torrent', 'usenet']
 
 
 def _qs_metadata_available(source):
@@ -29538,6 +29611,8 @@ def _qs_metadata_available(source):
             return bool(spotify_client and spotify_client.is_spotify_authenticated())
         if source == 'discogs':
             return bool(config_manager.get('discogs.token'))
+        if source == 'yandex':
+            return bool(config_manager.get('yandex.token'))
         return True
     except Exception:
         return True
@@ -39005,6 +39080,21 @@ except Exception as e:
 # Deezer status / pause / resume routes are now served by the
 # generic enrichment blueprint at /api/enrichment/deezer/{status,pause,resume}.
 
+# --- Yandex Music Worker Initialization (artists-only enrichment) ---
+yandex_worker = None
+try:
+    from database.music_database import MusicDatabase
+    yandex_worker = YandexWorker(database=MusicDatabase())
+    yandex_worker.start()
+    if config_manager.get('yandex_enrichment_paused', False):
+        yandex_worker.pause()
+        logger.info("Yandex enrichment worker initialized (paused — restored from config)")
+    else:
+        logger.info("Yandex enrichment worker initialized and started")
+except Exception as e:
+    logger.error(f"Yandex worker initialization failed: {e}")
+    yandex_worker = None
+
 # ================================================================================================
 # END DEEZER INTEGRATION
 # ================================================================================================
@@ -41276,6 +41366,11 @@ _register_enrichment_services([
         config_paused_key='discogs_enrichment_paused',
     ),
     _EnrichmentService(
+        id='yandex', display_name='Yandex Music',
+        worker_getter=lambda: yandex_worker,
+        config_paused_key='yandex_enrichment_paused',
+    ),
+    _EnrichmentService(
         id='deezer', display_name='Deezer',
         worker_getter=lambda: deezer_worker,
         config_paused_key='deezer_enrichment_paused',
@@ -41460,6 +41555,7 @@ def _emit_enrichment_status_loop():
         'audiodb': lambda: audiodb_worker,
         'discogs': lambda: discogs_worker,
         'deezer': lambda: deezer_worker,
+        'yandex': lambda: yandex_worker,
         'jiosaavn': lambda: jiosaavn_worker,
         'spotify-enrichment': lambda: spotify_enrichment_worker,
         'itunes-enrichment': lambda: itunes_enrichment_worker,
