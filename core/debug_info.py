@@ -227,12 +227,12 @@ def get_debug_info():
     # connection state). Listed so the debug dump reflects the full
     # metadata surface SoulSync queries from, not just the auth-gated ones.
     info['services']['always_available_metadata_sources'] = [
-        'deezer', 'itunes', 'musicbrainz',
+        'deezer', 'yandex', 'itunes', 'musicbrainz',
     ]
 
     # Enrichment workers
     workers = {}
-    worker_names = ['musicbrainz', 'audiodb', 'deezer', 'jiosaavn', 'bandcamp', 'spotify', 'itunes', 'lastfm', 'genius', 'discogs', 'tidal', 'qobuz']
+    worker_names = ['musicbrainz', 'audiodb', 'deezer', 'yandex', 'jiosaavn', 'bandcamp', 'spotify', 'itunes', 'lastfm', 'genius', 'discogs', 'tidal', 'qobuz']
     for name in worker_names:
         paused_key = f'{name}_enrichment_paused'
         workers[name] = 'paused' if config_manager.get(paused_key, False) else 'active'
