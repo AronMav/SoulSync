@@ -108,6 +108,24 @@ _VERSION_KEYWORDS = ['remix', 'live', 'acoustic', 'instrumental', 'radio edit',
                      'react', 'reaction', 'cover', 'nightcore',
                      'mashup', 'parody', '8d audio', '3d sound']
 
+# Streaming sources return structured API results with proper artist/title metadata —
+# score them with the same matching engine as Soulseek instead of the filename matcher.
+# Torrent / usenet belong here too: their filename field is a download URL, not a
+# slskd-style ``Artist/Album/Track.flac`` path, so the Soulseek matcher would extract
+# garbage segments from it. Yandex belongs here for exactly that reason: its candidates
+# carry ``username='yandex'`` plus pre-filled ``title`` / ``artist`` fields.
+# Module-level so tests and the Yandex parity guard can assert membership.
+_STREAMING_SOURCES = (
+    "youtube", "tidal", "qobuz", "hifi", "deezer_dl", "soundcloud",
+    "amazon", "torrent", "usenet", "yandex",
+)
+
+# Sources whose API durations are trustworthy enough to reject a candidate BEFORE
+# downloading it. Yandex is deliberately absent: its catalogue durations drift from
+# the Spotify reference often enough that a strict pre-download check produced false
+# rejections. Post-download integrity checks and AcoustID cover the real mismatches.
+_STRICT_DURATION_SOURCES = {"tidal", "qobuz", "hifi", "deezer_dl", "amazon"}
+
 
 def _has_version_kw(text, kw) -> bool:
     # WORD-boundary match — a plain substring check penalized "Staying Alive"
@@ -162,14 +180,7 @@ def get_valid_candidates(results, spotify_track, query):
     if not results:
         return []
 
-    # Streaming sources (YouTube, Tidal, Qobuz, HiFi, Deezer, SoundCloud) return structured API results
-    # with proper artist/title metadata — score using the same matching engine as Soulseek.
-    # Torrent / usenet results also belong here: their filename field is a download URL, not
-    # a slskd-style ``Artist/Album/Track.flac`` path, so the Soulseek matcher would extract
-    # garbage segments from it. Routing them through the streaming path means score_track_match
-    # reads ``r.title`` and ``r.artist`` directly (which the torrent/usenet projections pre-fill).
-    _streaming_sources = ("youtube", "tidal", "qobuz", "hifi", "deezer_dl", "soundcloud", "amazon", "torrent", "usenet")
-    if results[0].username in _streaming_sources:
+    if results[0].username in _STREAMING_SOURCES:
         source_label = results[0].username.replace('_dl', '').title()
         expected_artists = spotify_track.artists if spotify_track else []
         expected_title = spotify_track.name if spotify_track else ''
@@ -182,10 +193,9 @@ def get_valid_candidates(results, spotify_track, query):
                                   for kw in _version_keywords)
 
         scored = []
-        _strict_duration_sources = {'tidal', 'qobuz', 'hifi', 'deezer_dl', 'amazon'}
         for r in results:
             if (
-                r.username in _strict_duration_sources
+                r.username in _STRICT_DURATION_SOURCES
                 and _duration_mismatch_exceeds_integrity_tolerance(expected_duration, r.duration or 0)
             ):
                 logger.info(
@@ -364,7 +374,7 @@ def get_valid_candidates(results, spotify_track, query):
         return []
 
     # Skip quality filtering for streaming source results that somehow got here
-    is_streaming_source = initial_candidates[0].username in _streaming_sources if initial_candidates else False
+    is_streaming_source = initial_candidates[0].username in _STREAMING_SOURCES if initial_candidates else False
 
     if is_streaming_source:
         source_label = initial_candidates[0].username.title()

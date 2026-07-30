@@ -167,3 +167,35 @@ def test_keeps_torrent_title_match_when_artist_is_indexer_fallback(monkeypatch):
     result = get_valid_candidates([candidate], expected, 'Olivia Dean The Man I Need')
 
     assert result == [candidate]
+
+
+def test_yandex_candidate_is_scored_by_the_streaming_matcher(monkeypatch):
+    """A Yandex candidate carries structured artist/title fields, so it must be
+    scored by the streaming path. Falling through to the Soulseek matcher makes
+    it parse ``username='yandex'`` as a filename and extract garbage segments,
+    which is what rejected every Yandex download before the fix."""
+    monkeypatch.setattr(validation, 'matching_engine', _MatchingEngine())
+    expected = _Track(duration_ms=180_000, name='Gruppa Krovi', artists=('Kino',))
+    cand = _Candidate(
+        username='yandex',
+        duration=181_000,
+        title='Gruppa Krovi',
+        artist='Kino',
+    )
+
+    assert get_valid_candidates([cand], expected, 'Kino Gruppa Krovi') == [cand]
+
+
+def test_yandex_is_exempt_from_strict_duration_filtering_unlike_tidal(monkeypatch):
+    """Yandex catalogue durations legitimately drift from the Spotify reference,
+    so yandex must NOT join _STRICT_DURATION_SOURCES: the same drift that
+    correctly rejects a Tidal candidate pre-download has to be tolerated for
+    Yandex, where post-download integrity + AcoustID do the real checking."""
+    monkeypatch.setattr(validation, 'matching_engine', _MatchingEngine())
+    expected = _Track(duration_ms=338_000)
+
+    tidal = _Candidate(username='tidal', duration=30_000)
+    assert get_valid_candidates([tidal], expected, 'Artist Song') == []
+
+    yandex = _Candidate(username='yandex', duration=30_000)
+    assert get_valid_candidates([yandex], expected, 'Artist Song') == [yandex]
