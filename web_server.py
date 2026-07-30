@@ -40739,6 +40739,79 @@ def import_staging_suggestions():
 
 
 # ================================================================================================
+# NAVIDROME DELETE API — used by nd-delete.js injected into Navidrome UI
+# ================================================================================================
+
+@app.route('/api/nd/delete', methods=['POST'])
+def nd_delete_song():
+    """Delete a single audio file from the library by relative path."""
+    data = request.get_json(silent=True) or {}
+    rel_path = (data.get('path') or '').strip()
+    if not rel_path:
+        return jsonify({'success': False, 'error': 'No path provided'}), 400
+
+    # The path is relative to the music library root, as Navidrome reports it.
+    # SoulSync mounts the library at /music.
+    candidates = [
+        os.path.join('/music', rel_path),
+        os.path.join('/music', rel_path.lstrip('/')),
+        rel_path,
+    ]
+
+    deleted = False
+    for candidate in candidates:
+        # Safety: only delete under /music
+        real = os.path.realpath(candidate)
+        if not real.startswith('/music/'):
+            continue
+        if os.path.isfile(real):
+            try:
+                os.remove(real)
+                logger.info(f"[nd-delete] Deleted file: {real}")
+                deleted = True
+                break
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+    if not deleted:
+        return jsonify({'success': False, 'error': 'File not found in library'}), 404
+    return jsonify({'success': True})
+
+
+@app.route('/api/nd/delete-album', methods=['POST'])
+def nd_delete_album():
+    """Delete an entire album directory from the library."""
+    data = request.get_json(silent=True) or {}
+    rel_dir = (data.get('dir') or '').strip()
+    if not rel_dir:
+        return jsonify({'success': False, 'error': 'No directory provided'}), 400
+
+    candidates = [
+        os.path.join('/music', rel_dir),
+        os.path.join('/music', rel_dir.lstrip('/')),
+    ]
+
+    deleted = False
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if not real.startswith('/music/'):
+            continue
+        if os.path.isdir(real):
+            try:
+                import shutil
+                shutil.rmtree(real)
+                logger.info(f"[nd-delete] Deleted album dir: {real}")
+                deleted = True
+                break
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+    if not deleted:
+        return jsonify({'success': False, 'error': 'Directory not found in library'}), 404
+    return jsonify({'success': True})
+
+
+# ================================================================================================
 # WEBSOCKET (SOCKET.IO) EVENT HANDLERS AND BACKGROUND EMITTERS
 # ================================================================================================
 
