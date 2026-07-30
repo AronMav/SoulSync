@@ -25,7 +25,7 @@
  * doesn't match the current version, so old entries don't accumulate.
  */
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 const IMAGE_CACHE = `soulsync-images-${CACHE_VERSION}`;
 const STATIC_CACHE = `soulsync-static-${CACHE_VERSION}`;
 const VALID_CACHES = new Set([IMAGE_CACHE, STATIC_CACHE]);
