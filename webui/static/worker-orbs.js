@@ -14,6 +14,7 @@
         { container: '.mb-button-container',              color: [186, 85, 211], id: 'musicbrainz' },
         { container: '.audiodb-button-container',          color: [0, 188, 212],  id: 'audiodb' },
         { container: '.deezer-button-container',           color: [162, 56, 255], id: 'deezer' },
+        { container: '.yandex-button-container',           color: [255, 204, 0],  id: 'yandex' },
         { container: '.jiosaavn-button-container',         color: [43, 197, 180], id: 'jiosaavn' },
         { container: '.bandcamp-enrich-button-container',  color: [29, 160, 195], id: 'bandcamp-enrichment' },
         { container: '.spotify-enrich-button-container',   color: [30, 215, 96],  id: 'spotify-enrichment' },

@@ -502,7 +502,7 @@ function initializeWebSocket() {
     // Forward enrichment status to the dashboard worker-orbs so the hub fires
     // a pulse on each real item matched / error (additional listener — does not
     // disturb the UI handlers above).
-    ['musicbrainz', 'audiodb', 'discogs', 'deezer', 'jiosaavn', 'spotify-enrichment',
+    ['musicbrainz', 'audiodb', 'discogs', 'deezer', 'yandex', 'jiosaavn', 'spotify-enrichment',
      'itunes-enrichment', 'lastfm-enrichment', 'genius-enrichment', 'tidal-enrichment',
      'qobuz-enrichment', 'amazon-enrichment', 'bandcamp-enrichment', 'similar_artists', 'hydrabase',
      'soulid', 'repair'].forEach((ch) => {

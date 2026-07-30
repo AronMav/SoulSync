@@ -464,6 +464,122 @@ if (document.readyState === 'loading') {
 }
 
 // ===================================================================
+// YANDEX ENRICHMENT STATUS
+// ===================================================================
+
+async function updateYandexStatus() {
+    if (socketConnected) return;
+    if (document.hidden) return;
+    try {
+        const response = await _enrichmentStatusFetch('yandex');
+        if (!response.ok) { console.warn('Yandex status endpoint unavailable'); return; }
+        const data = await response.json();
+        updateYandexStatusFromData(data);
+    } catch (error) {
+        console.error('Error updating Yandex status:', error);
+    }
+}
+
+function updateYandexStatusFromData(data) {
+    const button = document.getElementById('yandex-button');
+    if (!button) return;
+
+    button.classList.remove('active', 'paused', 'complete');
+    if (data.idle) {
+        button.classList.add('complete');
+    } else if (data.running && !data.paused) {
+        button.classList.add('active');
+    } else if (data.paused) {
+        button.classList.add('paused');
+    }
+
+    const tooltipStatus = document.getElementById('yandex-tooltip-status');
+    const tooltipCurrent = document.getElementById('yandex-tooltip-current');
+    const tooltipProgress = document.getElementById('yandex-tooltip-progress');
+
+    if (tooltipStatus) {
+        if (data.idle) { tooltipStatus.textContent = 'Complete'; }
+        else if (data.running && !data.paused) { tooltipStatus.textContent = 'Running'; }
+        else if (data.paused) { tooltipStatus.textContent = data.yield_reason === 'downloads' ? 'Yielding for downloads' : 'Paused'; }
+        else { tooltipStatus.textContent = 'Idle'; }
+    }
+
+    if (tooltipCurrent) {
+        if (data.idle) {
+            tooltipCurrent.textContent = 'All items processed';
+        } else if (data.current_item && data.current_item.name) {
+            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
+        }
+    }
+
+    if (data.progress && tooltipProgress) {
+        const artists = data.progress.artists || {};
+        const albums = data.progress.albums || {};
+        const tracks = data.progress.tracks || {};
+
+        const currentType = data.current_item?.type;
+        let progressText = '';
+
+        const artistsComplete = artists.matched >= artists.total;
+        const albumsComplete = albums.matched >= albums.total;
+
+        if (currentType === 'artist' || (!artistsComplete && !currentType)) {
+            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
+        } else if (currentType === 'album' || (artistsComplete && !albumsComplete)) {
+            progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
+        } else if (currentType === 'track' || (artistsComplete && albumsComplete)) {
+            progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
+        } else {
+            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
+        }
+
+        tooltipProgress.textContent = progressText;
+    }
+}
+
+async function toggleYandexEnrichment() {
+    try {
+        const button = document.getElementById('yandex-button');
+        if (!button) return;
+
+        const isRunning = button.classList.contains('active');
+        const endpoint = isRunning ? '/api/enrichment/yandex/pause' : '/api/enrichment/yandex/resume';
+
+        const response = await fetch(endpoint, { method: 'POST' });
+        if (!response.ok) {
+            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Yandex enrichment`);
+        }
+
+        await updateYandexStatus();
+        console.log(`✅ Yandex enrichment ${isRunning ? 'paused' : 'resumed'}`);
+
+    } catch (error) {
+        console.error('Error toggling Yandex enrichment:', error);
+        showToast(`Error: ${error.message}`, 'error');
+    }
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+        const button = document.getElementById('yandex-button');
+        if (button) {
+            button.addEventListener('click', toggleYandexEnrichment);
+            updateYandexStatus();
+            setInterval(updateYandexStatus, 10000);
+            console.log('✅ Yandex UI initialized');
+        }
+    });
+} else {
+    const button = document.getElementById('yandex-button');
+    if (button) {
+        button.addEventListener('click', toggleYandexEnrichment);
+        updateYandexStatus();
+        setInterval(updateYandexStatus, 10000);
+        console.log('✅ Yandex UI initialized');
+    }
+}
+
+// ===================================================================
 // JIOSAAVN ENRICHMENT STATUS
 // ===================================================================
 
