@@ -435,6 +435,27 @@ def run_service_test(service, test_config):
                 return False, f"Deezer returned HTTP {resp.status_code}"
             except Exception as e:
                 return False, f"Deezer connection error: {str(e)}"
+        elif service == "yandex":
+            # One token powers metadata, new-release discovery, enrichment and
+            # downloads, so verifying it verifies the whole provider. Yandex has
+            # no anonymous tier worth probing — an absent token is a config
+            # error, not a connectivity one.
+            token = (test_config or {}).get('token') or ''
+            if not token.strip():
+                return False, "Yandex Music token is not set. Paste a user token and click Connect."
+            try:
+                import yandex_music
+                client = yandex_music.Client(token.strip())
+                client.init()
+                try:
+                    login = client.me.account.login
+                except Exception:
+                    login = None
+                if login:
+                    return True, f"Connected as {login}"
+                return True, "Yandex Music token accepted"
+            except Exception as e:
+                return False, f"Yandex Music connection error: {str(e)}"
         elif service == "jiosaavn":
             from core.metadata.registry import get_jiosaavn_client, is_jiosaavn_enabled
             if not is_jiosaavn_enabled():
