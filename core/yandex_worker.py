@@ -40,28 +40,8 @@ class YandexWorker:
         self.stats = {'matched': 0, 'not_found': 0, 'pending': 0, 'errors': 0}
         self.retry_days = 30
 
-        self._ensure_schema()
         self._load_stats_from_db()
         logger.info("Yandex background worker initialized")
-
-    # --- schema (self-healing fallback; canonical schema lives in music_database) ---
-    def _ensure_schema(self):
-        conn = None
-        try:
-            conn = self.db._get_connection()
-            cur = conn.cursor()
-            for table in ("artists", "albums", "tracks"):
-                cols = {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
-                for col in ("yandex_id", "yandex_match_status", "yandex_last_attempted"):
-                    if col not in cols:
-                        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
-                        logger.info("Added %s.%s column", table, col)
-            conn.commit()
-        except Exception as e:
-            logger.error("Yandex worker schema ensure failed: %s", e)
-        finally:
-            if conn:
-                conn.close()
 
     def _load_stats_from_db(self):
         """Restore cumulative stats from the database after a restart."""

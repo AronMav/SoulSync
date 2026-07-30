@@ -128,6 +128,7 @@ class SimilarArtist:
     popularity: int = 0  # Cached popularity score
     similar_artist_deezer_id: Optional[str] = None  # Deezer artist ID
     similar_artist_musicbrainz_id: Optional[str] = None  # MusicBrainz artist ID
+    similar_artist_yandex_id: Optional[str] = None  # Yandex Music artist ID
 
 @dataclass
 class DiscoveryTrack:
@@ -583,6 +584,7 @@ class MusicDatabase:
 
             # Add Deezer columns to library tables (migration)
             self._add_deezer_columns(cursor)
+            self._add_yandex_columns(cursor)
 
             # Add JioSaavn columns to library tables (migration)
             self._add_jiosaavn_columns(cursor)
@@ -2164,6 +2166,10 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE similar_artists ADD COLUMN similar_artist_musicbrainz_id TEXT")
                 logger.info("Added similar_artist_musicbrainz_id column to similar_artists table")
 
+            if 'similar_artist_yandex_id' not in similar_artists_columns:
+                cursor.execute("ALTER TABLE similar_artists ADD COLUMN similar_artist_yandex_id TEXT")
+                logger.info("Added similar_artist_yandex_id column to similar_artists table")
+
             # Migration: Add iTunes columns to recent_releases for dual-source discovery
             cursor.execute("PRAGMA table_info(recent_releases)")
             recent_releases_columns = [column[1] for column in cursor.fetchall()]
@@ -2280,6 +2286,7 @@ class MusicDatabase:
                                 similar_artist_itunes_id TEXT,
                                 similar_artist_deezer_id TEXT,
                                 similar_artist_musicbrainz_id TEXT,
+                                similar_artist_yandex_id TEXT,
                                 similar_artist_name TEXT NOT NULL,
                                 similarity_rank INTEGER DEFAULT 1,
                                 occurrence_count INTEGER DEFAULT 1,
@@ -3426,6 +3433,57 @@ class MusicDatabase:
             logger.error(f"Error adding Deezer columns: {e}")
             # Don't raise - this is a migration, database can still function
 
+    def _add_yandex_columns(self, cursor):
+        """Add Yandex Music tracking columns for enrichment (artists, albums, tracks).
+
+        Mirrors _add_deezer_columns. This is the canonical owner of these columns:
+        core/yandex_worker.py used to create them itself with ALTER TABLE, which
+        left a fresh database without them until the worker first ran.
+        """
+        try:
+            # --- Artists ---
+            cursor.execute("PRAGMA table_info(artists)")
+            artists_columns = [column[1] for column in cursor.fetchall()]
+
+            if 'yandex_id' not in artists_columns:
+                cursor.execute("ALTER TABLE artists ADD COLUMN yandex_id TEXT")
+            if 'yandex_match_status' not in artists_columns:
+                cursor.execute("ALTER TABLE artists ADD COLUMN yandex_match_status TEXT")
+            if 'yandex_last_attempted' not in artists_columns:
+                cursor.execute("ALTER TABLE artists ADD COLUMN yandex_last_attempted TIMESTAMP")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_yandex_id ON artists (yandex_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_yandex_status ON artists (yandex_match_status)")
+
+            # --- Albums ---
+            cursor.execute("PRAGMA table_info(albums)")
+            albums_columns = [column[1] for column in cursor.fetchall()]
+
+            if 'yandex_id' not in albums_columns:
+                cursor.execute("ALTER TABLE albums ADD COLUMN yandex_id TEXT")
+            if 'yandex_match_status' not in albums_columns:
+                cursor.execute("ALTER TABLE albums ADD COLUMN yandex_match_status TEXT")
+            if 'yandex_last_attempted' not in albums_columns:
+                cursor.execute("ALTER TABLE albums ADD COLUMN yandex_last_attempted TIMESTAMP")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_yandex_id ON albums (yandex_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_yandex_status ON albums (yandex_match_status)")
+
+            # --- Tracks ---
+            cursor.execute("PRAGMA table_info(tracks)")
+            tracks_columns = [column[1] for column in cursor.fetchall()]
+
+            if 'yandex_id' not in tracks_columns:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN yandex_id TEXT")
+            if 'yandex_match_status' not in tracks_columns:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN yandex_match_status TEXT")
+            if 'yandex_last_attempted' not in tracks_columns:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN yandex_last_attempted TIMESTAMP")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_yandex_id ON tracks (yandex_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_yandex_status ON tracks (yandex_match_status)")
+
+        except Exception as e:
+            logger.error(f"Error adding Yandex columns: {e}")
+            # Don't raise - this is a migration, database can still function
+
         # --- Repair worker columns ---
         # Kept in their OWN try block: a failure in the Deezer ALTERs above must not
         # prevent these from being created, or the repair worker errors on every run
@@ -4239,6 +4297,7 @@ class MusicDatabase:
                             similar_artist_itunes_id TEXT,
                             similar_artist_deezer_id TEXT,
                             similar_artist_musicbrainz_id TEXT,
+                            similar_artist_yandex_id TEXT,
                             similar_artist_name TEXT NOT NULL,
                             similarity_rank INTEGER DEFAULT 1,
                             occurrence_count INTEGER DEFAULT 1,
@@ -4255,7 +4314,8 @@ class MusicDatabase:
 
                     new_cols = ['id', 'source_artist_id', 'similar_artist_spotify_id',
                                 'similar_artist_itunes_id', 'similar_artist_deezer_id',
-                                'similar_artist_musicbrainz_id', 'similar_artist_name',
+                                'similar_artist_musicbrainz_id', 'similar_artist_yandex_id',
+                                'similar_artist_name',
                                 'similarity_rank', 'occurrence_count',
                                 'last_updated', 'image_url', 'genres', 'popularity',
                                 'metadata_updated_at', 'last_featured', 'profile_id']
