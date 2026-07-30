@@ -57,6 +57,11 @@ const SOURCE_LABELS = {
         logo: '/static/img/brands/deezer.png',
         tabClass: 'enh-tab-deezer', badgeClass: 'enh-badge-deezer',
     },
+    yandex: {
+        text: 'Yandex Music', icon: '🎵',
+        logo: '/static/img/brands/yandex.svg',
+        tabClass: 'enh-tab-yandex', badgeClass: 'enh-badge-yandex',
+    },
     discogs: {
         text: 'Discogs', icon: '📀',
         logo: '/static/img/brands/discogs-icon.png',
@@ -100,7 +105,7 @@ const SOURCE_LABELS = {
 // Canonical display order for the source picker. Standard metadata sources
 // first, then YouTube Music Videos, then Soulseek (basic-file source).
 const SOURCE_ORDER = [
-    'spotify', 'itunes', 'deezer', 'discogs', 'hydrabase', 'amazon', 'musicbrainz', 'jiosaavn', 'bandcamp',
+    'spotify', 'itunes', 'deezer', 'yandex', 'discogs', 'hydrabase', 'amazon', 'musicbrainz', 'jiosaavn', 'bandcamp',
     'youtube_videos', 'soulseek',
 ];
 
@@ -4280,9 +4285,9 @@ function renderEnrichmentCards(enrichment) {
 
     // Service display order
     const serviceOrder = [
-        'musicbrainz', 'spotify_enrichment', 'itunes_enrichment', 'deezer_enrichment', 'jiosaavn_enrichment',
-        'bandcamp_enrichment', 'tidal_enrichment', 'qobuz_enrichment', 'lastfm', 'genius', 'audiodb',
-        'acoustid', 'listenbrainz'
+        'musicbrainz', 'spotify_enrichment', 'itunes_enrichment', 'deezer_enrichment', 'yandex_enrichment',
+        'jiosaavn_enrichment', 'bandcamp_enrichment', 'tidal_enrichment', 'qobuz_enrichment', 'lastfm', 'genius',
+        'audiodb', 'acoustid', 'listenbrainz'
     ];
 
     // Map service keys to their settings page selector for click-to-configure

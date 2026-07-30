@@ -6162,6 +6162,25 @@
                                     </div>
                                 </div>
 
+                                <!-- Yandex Music Settings -->
+                                <div class="api-service-frame stg-service" data-service="yandex">
+                                    <div class="stg-service-header" onclick="toggleStgService(this)">
+                                        <span class="stg-service-dot" style="color: #FFCC00;"></span>
+                                        <h4 class="service-title yandex-title">Yandex Music (Metadata & Enrichment)</h4>
+                                        <span class="stg-service-chevron">›</span>
+                                    </div>
+                                    <div class="stg-service-body">
+                                        <div class="form-group">
+                                            <label>Access Token:</label>
+                                            <input type="password" id="yandex-token"
+                                                placeholder="Yandex Music OAuth token">
+                                        </div>
+                                        <div class="callback-info">
+                                            <div class="callback-help">Get your token from <a href="https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d" target="_blank" style="color: #FFCC00;">Yandex OAuth</a> — copy the <code>access_token</code> from the redirect URL. Provides metadata enrichment, search, and FLAC downloads.</div>
+                                        </div>
+                                    </div>
+                                </div>
+
                                 <!-- Discogs Settings -->
                                 <div class="api-service-frame stg-service" data-service="discogs">
                                     <div class="stg-service-header" onclick="toggleStgService(this)">

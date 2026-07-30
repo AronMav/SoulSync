@@ -1354,6 +1354,9 @@ async function loadSettingsData() {
         document.getElementById('deezer-redirect-uri').value = settings.deezer?.redirect_uri || 'http://127.0.0.1:8008/deezer/callback';
         document.getElementById('deezer-callback-display').textContent = settings.deezer?.redirect_uri || 'http://127.0.0.1:8008/deezer/callback';
 
+        // Populate Yandex Music settings
+        document.getElementById('yandex-token').value = settings.yandex?.token || '';
+
         // Add event listeners to update display URLs when input changes
         document.getElementById('spotify-redirect-uri').addEventListener('input', function () {
             document.getElementById('spotify-callback-display').textContent = this.value || 'http://127.0.0.1:8888/callback';
@@ -4563,6 +4566,9 @@ async function saveSettings(quiet = false) {
             redirect_uri: document.getElementById('deezer-redirect-uri').value,
             embed_tags: document.getElementById('embed-deezer').checked,
             tags: _collectServiceTags('deezer')
+        },
+        yandex: {
+            token: document.getElementById('yandex-token').value,
         },
         audiodb: {
             embed_tags: document.getElementById('embed-audiodb').checked,
