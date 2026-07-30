@@ -98,6 +98,110 @@ def _resolve_completion_track_total(release: Dict[str, Any], source_chain: List[
     return 0
 
 
+def _release_year_of(release: Dict[str, Any]) -> Optional[str]:
+    """The card's release year ('2024') or None — feeds the matcher's re-release
+    year gate. Never raises; unknown/blank stays None (gate stays off)."""
+    year = _extract_lookup_value(release, 'year')
+    if year:
+        return str(year)
+    release_date = _extract_lookup_value(release, 'release_date')
+    if release_date:
+        return str(release_date)[:4]
+    return None
+
+
+# Which enrichment columns on `albums` hold a given source's album id — the
+# identity proof for #1071. A discography card whose id equals the local
+# album's stored id FOR THAT SOURCE is the same release, no matter how the
+# viewing source titles or dates it: the year gate (re-releases-as-owned fix)
+# hard-rejects cross-source edition dating (library copy tagged with the 2014
+# remaster year vs a card dated 1989), which read as "ownership is locked to
+# the source I searched". Id equality beats both the year gate and title
+# drift — and can never credit a sibling edition, because a re-release card
+# carries a DIFFERENT id than the one enrichment stored.
+_SOURCE_ID_COLUMNS = {
+    'spotify': ('spotify_album_id',),
+    'deezer': ('deezer_id', 'album_deezer_id'),
+    'itunes': ('itunes_album_id', 'album_itunes_id'),
+    'musicbrainz': ('musicbrainz_release_id',),
+    'qobuz': ('qobuz_id',),
+    'tidal': ('tidal_id',),
+    'amazon': ('amazon_id',),
+    'audiodb': ('audiodb_id',),
+    'jiosaavn': ('jiosaavn_id',),
+}
+
+
+def _library_album_by_source_id(db, card_source, card_id, candidate_albums):
+    """The candidate library album whose stored enrichment id for the card's
+    source equals the card's id — or None. Scoped strictly to the pre-fetched
+    artist candidates so a global id collision can't cross artists."""
+    if not card_source or not card_id or not candidate_albums:
+        return None
+    cols = _SOURCE_ID_COLUMNS.get(str(card_source).strip().lower())
+    if not cols:
+        return None
+    get_ids = getattr(db, 'get_album_source_ids', None)
+    if not callable(get_ids):
+        return None
+    try:
+        id_map = get_ids([a.id for a in candidate_albums])
+    except Exception:
+        return None
+    want = str(card_id).strip()
+    if not want:
+        return None
+    for album in candidate_albums:
+        vals = id_map.get(album.id) or {}
+        for col in cols:
+            if vals.get(col) == want:
+                logger.debug(
+                    "Id-proof ownership: card %s (%s) == local album %s.%s",
+                    want, card_source, album.id, col)
+                return album
+    return None
+
+
+def _canonical_pin_denies_card(db, db_album: Any, card_source: Optional[str],
+                               card_id: Any) -> bool:
+    """True when the matched local album is PINNED to a different release of the
+    card's own source — the user's files are a known specific edition, and this
+    card is not it (the re-release problem: a name match must not light up a
+    sibling edition once we know exactly which release the files are).
+
+    Deliberately strict about proof so it can never false-deny:
+      • no pin / no card id / pin from another source → False (old behavior)
+      • the card id must actually RESOLVE in the pin's source (its tracklist
+        loads) — a card that slipped in from a fallback source carries an id
+        from a different id-space and must not be compared against the pin
+    """
+    if not card_source or not card_id:
+        return False
+    local_album_id = _extract_lookup_value(db_album, 'id')
+    get_canonical = getattr(db, 'get_album_canonical', None)
+    if not local_album_id or not callable(get_canonical):
+        return False
+    canonical = get_canonical(local_album_id)
+    if not canonical:
+        return False
+    pin_source = str(_extract_lookup_value(
+        canonical, 'source', 'canonical_source', default='') or '').strip().lower()
+    pin_id = str(_extract_lookup_value(
+        canonical, 'album_id', 'canonical_album_id', default='') or '').strip()
+    if not pin_source or not pin_id:
+        return False
+    if pin_source != str(card_source).strip().lower():
+        return False
+    if pin_id == str(card_id).strip():
+        return False
+    try:
+        items = _extract_track_items(
+            get_album_tracks_for_source(pin_source, str(card_id)))
+    except Exception:
+        return False   # can't prove the card belongs to the pin's source
+    return bool(items)
+
+
 def _resolve_canonical_album_completion(db, db_album: Any) -> Optional[Dict[str, Any]]:
     """Recalculate completion from a local album's exact pinned release.
 
@@ -181,7 +285,43 @@ def check_album_completion(
                 server_source=active_server,
                 candidate_albums=candidate_albums,
                 strict_discography_match=True,
+                expected_year=_release_year_of(album_data),
             )
+
+            # #1071: the fuzzy match failed (usually the year gate rejecting a
+            # cross-source edition date, sometimes title drift) — but if the
+            # card's id IS a candidate album's stored enrichment id for this
+            # source, that's identity proof. Runs BEFORE the pin deny so a
+            # canonical pin stays authoritative over everything.
+            if db_album is None:
+                _proven = _library_album_by_source_id(
+                    db, source_chain[0] if source_chain else None,
+                    album_id, candidate_albums)
+                if _proven is not None:
+                    db_album = _proven
+                    confidence = 1.0
+                    owned_tracks, expected_tracks, is_complete, formats = db.check_album_completeness(
+                        _proven.id, total_tracks if total_tracks > 0 else None)
+
+            # Canonical pin deny: the files are pinned to a specific release of
+            # this card's source, and this card is a different one — a name
+            # match must not credit it (re-releases-as-owned, second layer).
+            if db_album is not None and _canonical_pin_denies_card(
+                    db, db_album, source_chain[0] if source_chain else None, album_id):
+                logger.debug(
+                    "Canonical pin denies '%s' (%s): local album %s is pinned to a different release",
+                    album_name, album_id, _extract_lookup_value(db_album, 'id'))
+                return {
+                    "id": album_id,
+                    "name": album_name,
+                    "status": "missing",
+                    "owned_tracks": 0,
+                    "expected_tracks": total_tracks,
+                    "completion_percentage": 0,
+                    "confidence": 0.0,
+                    "found_in_db": False,
+                    "formats": [],
+                }
 
             canonical_completion = _resolve_canonical_album_completion(db, db_album)
             if canonical_completion is not None:
@@ -301,11 +441,23 @@ def check_single_completion(
                     server_source=active_server,
                     candidate_albums=candidate_albums,
                     strict_discography_match=True,
+                    expected_year=_release_year_of(single_data),
                 )
             except Exception as db_error:
                 logger.error(f"Database error for EP '{single_name}': {db_error}")
                 owned_tracks, expected_tracks, confidence = 0, total_tracks, 0.0
                 db_album = None
+
+            # #1071 identity proof — same rescue as the album path.
+            if db_album is None:
+                _proven = _library_album_by_source_id(
+                    db, source_chain[0] if source_chain else None,
+                    single_id, candidate_albums)
+                if _proven is not None:
+                    db_album = _proven
+                    confidence = 1.0
+                    owned_tracks, expected_tracks, is_complete, formats = db.check_album_completeness(
+                        _proven.id, total_tracks if total_tracks > 0 else None)
 
             if expected_tracks > 0:
                 completion_percentage = (owned_tracks / expected_tracks) * 100

@@ -182,15 +182,15 @@ function autoSyncSourceLabel(source) {
 // the ``<img onerror>`` swap so the header renders cleanly without
 // a broken-image placeholder.
 const _AUTO_SYNC_SOURCE_LOGOS = {
-    spotify:            'https://storage.googleapis.com/pr-newsroom-wp/1/2023/05/Spotify_Primary_Logo_RGB_Green.png',
-    spotify_public:     'https://storage.googleapis.com/pr-newsroom-wp/1/2023/05/Spotify_Primary_Logo_RGB_Green.png',
-    tidal:              'https://www.svgrepo.com/show/519734/tidal.svg',
-    youtube:            'https://www.svgrepo.com/show/13671/youtube.svg',
-    deezer:             'https://cdn.brandfetch.io/idEUKgCNtu/theme/dark/symbol.svg?c=1bxid64Mup7aczewSAYMX&t=1758260798610',
-    qobuz:              'https://www.svgrepo.com/show/504778/qobuz.svg',
-    itunes_link:        'https://upload.wikimedia.org/wikipedia/commons/thumb/d/df/ITunes_logo.svg/960px-ITunes_logo.svg.png',
-    lastfm:             'https://www.last.fm/static/images/lastfm_avatar_twitter.52a5d69a85ac.png',
-    listenbrainz:       'https://listenbrainz.org/static/img/listenbrainz-logo-no-text.svg',
+    spotify:            '/static/img/brands/spotify.png',
+    spotify_public:     '/static/img/brands/spotify.png',
+    tidal:              '/static/img/brands/tidal.svg',
+    youtube:            '/static/img/brands/youtube.svg',
+    deezer:             '/static/img/brands/deezer.png',
+    qobuz:              '/static/img/brands/qobuz.svg',
+    itunes_link:        '/static/img/brands/itunes.png',
+    lastfm:             '/static/img/brands/lastfm.png',
+    listenbrainz:       '/static/img/brands/listenbrainz.png',
     soulsync_discovery: '/static/favicon.png',
 };
 
@@ -713,6 +713,15 @@ function renderAutoSyncScheduleModal() {
     `;
     populateAutoSyncHistoryList(overlay);
     bindAutoSyncHistoryCardInteractions(overlay);
+    playlists.filter(p => !p._personalized).forEach(p => {
+        if (typeof hydratePlaylistQualityProfileSelects === 'function') {
+            void hydratePlaylistQualityProfileSelects(
+                p.source_playlist_id,
+                p.source,
+                p.quality_profile_id,
+            );
+        }
+    });
 
     if (_prevScroll != null) {
         const nl = overlay.querySelector('.auto-sync-tab-panel.active .auto-sync-lanes');
@@ -1075,6 +1084,15 @@ function setAutoSyncSidebarFilter(value) {
     if (!panel) return;
     const { playlists, playlistSchedules } = _autoSyncScheduleState;
     panel.innerHTML = renderAutoSyncSchedulePanel(playlists, playlistSchedules);
+    playlists.filter(p => !p._personalized).forEach(p => {
+        if (typeof hydratePlaylistQualityProfileSelects === 'function') {
+            void hydratePlaylistQualityProfileSelects(
+                p.source_playlist_id,
+                p.source,
+                p.quality_profile_id,
+            );
+        }
+    });
     // Restore focus to the search input + caret position at end.
     const input = panel.querySelector('.auto-sync-sidebar-search');
     if (input) {
@@ -1906,6 +1924,9 @@ function autoSyncOrganizeToggleHtml(playlist) {
             <input type="checkbox" ${checked} onchange="setAutoSyncOrganizeByPlaylist(${playlist.id}, this.checked)">
             <span>Organize by playlist</span>
         </label>
+        ${typeof playlistQualityProfileSelectHtml === 'function'
+            ? playlistQualityProfileSelectHtml(playlist.source_playlist_id, playlist.source, true)
+            : ''}
     `;
 }
 

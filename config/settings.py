@@ -457,7 +457,19 @@ class ConfigManager:
             "plex": {
                 "base_url": "",
                 "token": "",
-                "auto_detect": True
+                "auto_detect": True,
+                # Read timeout (seconds) for every Plex HTTP request. A deep
+                # scan enumerates the whole library in 100-item pages (plexapi
+                # batches internally); on a big library or a slow/remote server
+                # a single page can exceed the old hard-coded 15s and the scan
+                # died with "0 artists". 30s gives large libraries room without
+                # making a genuinely-dead server hang too long.
+                "request_timeout_seconds": 30,
+                # How many times a bulk library enumeration (artists / albums /
+                # tracks) is retried on a transient failure before giving up.
+                # plexapi has no per-page retry — one slow page used to zero the
+                # whole scan. 0 disables retries (original behavior).
+                "scan_retries": 2,
             },
             "jellyfin": {
                 "base_url": "",
@@ -484,6 +496,10 @@ class ConfigManager:
                 # searches even when the window cap isn't hit. 0 = disabled
                 # (preserves prior behavior).
                 "search_min_delay_seconds": 0,
+                # Refuse new downloads when the download disk has less than
+                # this many GB free (0 = off). A fresh LXC install left on the
+                # default paths otherwise fills its 8GB root until it hangs.
+                "min_free_disk_gb": 5.0,
             },
             "download_source": {
                 "mode": "soulseek",  # Options: "soulseek", "youtube", "tidal", "qobuz", "hifi", "hybrid", "torrent", "usenet"
@@ -598,6 +614,20 @@ class ConfigManager:
                 "password": "",
                 "category": "soulsync",
                 "save_path": "",
+                # Seeding lifecycle (mirror of the video side): seed a completed
+                # music torrent grab until the ratio/time goal is met, then remove
+                # it from the client. BOTH goals default 0 = sweep OFF = grabs seed
+                # forever (unchanged behavior). seed_remove_data also deletes the
+                # client's own copy on removal — the imported library file is a
+                # separate copy and is never touched.
+                "seed_ratio_goal": 0,
+                "seed_time_goal_hours": 0,
+                "seed_remove_data": True,
+                # Who enforces the seed goal above: "soulsync" (default) = the
+                # seeding sweep polls the client and removes when the goal is met;
+                # "client" = write the ratio/time limit straight into the torrent
+                # client (arr-style) and let it enforce, shown in its share-limit UI.
+                "seed_mode": "soulsync",
             },
             # Usenet client — receives .nzb URLs / payloads. ``type``
             # picks the adapter (sabnzbd | nzbget). SABnzbd uses an
@@ -715,7 +745,15 @@ class ConfigManager:
             },
             "library": {
                 "music_paths": [],
-                "music_videos_path": ""
+                "music_videos_path": "",
+                # Library Organize: when the tool re-resolves a track from the
+                # metadata source, the source's title/album CASING often differs
+                # from a file the user already curated (Spotify capitalizing
+                # prepositions, an ALL-CAPS artist, iTunes vs Deezer). With this
+                # on (default), a difference that is ONLY letter-case is left
+                # alone — no cosmetic rename churn on already-organized files.
+                # Turn off to canonicalize casing to the metadata source.
+                "reorganize_preserve_casing": True,
             },
             "scripts": {
                 "path": "./scripts",
@@ -866,6 +904,34 @@ class ConfigManager:
 
         return value
 
+    def get_full_config(self) -> Dict[str, Any]:
+        """Deep copy of the live, DECRYPTED config — including secrets. Used by
+        the config export ONLY when the user opts into embedding credentials;
+        never sent to the browser on the normal settings fetch (that's
+        ``redacted_config``)."""
+        return copy.deepcopy(self.config_data)
+
+    def apply_config_dict(self, incoming: Dict[str, Any]) -> int:
+        """Merge an imported config dict (config migration). Walks to LEAVES and
+        routes each through ``set()`` so its guards apply — a round-tripped
+        REDACTED_SENTINEL (a secrets-redacted export) is skipped instead of
+        blanking an existing secret. Returns the number of leaves written."""
+        count = 0
+
+        def _walk(node, prefix):
+            nonlocal count
+            for k, v in (node or {}).items():
+                path = f"{prefix}.{k}" if prefix else str(k)
+                if isinstance(v, dict) and v:
+                    _walk(v, path)
+                else:
+                    self.set(path, v)
+                    count += 1
+
+        if isinstance(incoming, dict):
+            _walk(incoming, "")
+        return count
+
     def redacted_config(self) -> Dict[str, Any]:
         """Deep copy of the live config with every sensitive value masked.
 
@@ -963,6 +1029,24 @@ class ConfigManager:
 
     def get_logging_config(self) -> Dict[str, str]:
         return self.get('logging', {})
+
+    def get_source_search_timeout(self):
+        """#1056 — user override for streaming-source search/API timeouts, in
+        seconds. Returns None when unset/0/invalid, meaning "keep each source's
+        built-in default" (HiFi 15, Qobuz 15, Deezer 10, stream search 15) — so
+        out of the box NOTHING changes; only a user-entered value applies.
+        Clamped to 5-120 so a typo can neither hammer sources nor hang workers.
+        Soulseek is NOT governed by this — its windowed soulseek.search_timeout
+        has different semantics (results stream in over the window) and its own
+        setting."""
+        raw = self.get('download_source.source_search_timeout', 0)
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        return max(5, min(120, value))
 
     def get_active_media_server(self) -> str:
         return self.get('active_media_server', 'plex')

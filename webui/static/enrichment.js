@@ -2,13 +2,42 @@
 // ============================================================================
 
 /**
+ * Bundled status hydrate: every per-service status reader below goes through
+ * this instead of its own /api/enrichment/<id>/status request — one
+ * /status-all response serves all ~13 of them (the load-time flood fix).
+ * Returns a Response-compatible object so the call sites stay untouched;
+ * unknown ids / a failed bundle fall back to the real per-service request.
+ */
+let _enrStatusBundle = null;   // { t, promise }
+function _enrichmentStatusFetch(id) {
+    const now = Date.now();
+    if (!_enrStatusBundle || now - _enrStatusBundle.t > 3000) {
+        _enrStatusBundle = {
+            t: now,
+            promise: fetch('/api/enrichment/status-all')
+                .then(r => (r.ok ? r.json() : null))
+                .catch(() => null),
+        };
+    }
+    return _enrStatusBundle.promise.then(bundle => {
+        const payload = bundle && bundle.services ? bundle.services[id] : null;
+        if (payload && !payload.error) {
+            return new Response(JSON.stringify(payload), {
+                status: 200, headers: { 'Content-Type': 'application/json' },
+            });
+        }
+        return fetch(`/api/enrichment/${id}/status`);
+    });
+}
+
+/**
  * Poll MusicBrainz status every 2 seconds and update UI
  */
 async function updateMusicBrainzStatus() {
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
-        const response = await fetch('/api/enrichment/musicbrainz/status');
+        const response = await _enrichmentStatusFetch('musicbrainz');
         if (!response.ok) { console.warn('MusicBrainz status endpoint unavailable'); return; }
         const data = await response.json();
         updateMusicBrainzStatusFromData(data);
@@ -120,7 +149,7 @@ if (document.readyState === 'loading') {
             button.addEventListener('click', toggleMusicBrainzEnrichment);
             // Start polling
             updateMusicBrainzStatus();
-            setInterval(updateMusicBrainzStatus, 2000); // Poll every 2 seconds
+            setInterval(updateMusicBrainzStatus, 10000); // fallback only — the websocket push owns live updates
             console.log('✅ MusicBrainz UI initialized');
         }
     });
@@ -130,7 +159,7 @@ if (document.readyState === 'loading') {
         button.addEventListener('click', toggleMusicBrainzEnrichment);
         // Start polling
         updateMusicBrainzStatus();
-        setInterval(updateMusicBrainzStatus, 2000); // Poll every 2 seconds
+        setInterval(updateMusicBrainzStatus, 10000); // fallback only — the websocket push owns live updates
         console.log('✅ MusicBrainz UI initialized');
     }
 }
@@ -146,7 +175,7 @@ async function updateAudioDBStatus() {
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
-        const response = await fetch('/api/enrichment/audiodb/status');
+        const response = await _enrichmentStatusFetch('audiodb');
         if (!response.ok) { console.warn('AudioDB status endpoint unavailable'); return; }
         const data = await response.json();
         updateAudioDBStatusFromData(data);
@@ -301,7 +330,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleAudioDBEnrichment);
             updateAudioDBStatus();
-            setInterval(updateAudioDBStatus, 2000);
+            setInterval(updateAudioDBStatus, 10000); // fallback only — the websocket push owns live updates
             console.log('✅ AudioDB UI initialized');
         }
     });
@@ -310,7 +339,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleAudioDBEnrichment);
         updateAudioDBStatus();
-        setInterval(updateAudioDBStatus, 2000);
+        setInterval(updateAudioDBStatus, 10000); // fallback only — the websocket push owns live updates
         console.log('✅ AudioDB UI initialized');
     }
 }
@@ -323,7 +352,7 @@ async function updateDeezerStatus() {
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
-        const response = await fetch('/api/enrichment/deezer/status');
+        const response = await _enrichmentStatusFetch('deezer');
         if (!response.ok) { console.warn('Deezer status endpoint unavailable'); return; }
         const data = await response.json();
         updateDeezerStatusFromData(data);
@@ -420,7 +449,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleDeezerEnrichment);
             updateDeezerStatus();
-            setInterval(updateDeezerStatus, 2000);
+            setInterval(updateDeezerStatus, 10000); // fallback only — the websocket push owns live updates
             console.log('✅ Deezer UI initialized');
         }
     });
@@ -429,7 +458,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleDeezerEnrichment);
         updateDeezerStatus();
-        setInterval(updateDeezerStatus, 2000);
+        setInterval(updateDeezerStatus, 10000); // fallback only — the websocket push owns live updates
         console.log('✅ Deezer UI initialized');
     }
 }
@@ -442,7 +471,7 @@ async function updateJioSaavnStatus() {
     if (socketConnected) return;
     if (document.hidden) return;
     try {
-        const response = await fetch('/api/enrichment/jiosaavn/status');
+        const response = await _enrichmentStatusFetch('jiosaavn');
         if (!response.ok) { console.warn('JioSaavn status endpoint unavailable'); return; }
         const data = await response.json();
         updateJioSaavnStatusFromData(data);
@@ -531,7 +560,7 @@ function initJioSaavnEnrichmentUI() {
     if (!button) return;
     button.addEventListener('click', toggleJioSaavnEnrichment);
     updateJioSaavnStatus();
-    setInterval(updateJioSaavnStatus, 2000);
+    setInterval(updateJioSaavnStatus, 10000); // fallback only — the websocket push owns live updates
 }
 
 if (document.readyState === 'loading') {
@@ -548,7 +577,7 @@ async function updateSpotifyEnrichmentStatus() {
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
-        const response = await fetch('/api/enrichment/spotify/status');
+        const response = await _enrichmentStatusFetch('spotify');
         if (!response.ok) { console.warn('Spotify enrichment status endpoint unavailable'); return; }
         const data = await response.json();
         updateSpotifyEnrichmentStatusFromData(data);
@@ -694,7 +723,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleSpotifyEnrichment);
             updateSpotifyEnrichmentStatus();
-            setInterval(updateSpotifyEnrichmentStatus, 2000);
+            setInterval(updateSpotifyEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -702,7 +731,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleSpotifyEnrichment);
         updateSpotifyEnrichmentStatus();
-        setInterval(updateSpotifyEnrichmentStatus, 2000);
+        setInterval(updateSpotifyEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -714,7 +743,7 @@ async function updateiTunesEnrichmentStatus() {
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
-        const response = await fetch('/api/enrichment/itunes/status');
+        const response = await _enrichmentStatusFetch('itunes');
         if (!response.ok) { console.warn('iTunes enrichment status endpoint unavailable'); return; }
         const data = await response.json();
         updateiTunesEnrichmentStatusFromData(data);
@@ -813,7 +842,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleiTunesEnrichment);
             updateiTunesEnrichmentStatus();
-            setInterval(updateiTunesEnrichmentStatus, 2000);
+            setInterval(updateiTunesEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -821,7 +850,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleiTunesEnrichment);
         updateiTunesEnrichmentStatus();
-        setInterval(updateiTunesEnrichmentStatus, 2000);
+        setInterval(updateiTunesEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -833,7 +862,7 @@ async function updateLastFMEnrichmentStatus() {
     if (socketConnected) return;
     if (document.hidden) return;
     try {
-        const response = await fetch('/api/enrichment/lastfm/status');
+        const response = await _enrichmentStatusFetch('lastfm');
         if (!response.ok) { console.warn('Last.fm status endpoint unavailable'); return; }
         const data = await response.json();
         updateLastFMEnrichmentStatusFromData(data);
@@ -940,7 +969,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleLastFMEnrichment);
             updateLastFMEnrichmentStatus();
-            setInterval(updateLastFMEnrichmentStatus, 2000);
+            setInterval(updateLastFMEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -948,7 +977,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleLastFMEnrichment);
         updateLastFMEnrichmentStatus();
-        setInterval(updateLastFMEnrichmentStatus, 2000);
+        setInterval(updateLastFMEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -960,7 +989,7 @@ async function updateGeniusEnrichmentStatus() {
     if (socketConnected) return;
     if (document.hidden) return;
     try {
-        const response = await fetch('/api/enrichment/genius/status');
+        const response = await _enrichmentStatusFetch('genius');
         if (!response.ok) { console.warn('Genius status endpoint unavailable'); return; }
         const data = await response.json();
         updateGeniusEnrichmentStatusFromData(data);
@@ -1061,7 +1090,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleGeniusEnrichment);
             updateGeniusEnrichmentStatus();
-            setInterval(updateGeniusEnrichmentStatus, 2000);
+            setInterval(updateGeniusEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -1069,7 +1098,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleGeniusEnrichment);
         updateGeniusEnrichmentStatus();
-        setInterval(updateGeniusEnrichmentStatus, 2000);
+        setInterval(updateGeniusEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -1086,7 +1115,7 @@ async function updateBandcampEnrichmentStatus() {
     if (socketConnected) return;
     if (document.hidden) return;
     try {
-        const response = await fetch('/api/enrichment/bandcamp/status');
+        const response = await _enrichmentStatusFetch('bandcamp');
         if (!response.ok) { console.warn('Bandcamp status endpoint unavailable'); return; }
         const data = await response.json();
         updateBandcampEnrichmentStatusFromData(data);
@@ -1188,7 +1217,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleBandcampEnrichment);
             updateBandcampEnrichmentStatus();
-            setInterval(updateBandcampEnrichmentStatus, 2000);
+            setInterval(updateBandcampEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -1196,7 +1225,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleBandcampEnrichment);
         updateBandcampEnrichmentStatus();
-        setInterval(updateBandcampEnrichmentStatus, 2000);
+        setInterval(updateBandcampEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -1208,7 +1237,7 @@ async function updateTidalEnrichmentStatus() {
     if (socketConnected) return;
     if (document.hidden) return;
     try {
-        const response = await fetch('/api/enrichment/tidal/status');
+        const response = await _enrichmentStatusFetch('tidal');
         if (!response.ok) { console.warn('Tidal status endpoint unavailable'); return; }
         const data = await response.json();
         updateTidalEnrichmentStatusFromData(data);
@@ -1313,7 +1342,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleTidalEnrichment);
             updateTidalEnrichmentStatus();
-            setInterval(updateTidalEnrichmentStatus, 2000);
+            setInterval(updateTidalEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -1321,7 +1350,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleTidalEnrichment);
         updateTidalEnrichmentStatus();
-        setInterval(updateTidalEnrichmentStatus, 2000);
+        setInterval(updateTidalEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -1333,7 +1362,7 @@ async function updateQobuzEnrichmentStatus() {
     if (socketConnected) return;
     if (document.hidden) return;
     try {
-        const response = await fetch('/api/enrichment/qobuz/status');
+        const response = await _enrichmentStatusFetch('qobuz');
         if (!response.ok) { console.warn('Qobuz status endpoint unavailable'); return; }
         const data = await response.json();
         updateQobuzEnrichmentStatusFromData(data);
@@ -1438,7 +1467,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleQobuzEnrichment);
             updateQobuzEnrichmentStatus();
-            setInterval(updateQobuzEnrichmentStatus, 2000);
+            setInterval(updateQobuzEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -1446,7 +1475,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleQobuzEnrichment);
         updateQobuzEnrichmentStatus();
-        setInterval(updateQobuzEnrichmentStatus, 2000);
+        setInterval(updateQobuzEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -1458,7 +1487,7 @@ async function updateAmazonEnrichmentStatus() {
     if (socketConnected) return;
     if (document.hidden) return;
     try {
-        const response = await fetch('/api/enrichment/amazon/status');
+        const response = await _enrichmentStatusFetch('amazon');
         if (!response.ok) { console.warn('Amazon enrichment status endpoint unavailable'); return; }
         const data = await response.json();
         updateAmazonEnrichmentStatusFromData(data);
@@ -1544,7 +1573,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleAmazonEnrichment);
             updateAmazonEnrichmentStatus();
-            setInterval(updateAmazonEnrichmentStatus, 2000);
+            setInterval(updateAmazonEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -1552,7 +1581,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleAmazonEnrichment);
         updateAmazonEnrichmentStatus();
-        setInterval(updateAmazonEnrichmentStatus, 2000);
+        setInterval(updateAmazonEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -1564,7 +1593,7 @@ async function updateSimilarArtistsEnrichmentStatus() {
     if (socketConnected) return;
     if (document.hidden) return;
     try {
-        const response = await fetch('/api/enrichment/similar_artists/status');
+        const response = await _enrichmentStatusFetch('similar_artists');
         if (!response.ok) return;
         updateSimilarArtistsEnrichmentStatusFromData(await response.json());
     } catch (error) {
@@ -1629,7 +1658,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleSimilarArtistsEnrichment);
             updateSimilarArtistsEnrichmentStatus();
-            setInterval(updateSimilarArtistsEnrichmentStatus, 2000);
+            setInterval(updateSimilarArtistsEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -1637,7 +1666,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleSimilarArtistsEnrichment);
         updateSimilarArtistsEnrichmentStatus();
-        setInterval(updateSimilarArtistsEnrichmentStatus, 2000);
+        setInterval(updateSimilarArtistsEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -1704,7 +1733,7 @@ if (document.readyState === 'loading') {
         if (button) {
             button.addEventListener('click', toggleHydrabaseWorker);
             updateHydrabaseStatus();
-            setInterval(updateHydrabaseStatus, 2000);
+            setInterval(updateHydrabaseStatus, 10000); // fallback only — the websocket push owns live updates
         }
     });
 } else {
@@ -1712,7 +1741,7 @@ if (document.readyState === 'loading') {
     if (button) {
         button.addEventListener('click', toggleHydrabaseWorker);
         updateHydrabaseStatus();
-        setInterval(updateHydrabaseStatus, 2000);
+        setInterval(updateHydrabaseStatus, 10000); // fallback only — the websocket push owns live updates
     }
 }
 
@@ -1862,7 +1891,20 @@ let _repairFindingsPage = 0;
 let _repairSelectedFindings = new Set();
 let _repairFindingsTotal = 0;
 let _repairFindingsAutoSwitched = false;  // Set after auto-switching to "All Status" so we don't loop
-const REPAIR_FINDINGS_PAGE_SIZE = 30;
+// Findings per page — user-adjustable (pertti: 30 was the only option besides
+// Fix All). Persisted per browser.
+let REPAIR_FINDINGS_PAGE_SIZE = (() => {
+    const saved = parseInt(localStorage.getItem('repairFindingsPageSize') || '30', 10);
+    return [30, 60, 100].includes(saved) ? saved : 30;
+})();
+
+function setRepairFindingsPageSize(value) {
+    const size = parseInt(value, 10);
+    REPAIR_FINDINGS_PAGE_SIZE = [30, 60, 100].includes(size) ? size : 30;
+    try { localStorage.setItem('repairFindingsPageSize', String(REPAIR_FINDINGS_PAGE_SIZE)); } catch (e) {}
+    _repairFindingsPage = 0;
+    loadRepairFindings();
+}
 let _repairJobsCache = {}; // Cache job data for help modal
 
 /**
@@ -2062,7 +2104,7 @@ async function loadRepairJobs() {
                         <label>${label}</label>
                         <input type="${inputType}" class="repair-setting-input"
                                data-job="${job.job_id}" data-key="${key}"${inputVal}
-                               ${inputType === 'number' ? 'step="0.01" min="0"' : ''}>
+                               ${inputType === 'number' ? (typeof val === 'number' && val < 0 ? 'step="0.01"' : 'step="0.01" min="0"') : ''}>
                     </div>`;
                 }).join('');
 
@@ -2408,6 +2450,11 @@ function updateRepairJobProgressFromData(data) {
 async function loadRepairFindingsDashboard() {
     const dashboard = document.getElementById('repair-findings-dashboard');
     if (!dashboard) return;
+
+    _checkBulkFixResume();   // reload mid-Fix-All picks the progress back up
+
+    const pageSizeSelect = document.getElementById('repair-page-size-select');
+    if (pageSizeSelect) pageSizeSelect.value = String(REPAIR_FINDINGS_PAGE_SIZE);
 
     try {
         const response = await fetch('/api/repair/findings/counts');
@@ -3023,9 +3070,12 @@ async function loadRepairFindings() {
             path_mismatch: 'Path Mismatch', metadata_gap: 'Missing Metadata',
             missing_cover_art: 'Missing Art', track_number_mismatch: 'Track Number',
             missing_lyrics: 'Missing Lyrics', expired_download: 'Expired',
-            missing_replaygain: 'No ReplayGain', empty_folder: 'Empty Folder',
+            missing_replaygain: 'No ReplayGain', replaygain_retag: 'RG Re-analyze',
+            empty_folder: 'Empty Folder',
             missing_lossy_copy: 'No Lossy Copy', library_retag: 'Re-tag',
-            quality_upgrade: 'Low Quality', short_preview_track: 'Preview Clip'
+            quality_upgrade: 'Low Quality', short_preview_track: 'Preview Clip',
+            genre_cleanup: 'Genres',
+            comma_artist_split: 'Comma Artist'
         };
 
         // Finding types that have an automated fix action
@@ -3036,6 +3086,7 @@ async function loadRepairFindings() {
             missing_cover_art: 'Apply Art',
             missing_lyrics: 'Apply Lyrics',
             missing_replaygain: 'Apply RG',
+            replaygain_retag: 'Re-analyze',
             empty_folder: 'Delete Folder',
             expired_download: 'Delete',
             metadata_gap: 'Apply',
@@ -3047,6 +3098,8 @@ async function loadRepairFindings() {
             missing_discography_track: 'Add to Wishlist',
             library_retag: 'Apply Tags',
             short_preview_track: 'Re-download',
+            genre_cleanup: 'Clean Genres',
+            comma_artist_split: 'Split Artists',
         };
 
         container.innerHTML = items.map(f => {
@@ -3054,6 +3107,8 @@ async function loadRepairFindings() {
             const age = formatCacheAge(f.created_at);
             const actionLabels = {
                 removed_db_entry: 'Entry Removed', added_to_wishlist: 'Wishlisted', deleted_file: 'File Deleted',
+                genres_cleaned: 'Genres Cleaned',
+                artists_split: 'Artists Split',
                 already_gone: 'Already Gone', fixed_track_number: 'Track # Fixed',
                 applied_cover_art: 'Art Applied', applied_metadata: 'Metadata Applied',
                 applied_lyrics: 'Lyrics Applied',
@@ -3182,7 +3237,19 @@ function _renderFindingMedia(d) {
     }
     if (artistUrl) {
         const artistLabel = d.artist_name || d.artist || 'Artist';
-        html += `<div class="repair-finding-media-card">
+        const hasName = !!(d.artist_name || d.artist);
+        // Clickable → the artist's page. New findings store the library
+        // artist_id (exact, ambiguity-proof); older findings predate it and
+        // resolve by exact name at click time instead.
+        // Ids are opaque server keys — numeric on Plex but alphanumeric on
+        // Navidrome/Jellyfin, so never coerce with Number() (→ "NaN").
+        const idAttr = (d.artist_id != null && d.artist_id !== '')
+            ? ` data-artist-id="${_escFinding(String(d.artist_id))}"` : '';
+        const clickAttrs = hasName
+            ? `${idAttr} data-artist-name="${_escFinding(artistLabel)}" onclick="event.stopPropagation(); openFindingArtist(this)"
+                title="Open ${_escFinding(artistLabel)}'s page" role="link"`
+            : '';
+        html += `<div class="repair-finding-media-card${hasName ? ' repair-finding-media-card--link' : ''}"${clickAttrs}>
             <img class="repair-finding-media-img artist" src="${_escFinding(artistUrl)}" alt="Artist"
                  onerror="this.parentElement.style.display='none'" />
             <span class="repair-finding-media-label">${_escFinding(artistLabel)}</span>
@@ -3192,12 +3259,101 @@ function _renderFindingMedia(d) {
     return html;
 }
 
+// Findings don't store the library artist id — resolve it by exact name and
+// navigate. Ambiguity rule: exact (case-insensitive) name match wins; without
+// one we DON'T guess a fuzzy result, we say so.
+async function openFindingArtist(el) {
+    const name = el.getAttribute('data-artist-name');
+    if (!name) return;
+    // New findings carry the library artist id — navigate directly, no lookup,
+    // immune to same-name ambiguity.
+    const storedId = el.getAttribute('data-artist-id');
+    if (storedId && typeof navigateToArtistDetail === 'function') {
+        // navigateToArtistDetail treats the id as opaque; only parse when it
+        // really is numeric (Plex) — Navidrome/Jellyfin ids are alphanumeric.
+        navigateToArtistDetail(/^\d+$/.test(storedId) ? parseInt(storedId, 10) : storedId, name);
+        return;
+    }
+    try {
+        // limit=50: the search is a CONTAINS match sorted alphabetically, so a
+        // short name ("Low") can sort after many substring hits ("Below",
+        // "Flower", …) — a small page could push the exact match off page 1.
+        const res = await fetch(`/api/library/artists?search=${encodeURIComponent(name)}&limit=50`);
+        const data = await res.json();
+        const artists = (data && data.artists) || [];
+        const exact = artists.find(a => (a.name || '').toLowerCase() === name.toLowerCase());
+        if (exact && exact.id != null && typeof navigateToArtistDetail === 'function') {
+            navigateToArtistDetail(exact.id, exact.name);
+        } else {
+            showToast(`"${name}" isn't in your library`, 'info');
+        }
+    } catch (err) {
+        showToast('Could not open artist page', 'error');
+    }
+}
+
 function _renderFindingDetail(f) {
     const d = f.details || {};
     const rows = [];
     const media = _renderFindingMedia(d);
 
     switch (f.finding_type) {
+        case 'genre_cleanup': {
+            // #1057 — show exactly what stays and what goes; the fix applies
+            // kept_genres verbatim, so this IS the contract.
+            const kept = Array.isArray(d.kept_genres) ? d.kept_genres : [];
+            const removed = Array.isArray(d.removed_genres) ? d.removed_genres : [];
+            rows.push(['Kept', kept.length ? kept.join(', ') : '— none (all genres are off your whitelist)']);
+            rows.push(['Removed', removed.join(', ')]);
+            if (d.entity) rows.push(['Applies to', d.entity === 'artist' ? 'Artist genres' : 'Album genres']);
+            return media + _gridRows(rows);
+        }
+
+        case 'comma_artist_split': {
+            // jadux — the contract: exactly what the artist tag becomes.
+            const parts = Array.isArray(d.split_artists) ? d.split_artists : [];
+            const res = Array.isArray(d.parts_resolution) ? d.parts_resolution : [];
+            rows.push(['Current artist tag', d.combined_name || '']);
+            rows.push(['New artist tag', d.new_display_artist || parts.join('; ')]);
+            if (d.primary_artist) rows.push(['Album artist', `becomes "${d.primary_artist}" (only where it was the combined name)`]);
+            if (Array.isArray(d.checked_sources) && d.checked_sources.length) {
+                rows.push(['Checked against', d.checked_sources.join(', ')]);
+            }
+            if (d.track_count != null) rows.push(['Tracks affected', String(d.track_count)]);
+            let html = media + _gridRows(rows);
+            // "Splits into" chips — parts already in the library are clickable
+            // and jump to that artist's page (same resolver as the artist card).
+            const chipSrc = res.length ? res : parts.map(p => ({ name: p }));
+            html += `<div style="margin:8px 0 2px;font-weight:600">Splits into</div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px">` +
+                chipSrc.map(p => {
+                    const mark = p.in_library ? ' ✓ in your library' : (p.verified_via ? ` ✓ ${p.verified_via}` : '');
+                    const base = `padding:3px 10px;border-radius:12px;background:rgba(255,255,255,.07);font-size:12px`;
+                    if (p.in_library) {
+                        const idAttr = (p.library_artist_id != null && p.library_artist_id !== '')
+                            ? ` data-artist-id="${_escFinding(String(p.library_artist_id))}"` : '';
+                        return `<span style="${base};cursor:pointer;text-decoration:underline"${idAttr}
+                            data-artist-name="${_escFinding(p.name)}" role="link"
+                            title="Open ${_escFinding(p.name)}'s page"
+                            onclick="event.stopPropagation(); openFindingArtist(this)">${_escFinding(p.name)}${mark}</span>`;
+                    }
+                    return `<span style="${base}">${_escFinding(p.name)}${mark}</span>`;
+                }).join('') + '</div>';
+            const tracks = Array.isArray(d.tracks) ? d.tracks : [];
+            if (tracks.length) {
+                html += `<div style="margin:8px 0 2px;font-weight:600">Tracks</div>`;
+                tracks.slice(0, 40).forEach(t => {
+                    const label = [t.title, t.album].filter(Boolean).join(' — ');
+                    html += `<div class="repair-finding-meta" style="margin:0 0 2px">${_escFinding(label || (t.file_path || '').split(/[\\/]/).pop() || 'Unknown')}</div>`;
+                });
+                if ((d.track_count || 0) > tracks.length) {
+                    html += `<div class="repair-finding-meta" style="margin-top:6px">…and ${(d.track_count || 0) - tracks.length} more track(s)</div>`;
+                }
+            }
+            html += `<div class="repair-finding-meta" style="margin-top:8px">Your media server picks up the split on its next scan.</div>`;
+            return html;
+        }
+
         case 'dead_file':
             if (d.artist) rows.push(['Artist', d.artist]);
             if (d.album) rows.push(['Album', d.album]);
@@ -3634,38 +3790,100 @@ async function fixAllMatchingFindings() {
         })) return;
     }
 
-    showToast(`Fixing ${_repairFindingsTotal} findings...`, 'info');
-
+    // Fix All runs in the BACKGROUND: at library scale (thousands of tag
+    // writes) a synchronous request outlives every browser/proxy timeout, so
+    // the user was told it failed while the server quietly kept fixing. The
+    // start endpoint returns immediately and we poll for progress instead.
     try {
         const body = {};
         if (jobId) body.job_id = jobId;
         if (severity) body.severity = severity;
         if (fixAction) body.fix_action = fixAction;
 
-        const response = await fetch('/api/repair/findings/bulk-fix', {
+        const response = await fetch('/api/repair/findings/bulk-fix-start', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
         const result = await response.json();
-        if (result.success) {
-            let msg = `Fixed ${result.fixed}${result.failed ? `, ${result.failed} failed` : ''} of ${result.total}`;
-            if (result.errors && result.errors.length > 0) {
-                msg += `: ${result.errors[0].error}`;
-            }
-            showToast(msg, result.fixed > 0 ? 'success' : 'error');
+        if (result.started) {
+            showToast(`Fixing ${result.total} findings in the background...`, 'info');
+            _watchBulkFixRun();
+        } else if (result.already_running) {
+            showToast('A bulk fix is already running — showing its progress', 'info');
+            _watchBulkFixRun();
         } else {
-            showToast(result.error || 'Bulk fix failed', 'error');
+            showToast(result.error || 'Bulk fix failed to start', 'error');
         }
     } catch (error) {
-        console.error('Error in bulk fix:', error);
-        showToast('Error applying bulk fix', 'error');
+        console.error('Error starting bulk fix:', error);
+        showToast('Error starting bulk fix', 'error');
     }
 
     _repairSelectedFindings.clear();
-    loadRepairFindingsDashboard();
-    loadRepairFindings();
-    updateRepairStatus();
+    _updateFindingsBulkBar();
+}
+
+let _bulkFixPollTimer = null;
+
+function _watchBulkFixRun() {
+    if (_bulkFixPollTimer) return;   // already watching
+
+    const poll = async () => {
+        let st;
+        try {
+            const resp = await fetch('/api/repair/bulk-fix/status');
+            st = await resp.json();
+        } catch (e) {
+            return;   // transient — keep polling
+        }
+
+        const bulkBar = document.getElementById('repair-findings-bulk');
+        const countEl = document.getElementById('repair-bulk-count');
+
+        if (st.running) {
+            // Surface live progress in the bulk bar (kept visible for the run)
+            if (bulkBar) bulkBar.style.display = '';
+            if (countEl) {
+                countEl.innerHTML = `Fixing ${st.done} / ${st.total}&hellip; ` +
+                    `<button class="btn btn--sm btn--secondary" onclick="stopBulkFixRun()">Stop</button>`;
+            }
+            return;
+        }
+
+        // Finished (or nothing ever ran on this server)
+        clearInterval(_bulkFixPollTimer);
+        _bulkFixPollTimer = null;
+        if (countEl) countEl.textContent = '';
+        if (st.total) {
+            let msg = `Fixed ${st.fixed}${st.failed ? `, ${st.failed} failed` : ''} of ${st.total}`;
+            if (st.stopped) msg = `Bulk fix stopped — ${msg.charAt(0).toLowerCase()}${msg.slice(1)}`;
+            if (st.errors && st.errors.length > 0) msg += `: ${st.errors[0].error}`;
+            showToast(msg, st.fixed > 0 ? 'success' : 'error');
+        }
+        _repairSelectedFindings.clear();
+        loadRepairFindingsDashboard();
+        loadRepairFindings();
+        updateRepairStatus();
+    };
+
+    _bulkFixPollTimer = setInterval(poll, 2000);
+    poll();
+}
+
+function stopBulkFixRun() {
+    fetch('/api/repair/bulk-fix/stop', { method: 'POST' }).catch(() => {});
+    showToast('Stopping after the current fix...', 'info');
+}
+
+async function _checkBulkFixResume() {
+    // A reload mid-run should pick the progress display back up.
+    if (_bulkFixPollTimer) return;
+    try {
+        const resp = await fetch('/api/repair/bulk-fix/status');
+        const st = await resp.json();
+        if (st.running) _watchBulkFixRun();
+    } catch (e) { /* not fatal */ }
 }
 
 function renderRepairFindingsPagination(total, currentPage) {

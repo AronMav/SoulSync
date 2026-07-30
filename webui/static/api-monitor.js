@@ -25,17 +25,17 @@ const _RATE_GAUGE_COLORS = {
 // reads as branded chips, not anonymous initials. AudioDB ships
 // no public logo URL, so it lives as a local static file.
 const _RATE_GAUGE_LOGOS = {
-    spotify:    'https://storage.googleapis.com/pr-newsroom-wp/1/2023/05/Spotify_Primary_Logo_RGB_Green.png',
-    itunes:     'https://upload.wikimedia.org/wikipedia/commons/thumb/d/df/ITunes_logo.svg/960px-ITunes_logo.svg.png',
-    deezer:     'https://cdn.brandfetch.io/idEUKgCNtu/theme/dark/symbol.svg?c=1bxid64Mup7aczewSAYMX&t=1758260798610',
-    jiosaavn:   'https://cdn-1.webcatalog.io/catalog/jiosaavn/jiosaavn-icon-filled-256.webp?v=1782693273643',
-    lastfm:     'https://www.last.fm/static/images/lastfm_avatar_twitter.52a5d69a85ac.png',
-    genius:     'https://images.genius.com/8ed669cadd956443e29c70361ec4f372.1000x1000x1.png',
-    musicbrainz:'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/MusicBrainz_Logo_%282016%29.svg/500px-MusicBrainz_Logo_%282016%29.svg.png',
+    spotify:    '/static/img/brands/spotify.png',
+    itunes:     '/static/img/brands/itunes.png',
+    deezer:     '/static/img/brands/deezer.png',
+    jiosaavn:   '/static/img/brands/jiosaavn.webp',
+    lastfm:     '/static/img/brands/lastfm.png',
+    genius:     '/static/img/brands/genius.png',
+    musicbrainz:'/static/img/brands/musicbrainz.png',
     audiodb:    '/static/audiodb.png',
-    tidal:      'https://www.svgrepo.com/show/519734/tidal.svg',
-    qobuz:      'https://www.svgrepo.com/show/504778/qobuz.svg',
-    discogs:    'https://www.svgrepo.com/show/305957/discogs.svg',
+    tidal:      '/static/img/brands/tidal.svg',
+    qobuz:      '/static/img/brands/qobuz.svg',
+    discogs:    '/static/img/brands/discogs.svg',
     amazon:     '/static/amazon.svg',
 };
 
@@ -1259,6 +1259,14 @@ async function updateArtistCardWatchlistStatus() {
  */
 async function initializeWatchlistPage() {
     try {
+        _ensureWatchlistLabelsStyles();   // style the Artists/Labels tabs on load
+        // Always land on the Artists tab (a prior Labels view would otherwise
+        // keep the artist grid hidden via .wl-view-labels).
+        const _wlPage = document.getElementById('watchlist-page');
+        if (_wlPage) _wlPage.classList.remove('wl-view-labels');
+        document.querySelectorAll('#watchlist-tabs .watchlist-tab').forEach(b => {
+            b.classList.toggle('active', b.getAttribute('data-wl-tab') === 'artists');
+        });
         const emptyEl = document.getElementById('watchlist-page-empty');
         const gridEl = document.getElementById('watchlist-artists-list');
         const countEl = document.getElementById('watchlist-page-count');
@@ -1427,6 +1435,176 @@ async function initializeWatchlistPage() {
     }
 }
 
+// ============================================================================
+// WATCHLIST — LABELS TAB (record-label watchlist)
+// ----------------------------------------------------------------------------
+// Purely additive: a second tab on the existing watchlist page. Toggling to
+// Labels adds .wl-view-labels to #watchlist-page (CSS hides the artist-only
+// toolbar/grid/scan controls and reveals the labels grid) — the artist flow is
+// never touched. Data comes only from the /api/labels/* blueprint.
+// ============================================================================
+
+function _ensureWatchlistLabelsStyles() {
+    if (document.getElementById('watchlist-labels-styles')) return;
+    const css = `
+    #watchlist-page .watchlist-tabs { display:flex; gap:8px; margin:4px 0 16px; }
+    #watchlist-page .watchlist-tab { background:rgba(255,255,255,0.05); color:var(--text-secondary,#9aa0aa);
+        border:1px solid rgba(255,255,255,0.08); border-radius:999px; padding:7px 18px; cursor:pointer;
+        font-size:13px; font-weight:600; }
+    #watchlist-page .watchlist-tab:hover { color:#fff; background:rgba(255,255,255,0.1); }
+    #watchlist-page .watchlist-tab.active { background:linear-gradient(135deg,#1db954,#12833b); color:#fff; border-color:transparent; }
+    #watchlist-page .watchlist-labels-tab { display:none; }
+    #watchlist-page.wl-view-labels .watchlist-labels-tab { display:block; }
+    #watchlist-page.wl-view-labels .watchlist-toolbar,
+    #watchlist-page.wl-view-labels .watchlist-batch-bar,
+    #watchlist-page.wl-view-labels #watchlist-artists-list,
+    #watchlist-page.wl-view-labels #watchlist-page-empty,
+    #watchlist-page.wl-view-labels .watchlist-last-scan-strip,
+    #watchlist-page.wl-view-labels #watchlist-page-settings-btn { display:none !important; }
+    #watchlist-page .watchlist-labels-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:16px; }
+    #watchlist-page .wl-label-card { position:relative; background:rgba(255,255,255,0.04);
+        border:1px solid rgba(255,255,255,0.07); border-radius:12px; padding:18px; cursor:pointer;
+        transition:background .15s, border-color .15s; }
+    #watchlist-page .wl-label-card:hover { background:rgba(255,255,255,0.08); border-color:rgba(29,185,84,0.4); }
+    #watchlist-page .wl-label-icon { font-size:30px; }
+    #watchlist-page .wl-label-name { font-size:15px; font-weight:700; color:#fff; margin-top:10px;
+        overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    #watchlist-page .wl-label-meta { font-size:12px; color:var(--text-secondary,#8a909a); margin-top:4px; }
+    #watchlist-page .wl-label-backlog-badge { display:inline-block; margin-top:8px; font-size:11px; font-weight:600;
+        padding:2px 8px; border-radius:999px; background:rgba(255,180,40,0.16); color:#ffb84d; }
+    #watchlist-page .wl-label-actions { position:absolute; top:12px; right:12px; display:flex; gap:6px; }
+    #watchlist-page .wl-label-actions button { background:rgba(0,0,0,0.35); border:none; color:#cfd3da;
+        width:26px; height:26px; border-radius:7px; cursor:pointer; display:flex; align-items:center;
+        justify-content:center; font-size:13px; }
+    #watchlist-page .wl-label-actions button:hover { background:rgba(0,0,0,0.6); color:#fff; }`;
+    const style = document.createElement('style');
+    style.id = 'watchlist-labels-styles';
+    style.textContent = css;
+    document.head.appendChild(style);
+}
+
+function switchWatchlistTab(tab) {
+    const page = document.getElementById('watchlist-page');
+    if (!page) return;
+    _ensureWatchlistLabelsStyles();
+    const isLabels = tab === 'labels';
+    page.classList.toggle('wl-view-labels', isLabels);
+    document.querySelectorAll('#watchlist-tabs .watchlist-tab').forEach(b => {
+        b.classList.toggle('active', b.getAttribute('data-wl-tab') === tab);
+    });
+    const countEl = document.getElementById('watchlist-page-count');
+    if (isLabels) {
+        initializeWatchlistLabelsTab();
+    } else if (countEl) {
+        const n = (watchlistPageState.artists || []).length;
+        countEl.textContent = `${n} artist${n !== 1 ? 's' : ''}`;
+    }
+}
+
+async function initializeWatchlistLabelsTab() {
+    _ensureWatchlistLabelsStyles();
+    const grid = document.getElementById('watchlist-labels-list');
+    const empty = document.getElementById('watchlist-labels-empty');
+    const countEl = document.getElementById('watchlist-page-count');
+    if (!grid) return;
+
+    let labels = [];
+    try {
+        const res = await fetch('/api/labels/watchlist').then(r => r.json());
+        labels = (res && res.labels) || [];
+    } catch (e) {
+        labels = [];
+    }
+
+    if (countEl) countEl.textContent = `${labels.length} label${labels.length !== 1 ? 's' : ''}`;
+
+    if (!labels.length) {
+        grid.innerHTML = '';
+        if (empty) empty.style.display = '';
+        return;
+    }
+    if (empty) empty.style.display = 'none';
+
+    grid.innerHTML = labels.map(l => {
+        const mbid = escapeHtml(l.musicbrainz_label_id || '');
+        const name = escapeHtml(l.label_name || 'Label');
+        const backlog = !!l.backlog;
+        const scanned = l.last_scan_timestamp
+            ? `Scanned ${escapeHtml(formatRelativeScanTime(l.last_scan_timestamp))}`
+            : 'Not scanned yet';
+        return `
+            <div class="wl-label-card" data-label-id="${mbid}" data-label-name="${name}">
+                <div class="wl-label-actions">
+                    <button class="wl-label-backlog-btn" title="${backlog ? 'Monitoring full backlog — click for new-releases-only' : 'Monitoring new releases only — click for full backlog'}">${backlog ? '📚' : '🆕'}</button>
+                    <button class="wl-label-unfollow-btn" title="Unfollow label">✕</button>
+                </div>
+                <div class="wl-label-icon">🏷️</div>
+                <div class="wl-label-name">${name}</div>
+                <div class="wl-label-meta">${scanned}</div>
+                ${backlog ? '<span class="wl-label-backlog-badge">Full backlog</span>' : ''}
+            </div>`;
+    }).join('');
+
+    grid.querySelectorAll('.wl-label-card').forEach(card => {
+        const mbid = card.getAttribute('data-label-id');
+        const name = card.getAttribute('data-label-name');
+        card.addEventListener('click', (e) => {
+            if (e.target.closest('.wl-label-actions')) return;
+            if (typeof navigateToLabelDetail === 'function') navigateToLabelDetail(mbid, name);
+        });
+        const backlogBtn = card.querySelector('.wl-label-backlog-btn');
+        if (backlogBtn) backlogBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleWatchlistLabelBacklog(mbid, !!card.querySelector('.wl-label-backlog-badge'));
+        });
+        const unfollowBtn = card.querySelector('.wl-label-unfollow-btn');
+        if (unfollowBtn) unfollowBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            unfollowWatchlistLabel(mbid, name);
+        });
+    });
+}
+
+async function toggleWatchlistLabelBacklog(mbid, currentlyBacklog) {
+    if (!mbid) return;
+    try {
+        const res = await fetch('/api/labels/watchlist/backlog', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ musicbrainz_label_id: mbid, backlog: !currentlyBacklog }),
+        }).then(r => r.json());
+        if (res && res.success) initializeWatchlistLabelsTab();
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not update label setting', 'error');
+    }
+}
+
+async function unfollowWatchlistLabel(mbid, name) {
+    if (!mbid) return;
+    const ok = (typeof showConfirmDialog === 'function')
+        ? await showConfirmDialog({
+            title: 'Unfollow Label',
+            message: `Stop monitoring ${name || 'this label'} for new releases?`,
+            confirmText: 'Unfollow', destructive: true,
+        })
+        : true;
+    if (!ok) return;
+    try {
+        const res = await fetch('/api/labels/watchlist/remove', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ musicbrainz_label_id: mbid }),
+        }).then(r => r.json());
+        if (res && res.success) {
+            initializeWatchlistLabelsTab();
+            if (typeof updateWatchlistButtonCount === 'function') {
+                try { updateWatchlistButtonCount(); } catch (e) { /* non-fatal */ }
+            }
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not unfollow label', 'error');
+    }
+}
+
+
 /**
  * Initialize/refresh the wishlist sidebar page
  */
@@ -1507,6 +1685,26 @@ async function initializeWishlistPage() {
    WISHLIST NEBULA — Artist orbs with album/single satellites
    ═══════════════════════════════════════════════════════════════════ */
 
+// A track is "failing" once it has burned this many wishlist cycles without
+// landing (#liveleak-failing-hub). The count/last-try/reason all come from the
+// wishlist API (retry_count / last_attempted / failure_reason) — the data was
+// always there, the page just never showed it.
+const WL_FAILING_ATTEMPTS = 3;
+
+function _wlFailTitle(p) {
+    let t = `${p.retry} failed attempt${p.retry !== 1 ? 's' : ''}`;
+    if (p.lastTried) t += ` · last tried ${p.lastTried}`;
+    if (p.failReason) t += `\n${p.failReason}`;
+    return t;
+}
+
+// Attribute-safe escape: escapeHtml (innerHTML-based) leaves double quotes
+// intact, so a failure reason containing one would break out of a title="…"
+// attribute. Always use this for attribute values built from wishlist data.
+function _wlAttr(s) {
+    return escapeHtml(String(s ?? '')).replace(/"/g, '&quot;');
+}
+
 function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, currentCycle) {
     const field = document.getElementById('wl-nebula-field');
     if (!field) return;
@@ -1523,7 +1721,13 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
         let artist = 'Unknown Artist';
         if (sd.artists?.[0]?.name) artist = sd.artists[0].name;
         else if (typeof sd.artists?.[0] === 'string') artist = sd.artists[0];
-        return { track: sd.name || 'Unknown', artist, album: albumName, image: albumImage, type, id: track.spotify_track_id || track.id || '' };
+        const retry = Number(track.retry_count) || 0;
+        return { track: sd.name || 'Unknown', artist, album: albumName, image: albumImage, type,
+                 id: track.spotify_track_id || track.id || '',
+                 retry,
+                 failing: retry >= WL_FAILING_ATTEMPTS,
+                 lastTried: track.last_attempted || '',
+                 failReason: track.failure_reason || '' };
     }
 
     for (const t of albumTracks) { const p = _parse(t, 'album'); if (p) { if (!artistMap.has(p.artist)) artistMap.set(p.artist, { albums: new Map(), singles: [] }); const a = artistMap.get(p.artist); if (!a.albums.has(p.album)) a.albums.set(p.album, { image: p.image, tracks: [] }); a.albums.get(p.album).tracks.push(p); } }
@@ -1545,6 +1749,11 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
         const hasAlbums = data.albums.size > 0;
         const hue = _hue(name);
         const sz = total >= 10 ? 'orb-lg' : total >= 4 ? 'orb-md' : 'orb-sm';
+        // Failing rollup for this artist (#liveleak-failing-hub): drives the orb
+        // warning dot and the Failing-only filter (data-failing attribute).
+        const failingCount = [...data.albums.values()].reduce(
+            (s, a) => s + a.tracks.filter(t => t.failing).length, 0)
+            + data.singles.filter(s2 => s2.failing).length;
 
         // Enhancement 1: prefer watchlist artist photo over album cover
         let img = artistImageMap.get(name.toLowerCase()) || '';
@@ -1557,7 +1766,7 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
         // Enhancement 7: staggered entry animation
         const delay = Math.min(idx * 60, 800);
 
-        html += `<div class="wl-orb-group" data-artist="${escapeHtml(name)}" style="animation-delay:${delay}ms">`;
+        html += `<div class="wl-orb-group" data-artist="${escapeHtml(name)}" data-failing="${failingCount}" style="animation-delay:${delay}ms">`;
 
         // Enhancement 2: hover tooltip
         html += `<div class="wl-orb-tooltip">${escapeHtml(name)}<br><span>${total} track${total !== 1 ? 's' : ''}</span></div>`;
@@ -1584,7 +1793,7 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
 
         // Enhancement 8: clickable artist name → navigate to artist detail
         html += `<div class="wl-orb-label" onclick="event.stopPropagation(); _navigateToArtistFromWishlist('${escapeHtml(name)}')" title="View artist">${escapeHtml(name)}</div>`;
-        html += `<div class="wl-orb-meta">${total} track${total !== 1 ? 's' : ''}</div>`;
+        html += `<div class="wl-orb-meta">${total} track${total !== 1 ? 's' : ''}${failingCount > 0 ? ` · <span class="wl-orb-meta-failing" title="${failingCount} track${failingCount !== 1 ? 's' : ''} repeatedly failing to download">&#9888; ${failingCount} failing</span>` : ''}</div>`;
 
         // Expanded content
         html += `<div class="wl-orb-expanded">`;
@@ -1600,8 +1809,12 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
                 // Track list (hidden until tile clicked)
                 html += `<div class="wl-tile-tracks">`;
                 for (const tr of ad.tracks) {
-                    html += `<div class="wl-tile-track">`;
+                    html += `<div class="wl-tile-track${tr.failing ? ' wl-track-failing' : ''}">`;
                     html += `<span class="wl-tile-track-name">${escapeHtml(tr.track)}</span>`;
+                    if (tr.failing) {
+                        html += `<span class="wl-failing-badge" title="${_wlAttr(_wlFailTitle(tr))}">&#9888; ${tr.retry}</span>`;
+                    }
+                    html += `<button class="wl-tile-track-search" onclick="event.stopPropagation();_searchWishlistTrackManually('${escapeForInlineJs(tr.artist)}','${escapeForInlineJs(tr.track)}')" title="Search manually — pick a source yourself">&#128269;</button>`;
                     html += `<button class="wl-tile-track-remove" onclick="event.stopPropagation();_removeWishlistTrack('${escapeHtml(tr.id)}')" title="Remove track">&#10005;</button>`;
                     html += `</div>`;
                 }
@@ -1613,9 +1826,11 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
         if (data.singles.length > 0) {
             html += `<div class="wl-singles-orbit">`;
             for (const s of data.singles) {
-                html += `<div class="wl-single-moon" data-track-id="${escapeHtml(s.id)}">`;
+                html += `<div class="wl-single-moon${s.failing ? ' wl-moon-failing' : ''}" data-track-id="${escapeHtml(s.id)}"${s.failing ? ` title="${_wlAttr(_wlFailTitle(s))}"` : ''}>`;
                 html += s.image ? `<img src="${s.image}" alt="">` : `<span class="wl-moon-fallback">&#11088;</span>`;
+                if (s.failing) html += `<span class="wl-moon-failing-badge">&#9888;</span>`;
                 html += `<div class="wl-moon-label">${escapeHtml(s.track)}</div>`;
+                html += `<button class="wl-moon-search-btn" onclick="event.stopPropagation();_searchWishlistTrackManually('${escapeForInlineJs(s.artist)}','${escapeForInlineJs(s.track)}')" title="Search manually — pick a source yourself">&#128269;</button>`;
                 html += `<button class="wl-moon-remove-btn" onclick="event.stopPropagation();_removeWishlistTrack('${escapeHtml(s.id)}')" title="Remove">&#10005;</button>`;
                 html += `</div>`;
             }
@@ -1625,6 +1840,55 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
     });
 
     field.innerHTML = html;
+}
+
+// LiveLeak hub phase 2: jump from a stuck wishlist track straight into the
+// enhanced search, prefilled with "artist track" — every result there can be
+// hand-picked from any source and downloaded, which is exactly the manual
+// way out a repeatedly-failing track needs.
+function _searchWishlistTrackManually(artistName, trackName) {
+    navigateToPage('search');
+    const query = `${artistName || ''} ${trackName || ''}`.trim();
+    // The user is here because AUTO downloads kept failing — at this point they
+    // want the FILE, not metadata browsing. Land on the Soulseek (basic) surface
+    // with the search already running, instead of the default metadata source.
+    //
+    // The source-picker controller initializes ASYNCHRONOUSLY on a fresh
+    // /search visit (settings fetch builds the icon row + sets the default
+    // source). Swapping sections before it finishes gets overridden the moment
+    // its first render fires (it re-activates the enhanced section for the
+    // default source) — the "lands on basic then flips to metadata" bug. So:
+    // WAIT for the soulseek icon to exist and click it — then the CONTROLLER
+    // holds the soulseek state and its own renders short-circuit, nothing can
+    // flip back. Only after ~4s without an icon do we fall back to a manual
+    // section swap.
+    let attempts = 0;
+    const tryHandoff = () => {
+        attempts += 1;
+        const basicInput = document.getElementById('downloads-search-input');
+        const soulseekIcon = document.querySelector('#enh-source-row [data-source="soulseek"]');
+        if (soulseekIcon) {
+            if (basicInput) basicInput.value = query;
+            // Sync the controller's query BEFORE clicking — otherwise
+            // onSoulseekSelected fires with a stale query and overwrites it.
+            if (typeof _searchPageController !== 'undefined' && _searchPageController) {
+                _searchPageController.state.query = query;
+            }
+            soulseekIcon.click();
+            return;
+        }
+        if (attempts < 25) { setTimeout(tryHandoff, 160); return; }
+        // Controller never came up — swap sections and run the search directly.
+        const basicSection = document.getElementById('basic-search-section');
+        const enhancedSection = document.getElementById('enhanced-search-section');
+        if (basicSection) basicSection.classList.add('active');
+        if (enhancedSection) enhancedSection.classList.remove('active');
+        if (basicInput) basicInput.value = query;
+        if (basicInput && basicInput.value && typeof performDownloadsSearch === 'function') {
+            performDownloadsSearch();
+        }
+    };
+    setTimeout(tryHandoff, 200);
 }
 
 // Enhancement 8: navigate to the Search page pre-filled with this artist's name
@@ -1679,12 +1943,22 @@ async function _removeWishlistTrack(trackId) {
     } catch (err) { showToast('Error: ' + err.message, 'error'); }
 }
 
+let _wlFailingOnly = false;
+
+function _toggleFailingFilter() {
+    _wlFailingOnly = !_wlFailingOnly;
+    document.getElementById('wl-failing-filter')?.classList.toggle('active', _wlFailingOnly);
+    _filterNebula();
+}
+
 function _filterNebula() {
     const q = (document.getElementById('wl-nebula-search')?.value || '').toLowerCase().trim();
     document.querySelectorAll('.wl-orb-group').forEach(g => {
         const a = (g.dataset.artist || '').toLowerCase();
         const albums = [...g.querySelectorAll('.wl-satellite')].map(s => (s.dataset.album || '').toLowerCase());
-        const match = !q || a.includes(q) || albums.some(al => al.includes(q));
+        let match = !q || a.includes(q) || albums.some(al => al.includes(q));
+        // Failing-only chip: hide artists with nothing stuck (#liveleak-failing-hub)
+        if (match && _wlFailingOnly && !(Number(g.dataset.failing) > 0)) match = false;
         g.style.display = match ? '' : 'none';
         if (!match) g.classList.remove('expanded');
     });
@@ -2497,7 +2771,7 @@ async function openWatchlistArtistConfigModal(artistId, artistName) {
             return;
         }
 
-        const { config, artist, spotify_artist_id, itunes_artist_id, deezer_artist_id, discogs_artist_id, amazon_artist_id, musicbrainz_artist_id, watchlist_name } = data;
+        const { config, artist, spotify_artist_id, itunes_artist_id, deezer_artist_id, discogs_artist_id, amazon_artist_id, musicbrainz_artist_id, watchlist_name, quality_profiles } = data;
 
         // Populate linked provider section (use DB watchlist_name for mismatch comparison)
         _populateLinkedProviderSection(artistId, watchlist_name || artistName, spotify_artist_id, itunes_artist_id, artist, deezer_artist_id, discogs_artist_id, amazon_artist_id, musicbrainz_artist_id);
@@ -2561,6 +2835,18 @@ async function openWatchlistArtistConfigModal(artistId, artistName) {
         document.getElementById('config-include-compilations').checked = config.include_compilations || false;
         document.getElementById('config-include-instrumentals').checked = config.include_instrumentals || false;
         document.getElementById('config-lookback-days').value = config.lookback_days != null ? String(config.lookback_days) : '';
+        const qualityProfileSelect = document.getElementById('config-quality-profile');
+        if (qualityProfileSelect) {
+            // Explicit "Use default" so an artist with no saved profile (or one whose
+            // saved profile was since deleted) never silently defaults to the first
+            // listed profile on save. The save path maps an empty value back to null.
+            qualityProfileSelect.innerHTML = '<option value="">Use default</option>' + (quality_profiles || []).map(profile =>
+                `<option value="${profile.id}">${escapeHtml(profile.name || `Profile ${profile.id}`)}${profile.is_default ? ' (Default)' : ''}</option>`
+            ).join('');
+            qualityProfileSelect.value = config.quality_profile_id != null ? String(config.quality_profile_id) : '';
+            // Stored profile no longer exists (deleted) → fall back to "Use default", not blank.
+            if (qualityProfileSelect.selectedIndex < 0) qualityProfileSelect.value = '';
+        }
 
         // Populate metadata source selector
         const sourceSelector = document.getElementById('config-metadata-source-selector');
@@ -3041,6 +3327,8 @@ async function saveWatchlistArtistConfig(artistId) {
         const includeInstrumentals = document.getElementById('config-include-instrumentals').checked;
         const autoDownloadEl = document.getElementById('config-auto-download');
         const autoDownload = autoDownloadEl ? autoDownloadEl.checked : true;
+        const qualityProfileEl = document.getElementById('config-quality-profile');
+        const qualityProfileId = qualityProfileEl?.value ? parseInt(qualityProfileEl.value, 10) : null;
         const lookbackDaysVal = document.getElementById('config-lookback-days').value;
         const lookbackDays = lookbackDaysVal !== '' ? parseInt(lookbackDaysVal) : null;
         const activeSourceBtn = document.querySelector('#config-metadata-source-selector .config-msrc-btn.active');
@@ -3073,6 +3361,7 @@ async function saveWatchlistArtistConfig(artistId) {
                 include_compilations: includeCompilations,
                 include_instrumentals: includeInstrumentals,
                 auto_download: autoDownload,
+                quality_profile_id: qualityProfileId,
                 lookback_days: lookbackDays,
                 preferred_metadata_source: preferredMetadataSource,
             })
@@ -3299,6 +3588,7 @@ function _wlPrettyPhase(data) {
     const map = {
         starting: 'Starting…',
         fetching_discography: 'Fetching releases…',
+        scanning_labels: 'Scanning record labels…',
         populating_discovery_pool: 'Populating discovery…',
         updating_listenbrainz: 'Updating ListenBrainz…',
     };

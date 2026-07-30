@@ -791,7 +791,22 @@ let wishlistModalVersion = 0;
  * @param {Array} tracks - Array of track objects
  * @param {string} albumType - Type of release (album, EP, single)
  */
-async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwnership) {
+const WISHLIST_MODAL_QUALITY_PROFILE_SELECT_ID = 'wishlist-modal-quality-profile';
+
+/** The Quality Profile chosen in the shared wishlist modal, or null for "server decides". */
+function currentWishlistModalQualityProfileId() {
+    return getAcquisitionQualityProfileId(WISHLIST_MODAL_QUALITY_PROFILE_SELECT_ID);
+}
+
+/**
+ * @param {object} [playlistContext] `{ playlistRef, playlistSource }` when this
+ *   modal was opened from a playlist surface, so the Quality Profile selector
+ *   can preselect that mirror's persisted assignment. The library/artist
+ *   surfaces that call this today have no playlist, and omitting it simply
+ *   preselects the global default — the context has to be passed in, it was
+ *   never derivable from the album/artist arguments (R2-10).
+ */
+async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwnership, playlistContext = null) {
     wishlistModalVersion++;
     showLoadingOverlay('Preparing wishlist...');
     console.log(`🎵 Opening Add to Wishlist modal for: ${artist.name} - ${album.name}`);
@@ -802,7 +817,9 @@ async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwn
             album,
             artist,
             tracks,
-            albumType
+            albumType,
+            playlistRef: playlistContext?.playlistRef || null,
+            playlistSource: playlistContext?.playlistSource || null
         };
 
         const modal = document.getElementById('add-to-wishlist-modal');
@@ -832,6 +849,14 @@ async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwn
         if (addToWishlistBtn) {
             addToWishlistBtn.onclick = () => handleAddToWishlist();
         }
+
+        // Quality Profile for this acquisition (P1-01). Preselects the mirror's
+        // persisted assignment when the caller passed a playlist context, the
+        // default profile otherwise. Both footer buttons read the same control.
+        await hydrateAcquisitionQualityProfileSelect(WISHLIST_MODAL_QUALITY_PROFILE_SELECT_ID, {
+            playlistRef: currentWishlistModalData.playlistRef,
+            source: currentWishlistModalData.playlistSource,
+        });
 
         // Show the modal
         overlay.classList.remove('hidden');
@@ -945,6 +970,9 @@ async function handleAddToWishlist() {
 
     const { album, artist, tracks, albumType } = currentWishlistModalData;
     const addToWishlistBtn = document.getElementById('confirm-add-to-wishlist-btn');
+    // Read once, before the modal can be re-rendered mid-loop, so every track in
+    // this batch gets the SAME profile (P1-01).
+    const qualityProfileId = currentWishlistModalQualityProfileId();
 
     try {
         // Show loading state
@@ -1022,6 +1050,9 @@ async function handleAddToWishlist() {
                         artist: artist,
                         album: trackAlbum,
                         source_type: 'album',
+                        // Explicit user choice for this action (P1-01); null lets
+                        // the server keep its own resolution order.
+                        quality_profile_id: qualityProfileId,
                         source_context: {
                             album_name: trackAlbum.name,
                             artist_name: artist.name,
@@ -1299,6 +1330,9 @@ async function handleWishlistDownloadNow() {
 
     // Capture data before closeAddToWishlistModal clears it
     const { album, artist, tracks, albumType } = currentWishlistModalData;
+    // Carry the user's choice into the download dialog, so "Download Now" and
+    // "Add to Wishlist" in the SAME dialog can never disagree (P1-01).
+    const qualityProfileId = currentWishlistModalQualityProfileId();
 
     // Close the wishlist modal
     closeAddToWishlistModal();
@@ -1321,6 +1355,14 @@ async function handleWishlistDownloadNow() {
     await openDownloadMissingModalForArtistAlbum(
         virtualPlaylistId, playlistName, tracks, album, artist, false
     );
+    if (qualityProfileId != null) {
+        // Awaited: the modal's own hydration is still in flight and would
+        // otherwise land after this one and overwrite the user's choice. The
+        // generation guard inside the helper makes the later call win either
+        // way; awaiting also keeps the loading overlay up until the selector
+        // really shows the chosen profile (R2-05).
+        await setDownloadModalQualityProfile(virtualPlaylistId, qualityProfileId);
+    }
     hideLoadingOverlay();
 
     // Register download bubble (reuses existing artist bubble system)
@@ -1363,6 +1405,10 @@ async function addModalTracksToWishlist(playlistId) {
     // not for playlists, so we must NOT use it as a blanket default.
     const processArtist = process.artist || null;
     const album = process.album || process.playlist || { name: 'Playlist', id: playlistId };
+
+    // Same control the modal's "Begin Analysis" reads, so both buttons in this
+    // dialog agree on the Quality Profile (P1-01).
+    const qualityProfileId = getDownloadModalQualityProfileId(playlistId);
 
     console.log(`🔄 Adding ${tracks.length} tracks from "${album.name}" to wishlist (process artist: ${processArtist?.name || 'per-track'})`);
 
@@ -1470,6 +1516,7 @@ async function addModalTracksToWishlist(playlistId) {
                         artist: trackArtist,
                         album: trackAlbum,
                         source_type: 'album',
+                        quality_profile_id: qualityProfileId,
                         source_context: {
                             album_name: trackAlbum.name,
                             artist_name: trackArtist.name,
@@ -1707,166 +1754,6 @@ function calculateRelevanceScore(result, query) {
 
     return score;
 }
-// APPEND THIS JAVASCRIPT SNIPPET (B)
-
-function initializeFilters() {
-    const toggleBtn = document.getElementById('filter-toggle-btn');
-    const container = document.getElementById('filters-container');
-    const content = document.getElementById('filter-content');
-
-    if (toggleBtn && container && content) {
-        // Using .onclick ensures we only ever have one click handler
-        toggleBtn.onclick = () => {
-            const isExpanded = container.classList.contains('expanded');
-
-            if (isExpanded) {
-                // Collapse the container
-                container.classList.remove('expanded');
-                toggleBtn.textContent = '⏷ Filters';
-            } else {
-                // Expand the container
-                content.classList.remove('hidden'); // Make sure content is visible for animation
-                container.classList.add('expanded');
-                toggleBtn.textContent = '⏶ Filters';
-            }
-        };
-    }
-
-    // This part is correct and doesn't need to change
-    document.querySelectorAll('.filter-btn').forEach(button => {
-        button.addEventListener('click', handleFilterClick);
-    });
-}
-
-function handleFilterClick(event) {
-    const button = event.target;
-    const filterType = button.dataset.filterType;
-    const value = button.dataset.value;
-
-    if (filterType === 'type') currentFilterType = value;
-    if (filterType === 'format') currentFilterFormat = value;
-    if (filterType === 'sort') currentSortBy = value;
-
-    if (button.id === 'sort-order-btn') {
-        isSortReversed = !isSortReversed;
-        button.textContent = isSortReversed ? '↑' : '↓';
-    }
-
-    document.querySelectorAll(`.filter-btn[data-filter-type="${filterType}"]`).forEach(btn => {
-        btn.classList.remove('active');
-    });
-    if (filterType) { // Don't try to activate the sort order button
-        button.classList.add('active');
-    }
-
-    applyFiltersAndSort();
-}
-
-function resetFilters() {
-    currentFilterType = 'all';
-    currentFilterFormat = 'all';
-    currentSortBy = 'quality_score';
-    isSortReversed = false;
-
-    document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
-    document.querySelector('.filter-btn[data-filter-type="type"][data-value="all"]').classList.add('active');
-    document.querySelector('.filter-btn[data-filter-type="format"][data-value="all"]').classList.add('active');
-    document.querySelector('.filter-btn[data-filter-type="sort"][data-value="quality_score"]').classList.add('active');
-    document.getElementById('sort-order-btn').textContent = '↓';
-}
-
-function applyFiltersAndSort() {
-    let processedResults = [...allSearchResults];
-    const query = document.getElementById('downloads-search-input').value.trim().toLowerCase();
-
-    // 1. Filter by Type
-    if (currentFilterType !== 'all') {
-        processedResults = processedResults.filter(r => r.result_type === currentFilterType);
-    }
-
-    // 2. Filter by Format
-    if (currentFilterFormat !== 'all') {
-        processedResults = processedResults.filter(r => {
-            const quality = (r.dominant_quality || r.quality || '').toLowerCase();
-            return quality === currentFilterFormat;
-        });
-    }
-
-    // 3. Sort Results
-    processedResults.sort((a, b) => {
-        let valA, valB;
-
-        // Special handling for relevance sort
-        if (currentSortBy === 'relevance') {
-            valA = calculateRelevanceScore(a, query);
-            valB = calculateRelevanceScore(b, query);
-            return valB - valA; // Higher score is better
-        }
-
-        // Special handling for availability
-        if (currentSortBy === 'availability') {
-            valA = (a.free_upload_slots || 0) - (a.queue_length || 0) * 0.1;
-            valB = (b.free_upload_slots || 0) - (b.queue_length || 0) * 0.1;
-            return valB - valA;
-        }
-
-        valA = a[currentSortBy] || 0;
-        valB = b[currentSortBy] || 0;
-
-        if (typeof valA === 'string') {
-            // For name/title sort, use the correct property
-            const titleA = (a.album_title || a.title || '').toLowerCase();
-            const titleB = (b.album_title || b.title || '').toLowerCase();
-            return titleA.localeCompare(titleB);
-        }
-
-        // Default numeric sort (descending)
-        return valB - valA;
-    });
-
-    // Handle sort direction toggle
-    const sortDefaults = {
-        relevance: 'desc', quality_score: 'desc', size: 'desc', bitrate: 'desc',
-        upload_speed: 'desc', duration: 'desc', availability: 'desc',
-        title: 'asc', username: 'asc'
-    };
-
-    const defaultOrder = sortDefaults[currentSortBy] || 'desc';
-    if ((defaultOrder === 'asc' && isSortReversed) || (defaultOrder === 'desc' && !isSortReversed)) {
-        processedResults.reverse();
-    }
-
-    displayDownloadsResults(processedResults);
-}
-
-function calculateRelevanceScore(result, query) {
-    let score = 0.0;
-    const queryTerms = query.split(' ').filter(t => t.length > 1);
-
-    // 1. Search Term Matching (40%)
-    let searchableText = `${result.title || ''} ${result.artist || ''} ${result.album || ''} ${result.album_title || ''}`.toLowerCase();
-    let termMatches = 0;
-    for (const term of queryTerms) {
-        if (searchableText.includes(term)) {
-            termMatches++;
-        }
-    }
-    score += (termMatches / queryTerms.length) * 0.40;
-
-    // 2. Quality Score (25%)
-    score += (result.quality_score || 0) * 0.25;
-
-    // 3. User Reliability (Availability & Speed) (20%)
-    const reliability = ((result.free_upload_slots || 0) > 0 ? 0.5 : 0) + Math.min(1, (result.upload_speed || 0) / 500) * 0.5;
-    score += reliability * 0.20;
-
-    // 4. File Completeness (Bitrate & Duration) (15%)
-    const completeness = (Math.min(1, (result.bitrate || 0) / 320) * 0.5) + (result.duration > 0 ? 0.5 : 0);
-    score += completeness * 0.15;
-
-    return score;
-}
-
 // Add to global scope for onclick
 window.handleFilterClick = handleFilterClick;
 
@@ -6497,6 +6384,40 @@ const TOOL_HELP_CONTENT = {
                 <li><strong>Albums:</strong> Total cached album records</li>
                 <li><strong>Tracks:</strong> Total cached track records</li>
                 <li><strong>Hits:</strong> Total number of times cached data was served instead of making an API call</li>
+            </ul>
+        `
+    },
+    'video-backups': {
+        title: 'Video Database Backups',
+        content: `
+            <h4>What is this?</h4>
+            <p>Automatic safety copies of the video library database (matches, wishlist, watchlist, settings — everything). A backup is taken on a schedule and kept in rotation; you can also take one on demand with <strong>Back up now</strong>.</p>
+
+            <h4>Restoring</h4>
+            <p>Restoring is <em>staged</em>: the backup you pick is applied on the next app restart, and the database it replaces is kept next to it as a <code>.pre-restore</code> copy — so even a restore is reversible. You can cancel a staged restore any time before restarting.</p>
+
+            <h4>Good to know</h4>
+            <ul>
+                <li>Backups only cover the video database — your actual media files are never touched.</li>
+                <li>The newest 8 backups are kept; older ones rotate out automatically.</li>
+                <li>Download a backup from the list to keep an off-machine copy.</li>
+            </ul>
+        `
+    },
+    'video-rename': {
+        title: 'Mass Rename',
+        content: `
+            <h4>What is this?</h4>
+            <p>Naming templates (Settings → Organization) normally apply only when a file is imported. If you change the templates later, your library ends up with two naming eras. Mass Rename re-renders <em>every</em> owned file name to the current templates.</p>
+
+            <h4>How it works</h4>
+            <p><strong>Preview</strong> lists every file whose on-disk name differs from what the templates say — nothing is touched. <strong>Apply renames</strong> then performs the moves: subtitles and other sidecar files travel with their video, and the database follows each move.</p>
+
+            <h4>Safety</h4>
+            <ul>
+                <li>An occupied destination is skipped with a reason — a rename never overwrites another file.</li>
+                <li>Files never move across library roots; they are renamed in place under the folder they already live in.</li>
+                <li>Your media server re-adopts the new names on its next library scan — run one after applying.</li>
             </ul>
         `
     }

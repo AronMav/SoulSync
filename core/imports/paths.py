@@ -25,6 +25,40 @@ from core.imports.context import (
 logger = logging.getLogger("imports.paths")
 
 
+def artist_letter(artist, symbol_fallback=None):
+    """The $artistletter value — the ONE implementation all four call sites
+    share (both template engines + the music-video path builder).
+
+    Literal mode (default, historical behavior byte-for-byte): the raw first
+    character uppercased — '365 Days' → '3', 'Édith Piaf' → 'É'.
+
+    Symbol-fallback mode (file_organization.artistletter_symbol_fallback,
+    #1072 QT3496): diacritics fold to their base letter first (Édith → E —
+    the iTunes/Plex shelving convention; É belongs under E, not #), then
+    anything that doesn't resolve to A-Z (digits, symbols, CJK, Cyrillic,
+    ...) lands in one '#' catch-all instead of fragmenting the library into
+    per-character folders.
+
+    ``symbol_fallback=None`` reads the config; pass a bool to force either
+    mode (tests, previews).
+    """
+    literal = (artist or "U")[0].upper()
+    if symbol_fallback is None:
+        try:
+            from config.settings import config_manager
+            symbol_fallback = bool(config_manager.get(
+                "file_organization.artistletter_symbol_fallback", False))
+        except Exception:   # config unavailable → historical behavior
+            symbol_fallback = False
+    if not symbol_fallback:
+        return literal
+    import unicodedata
+    folded = unicodedata.normalize("NFKD", str(artist or ""))
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    lead = folded[:1].upper()
+    return lead if "A" <= lead <= "Z" else "#"
+
+
 def _get_config_manager():
     try:
         from config.settings import config_manager
@@ -200,6 +234,11 @@ def get_album_type_display(raw_type, track_count) -> str:
     if raw == "album":
         return "Album"
     if raw in ("single", "ep"):
+        # Unknown track count must not collapse to Single: an EP whose count
+        # was lost in a handoff kept getting filed as [Single] (#1064). With
+        # no count, trust the source's own word.
+        if tc <= 0:
+            return "EP" if raw == "ep" else "Single"
         if tc <= 3:
             return "Single"
         if tc <= 6:
@@ -251,7 +290,7 @@ def _replace_template_variables(template: str, context: dict) -> str:
         "albumartist": album_artist_value,
         "albumtype": clean_context.get("albumtype", "Album"),
         "playlist": clean_context.get("playlist_name", ""),
-        "artistletter": (clean_context.get("artist", "U") or "U")[0].upper(),
+        "artistletter": artist_letter(clean_context.get("artist", "U")),
         "artist": clean_context.get("artist", "Unknown Artist"),
         "album": clean_context.get("album", "Unknown Album"),
         "title": clean_context.get("title", "Unknown Track"),
@@ -270,7 +309,7 @@ def _replace_template_variables(template: str, context: dict) -> str:
     result = result.replace("$albumartist", album_artist_value)
     result = result.replace("$albumtype", clean_context.get("albumtype", "Album"))
     result = result.replace("$playlist", clean_context.get("playlist_name", ""))
-    result = result.replace("$artistletter", (clean_context.get("artist", "U") or "U")[0].upper())
+    result = result.replace("$artistletter", artist_letter(clean_context.get("artist", "U")))
     result = result.replace("$artist", clean_context.get("artist", "Unknown Artist"))
     result = result.replace("$album", clean_context.get("album", "Unknown Album"))
     result = result.replace("$title", clean_context.get("title", "Unknown Track"))
@@ -357,10 +396,22 @@ def get_file_path_from_template(context: dict, template_type: str = "album_path"
 
     templates = _get_config_manager().get("file_organization.templates", {})
     template = templates.get(template_type)
+    # The settings page used to seed the singles input with this exact string
+    # and Save persisted it — so most installs carry the old default without
+    # ever having customized anything. A stored value that IS the old default
+    # upgrades to the new one (same pattern as the YouTube template upgrade);
+    # anything the user actually edited is untouched.
+    if template_type == "single_path" and template == "$artist/$artist - $title/$title":
+        template = None
     if not template:
         default_templates = {
             "album_path": "$albumartist/$albumartist - $album/$track - $title",
-            "single_path": "$artist/$artist - $title/$title",
+            # $albumartist, not $artist, for the FOLDER identity: only
+            # $albumartist honors the Collaborative Album Artist setting, so a
+            # multi-artist single ("A, B & C") files under its main artist when
+            # the mode is 'first' (TheHomeGuy). For single-artist tracks the two
+            # are identical; users with a CUSTOM template are untouched.
+            "single_path": "$albumartist/$albumartist - $title/$title",
             "compilation_path": "Compilations/$album/$track - $artist - $title",
             "playlist_path": "$playlist/$artist - $title",
         }
@@ -608,8 +659,23 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         # any miss falls through to the template path below. Best-effort.
         # Compilations skip reuse — their namespace moved from artist-based to
         # Compilations/, so matching an old artist folder would scatter tracks.
+        # Multi-disc albums skip reuse too (#1009): their correct layout is
+        # SEVERAL folders (one per disc — $cdnum/$disc templates or the auto
+        # "Disc N" folder), but the resolver can only answer "the album's one
+        # existing folder" (DatabaseTrack carries no disc number). Mid-download
+        # that one folder is whichever disc landed first, so every later track
+        # of a box set would be funneled into it — collapsing all discs into a
+        # single disc folder and colliding same-numbered filenames.
+        # Reorganize disables reuse outright (`_no_album_folder_reuse`): its whole
+        # job is to move albums OUT of the folder they currently sit in, and the
+        # resolver would answer with exactly that folder — making every reorganize
+        # compute "destination == current location" and no-op (the template-change
+        # complaint from TheHomeGuy).
         reuse_folder = None
-        if filename_base and raw_album_type not in ("compilation", "compile"):
+        _multi_disc_album = total_discs > 1 or disc_number > 1
+        if (filename_base and not _multi_disc_album
+                and raw_album_type not in ("compilation", "compile")
+                and not context.get("_no_album_folder_reuse")):
             try:
                 from core.library.existing_album_folder import resolve_existing_album_folder
                 from database.music_database import get_database

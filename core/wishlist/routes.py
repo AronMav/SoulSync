@@ -488,6 +488,68 @@ def remove_album_from_wishlist(
         return {"success": False, "error": str(exc)}, 500
 
 
+def _primary_artist_name(spotify_data: Dict[str, Any]) -> str:
+    artists = spotify_data.get("artists") or []
+    if isinstance(artists, list) and artists:
+        first = artists[0]
+        if isinstance(first, dict):
+            return str(first.get("name") or "")
+        return str(first or "")
+    return ""
+
+
+def remove_artist_from_wishlist(
+    runtime: WishlistRouteRuntime,
+    artist_name: str,
+) -> tuple[Dict[str, Any], int]:
+    """Remove EVERY wishlist track whose primary artist matches (#1065).
+
+    QT3496: excluding one artist from a big discography wishlist meant
+    unchecking / deleting every album one by one. Mirrors the per-album
+    removal exactly — each removed track gets an ignore entry (#874) so the
+    next watchlist/discography pass doesn't quietly re-add the artist."""
+    try:
+        artist_name = str(artist_name or "").strip()
+        if not artist_name:
+            return {"success": False, "error": "Missing artist_name"}, 400
+        wanted = artist_name.lower()
+
+        wishlist_service = get_wishlist_service()
+        all_tracks = wishlist_service.get_wishlist_tracks_for_download(profile_id=runtime.profile_id)
+
+        tracks_to_remove = []
+        for track in all_tracks:
+            spotify_data = _load_track_spotify_data(track)
+            if _primary_artist_name(spotify_data).lower().strip() != wanted:
+                continue
+            spotify_track_id = track.get("track_id") or track.get("spotify_track_id") or track.get("id")
+            if spotify_track_id:
+                tracks_to_remove.append((spotify_track_id, spotify_data))
+
+        from core.wishlist.ignore import ignore_wishlist_track, REASON_REMOVED
+        _db = getattr(wishlist_service, "database", None)
+        removed_count = 0
+        pid = runtime.profile_id
+        for spotify_track_id, track_spotify_data in tracks_to_remove:
+            if wishlist_service.remove_track_from_wishlist(spotify_track_id, profile_id=pid):
+                removed_count += 1
+                ignore_wishlist_track(_db, pid, spotify_track_id, REASON_REMOVED,
+                                      spotify_data=track_spotify_data)
+
+        if removed_count > 0:
+            runtime.logger.info("Removed %s wishlist track(s) for artist %r",
+                                removed_count, artist_name)
+            return {
+                "success": True,
+                "message": f"Removed {removed_count} track(s) by {artist_name}",
+                "removed_count": removed_count,
+            }, 200
+        return {"success": False, "error": "No wishlist tracks found for this artist"}, 404
+    except Exception as exc:
+        runtime.logger.error("Error removing artist from wishlist: %s", exc)
+        return {"success": False, "error": str(exc)}, 500
+
+
 def remove_batch_from_wishlist(
     runtime: WishlistRouteRuntime,
     spotify_track_ids,
@@ -533,13 +595,22 @@ def add_album_track_to_wishlist(
     album: Dict[str, Any] | None,
     source_type: str = "album",
     source_context: Dict[str, Any] | None = None,
+    quality_profile_id: int | None = None,
 ) -> tuple[Dict[str, Any], int]:
-    """Add a single album track to the wishlist."""
+    """Add a single album track to the wishlist.
+
+    ``quality_profile_id`` is the durable acquisition intent chosen in the
+    shared "Tracks to Add to Wishlist" dialog. It travels all the way to the
+    stored row so the same track gets the same rules regardless of which page
+    the user started from (P1-01). ``None`` keeps the app-wide default.
+    """
     try:
         if not track or not artist or not album:
             return {"success": False, "error": "Missing required fields: track, artist, album"}, 400
 
         track_data = _build_track_data(track, album)
+        if quality_profile_id is not None:
+            track_data["quality_profile_id"] = quality_profile_id
 
         # #825: don't add a track that's already in the library, unless the user
         # has opted into duplicates. The manual album "add to wishlist" modal
@@ -587,6 +658,7 @@ def add_album_track_to_wishlist(
             # ignore-list, even if the user previously cancelled this track
             # (otherwise the add is silently dropped — carlosjfcasero, #897).
             user_initiated=True,
+            quality_profile_id=quality_profile_id,
         )
 
         if success:

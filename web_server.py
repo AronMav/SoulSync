@@ -45,7 +45,7 @@ logger = setup_logging(_log_level, _log_path)
 
 # App version — single source of truth for backup metadata, system-info, update check, etc.
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
-_SOULSYNC_BASE_VERSION = "2.8.8"
+_SOULSYNC_BASE_VERSION = "3.1.9"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -87,6 +87,7 @@ if not pp_logger.handlers:
     _pp_handler.setFormatter(_logging.Formatter("%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     pp_logger.addHandler(_pp_handler)
     pp_logger.propagate = False
+from core.api_validation import parse_strict_bool, parse_strict_id, parse_strict_int
 from core.spotify_client import SpotifyClient, Playlist as SpotifyPlaylist, Track as SpotifyTrack, _is_globally_rate_limited as _spotify_rate_limited, SPOTIFY_OAUTH_SCOPE
 from core.plex_client import PlexClient
 from core.ui_appearance import is_firefox_user_agent, resolve_worker_orbs_default
@@ -125,6 +126,7 @@ from core.imports.context import (
 )
 from core.wishlist.payloads import (
     build_cancelled_task_wishlist_payload as _build_cancelled_task_wishlist_payload,
+    resolve_task_quality_profile_id,
     build_failed_track_wishlist_context as _build_failed_track_wishlist_context,
     ensure_wishlist_track_format as _ensure_wishlist_track_format,
     get_track_artist_name as _get_track_artist_name,
@@ -139,6 +141,7 @@ from core.wishlist.routes import (
     get_wishlist_tracks as _wishlist_get_wishlist_tracks,
     process_wishlist_api as _wishlist_process_api,
     remove_album_from_wishlist as _wishlist_remove_album_from_wishlist,
+    remove_artist_from_wishlist as _wishlist_remove_artist_from_wishlist,
     remove_batch_from_wishlist as _wishlist_remove_batch_from_wishlist,
     remove_track_from_wishlist as _wishlist_remove_track_from_wishlist,
     set_wishlist_cycle as _wishlist_set_wishlist_cycle,
@@ -165,6 +168,7 @@ from core.wishlist.state import (
     reset_flag_if_stuck as _reset_wishlist_flag_if_stuck,
 )
 from core.imports.album_naming import resolve_album_group as _resolve_album_group
+from core.imports.paths import artist_letter as _shared_artist_letter
 from core.imports.album import build_album_import_match_payload
 from core.imports.filename import extract_track_number_from_filename, parse_filename_metadata
 from core.imports.staging import (
@@ -475,6 +479,26 @@ socketio = SocketIO(app, async_mode='threading', cors_allowed_origins=_socketio_
 _log_socketio_startup_status(_socketio_cors_origins, logger)
 _socketio_rejection_logger = _SocketIORejectionLogger(logger)
 set_activity_toast_emitter(socketio.emit)
+# Live overlay-apply progress → 'overlay:progress' socket events (bell + panel).
+from core.video.overlays.service import set_overlay_progress_emitter as _set_overlay_emit
+_set_overlay_emit(socketio.emit)
+# Live collection-cleanup progress → 'collections:cleanup' socket events (studio).
+from core.video.collections.server_cleanup import set_cleanup_progress_emitter as _set_cleanup_emit
+_set_cleanup_emit(socketio.emit)
+# Live collection-sync progress → 'collections:sync' socket events (bell + studio).
+from core.video.collections.sync_job import set_sync_progress_emitter as _set_colsync_emit
+_set_colsync_emit(socketio.emit)
+# Live artwork-refresh progress → 'collections:artwork' socket events (bell + studio).
+from core.video.collections.poster_gen import set_artwork_progress_emitter as _set_colart_emit
+_set_colart_emit(socketio.emit)
+# Live bulk-metadata progress → 'video:bulk' socket events (bell + library bar).
+from core.video.bulk_ops import set_bulk_progress_emitter as _set_bulk_emit
+_set_bulk_emit(socketio.emit)
+# Video Library Maintenance (jobs & findings): live 'video:repair:progress'
+# socket events + the scheduler thread (force-runs work even when disabled).
+from core.video.repair.worker import get_video_repair_worker as _get_video_repair
+_get_video_repair().set_emitter(socketio.emit)
+_get_video_repair().start()
 
 # Plex PIN auth requests stored in memory for polling
 _plex_pin_requests = {}
@@ -609,8 +633,15 @@ def _set_profile_context():
 
     pid = session.get('profile_id', 1)
 
-    # Validate session profile still exists (handles deleted profiles)
+    # Validate session profile still exists (handles deleted profiles), and stash
+    # download permission on g so isolated blueprints (video) can gate without a
+    # music-DB read. Admin (1) is always allowed.
+    g.can_download = True
+    g.profile_name = "Admin"   # display name for isolated blueprints (video issues reporter)
+    g.is_admin = True          # profile 1 is always admin; others per their is_admin flag
+    g.allowed_sides = 'both'   # per-profile side access (music|video|both); admins always both
     if pid != 1 and 'profile_id' in session:
+        g.is_admin = False
         try:
             database = get_database()
             profile = database.get_profile(pid)
@@ -618,6 +649,12 @@ def _set_profile_context():
                 session.pop('profile_id', None)
                 from flask import jsonify as _jsonify
                 return _jsonify({"error": "profile_required", "message": "Profile no longer exists"}), 401
+            g.can_download = bool((profile or {}).get('can_download', True))
+            g.profile_name = (profile or {}).get('name') or ("Profile %s" % pid)
+            g.is_admin = bool((profile or {}).get('is_admin', False))
+            # get_profile resolves defaults (non-admin NULL → 'music'), so the
+            # video blueprint can gate off g without a second music-DB read.
+            g.allowed_sides = (profile or {}).get('allowed_sides') or 'music'
         except Exception as e:
             logger.debug("profile session validate: %s", e)
 
@@ -709,6 +746,31 @@ def _add_discover_cache_headers(response):
         # a 500 — log and ship the response without the cache header.
         logger.warning(f"[discover-cache-headers] failed for {request.path}: {exc}")
     return response
+
+
+def mirrored_playlist_visible(playlist) -> bool:
+    """Owner-or-admin gate for by-id mirrored-playlist routes (IDOR fix).
+
+    Every /api/mirrored-playlists/<id>/* route used to act on any playlist id
+    regardless of who owned it — profile 2 could read, rename, re-point,
+    pipeline-run, or DELETE profile 3's playlists by iterating ids. The list
+    endpoint was always profile-scoped; the by-id ones now match it. Callers
+    answer 404 (not 403) on failure so foreign ids aren't probeable.
+
+    Background/system callers (no request context) resolve to profile 1 via
+    get_current_profile_id() and pass the admin check — automation pipelines
+    keep working exactly as before."""
+    if not playlist:
+        return False
+    try:
+        if bool(getattr(g, "is_admin", True)):
+            return True
+    except RuntimeError:
+        return True   # no request context = system caller
+    try:
+        return int(playlist.get('profile_id') or 1) == int(get_current_profile_id())
+    except (TypeError, ValueError):
+        return False
 
 
 def get_current_profile_id() -> int:
@@ -843,6 +905,17 @@ VALID_PAGE_IDS = {
     'help',
     'hydrabase',
     'issues',
+    # Video side — per-profile page toggles (admin-only surfaces are gated separately,
+    # not via allowed_pages: overlay studio, video-import, video-settings, video-automations).
+    'video-dashboard',
+    'video-search',
+    'video-discover',
+    'video-library',
+    'video-watchlist',
+    'video-wishlist',
+    'video-downloads',
+    'video-calendar',
+    'video-tools',
 }
 
 def check_download_permission():
@@ -1213,6 +1286,10 @@ from core.runtime_state import batch_locks
 _orphaned_download_keys = set()
 
 _enrichment_activity_log = {}
+# Guards _enrichment_activity_log's deques: every /status request appends to
+# and scans them via _get_windowed_calls, so concurrent polls (multiple tabs)
+# race into "deque mutated during iteration" without it.
+_enrichment_activity_lock = threading.Lock()
 _idle_since = {}
 _IDLE_GRACE_SECONDS = 5
 
@@ -1390,6 +1467,27 @@ def _register_automation_handlers():
     )
     _register_extracted_handlers(_automation_deps)
 
+    # Bridge the isolated video download monitor's batch-complete signal into the
+    # automation engine (core/video can't import the engine). Mirrors how the music
+    # web_scan_manager forwards library_scan_completed. ONE forwarder relays EVERY
+    # published video event (batch complete, download completed/failed, repair
+    # findings, wishlist/watchlist changes, ...) to its same-named event trigger.
+    if automation_engine is not None:
+        try:
+            from core.video.download_events import register_event_forwarder
+            register_event_forwarder(
+                lambda etype, data: automation_engine.emit(etype, data or {}))
+        except Exception:
+            logger.exception("Could not wire video events -> automation engine")
+    # Notifications (arr-parity P11): a second forwarder fans the same events
+    # out to configured Discord/webhook/Telegram connections. Independent of
+    # the engine — notify still works if automations are off.
+    try:
+        from core.video.download_events import register_event_forwarder as _reg_fw
+        from core.video.notifications import handle_event as _notify_handle
+        _reg_fw(_notify_handle)
+    except Exception:
+        logger.exception("Could not wire video events -> notifications")
 
     logger.info("Automation action handlers registered")
 
@@ -2394,23 +2492,24 @@ def _get_windowed_calls(key, current_total):
     Deque stores (timestamp, cumulative_total) in chronological order.
     To get calls in a window: current_total minus the oldest total within that window."""
     now = time.time()
-    history = _enrichment_activity_log.setdefault(key, collections.deque(maxlen=17300))
-    history.append((now, current_total))
-
     cutoff_1h = now - 3600
     cutoff_24h = now - 86400
 
-    # Forward scan: first entry with ts >= cutoff is the oldest in that window
-    oldest_1h_total = current_total
-    oldest_24h_total = current_total
-    found_24h = False
-    for ts, total in history:
-        if not found_24h and ts >= cutoff_24h:
-            oldest_24h_total = total
-            found_24h = True
-        if ts >= cutoff_1h:
-            oldest_1h_total = total
-            break
+    with _enrichment_activity_lock:
+        history = _enrichment_activity_log.setdefault(key, collections.deque(maxlen=17300))
+        history.append((now, current_total))
+
+        # Forward scan: first entry with ts >= cutoff is the oldest in that window
+        oldest_1h_total = current_total
+        oldest_24h_total = current_total
+        found_24h = False
+        for ts, total in history:
+            if not found_24h and ts >= cutoff_24h:
+                oldest_24h_total = total
+                found_24h = True
+            if ts >= cutoff_1h:
+                oldest_1h_total = total
+                break
 
     return max(0, current_total - oldest_1h_total), max(0, current_total - oldest_24h_total)
 
@@ -2685,6 +2784,20 @@ def fix_navidrome_urls():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+def _m3u_entry_path(path):
+    """Final transforms for one m3u entry line: the prefix hot-swap
+    (m3u_export.rewrite_from → rewrite_to, wolf39us — container path in,
+    playback-machine path out) and the '#' comment-guard (#1072). Shared
+    logic lives in core.library.m3u_export.finalize_m3u_entry; this wrapper
+    just feeds it the configured mapping. Empty settings = '#'-guard only."""
+    from core.library.m3u_export import finalize_m3u_entry
+    return finalize_m3u_entry(
+        path,
+        rewrite_from=config_manager.get('m3u_export.rewrite_from', '') or '',
+        rewrite_to=config_manager.get('m3u_export.rewrite_to', '') or '',
+    )
+
+
 def _regenerate_batch_m3u(batch, tracks):
     """Regenerate M3U file for a completed batch using real library DB paths.
     Called from batch completion handler after all post-processing is done."""
@@ -2747,7 +2860,7 @@ def _regenerate_batch_m3u(batch, tracks):
             lines.append(f'#EXTINF:{dur_s},{artist} - {name}')
             fp = file_path_map.get(idx)
             if fp:
-                path = f'{entry_base_path}/{fp}' if entry_base_path else fp
+                path = _m3u_entry_path(f'{entry_base_path}/{fp}' if entry_base_path else fp)
                 lines.append(path)
                 found += 1
             else:
@@ -2935,7 +3048,7 @@ def generate_playlist_m3u():
             if file_path:
                 found_count += 1
                 lines.append('#STATUS:FOUND_IN_LIBRARY')
-                entry = f'{entry_base_path}/{file_path}' if entry_base_path else file_path
+                entry = _m3u_entry_path(f'{entry_base_path}/{file_path}' if entry_base_path else file_path)
                 lines.append(entry.replace('\\', '/'))
             else:
                 missing_count += 1
@@ -3092,6 +3205,79 @@ def get_system_stats():
         return jsonify(_build_system_stats())
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/server-activity')
+def get_server_activity():
+    """Live Tautulli-style activity — every active Plex stream (music + video):
+    who's playing what, direct play vs transcode, bandwidth, progress. App-wide;
+    never raises (an unconfigured/down server is a normal state the UI shows)."""
+    try:
+        from core.server_activity import get_activity
+        return jsonify(get_activity())
+    except Exception:
+        logger.exception("server activity failed")
+        return jsonify({"ok": False, "reason": "error", "sessions": [],
+                        "summary": {"streams": 0}})
+
+
+@app.route('/api/server-activity/history')
+def get_server_activity_history():
+    """Recent watch/listen history (Tautulli's History) — app-wide."""
+    try:
+        from core.server_activity import get_history
+        limit = request.args.get("limit", default=40, type=int) or 40
+        return jsonify(get_history(limit=limit))
+    except Exception:
+        logger.exception("server activity history failed")
+        return jsonify({"ok": False, "reason": "error", "history": []})
+
+
+@app.route('/api/server-activity/stats')
+def get_server_activity_stats():
+    """Dashboard stats — most-watched, most-active users, plays over time, top
+    devices (Tautulli's Statistics). App-wide; cached; never raises."""
+    try:
+        from core.server_activity import get_stats
+        days = request.args.get("days", default=30, type=int) or 30
+        return jsonify(get_stats(days=days))
+    except Exception:
+        logger.exception("server activity stats failed")
+        return jsonify({"ok": False, "reason": "error"})
+
+
+@app.route('/api/server-activity/stop', methods=['POST'])
+def stop_server_activity_stream():
+    """Terminate an active stream with a message (Tautulli's kill move).
+    Admin-only — a shared server shouldn't let anyone end others' streams."""
+    try:
+        if not getattr(g, 'is_admin', False):
+            return jsonify({"ok": False, "error": "Admin only."}), 403
+        body = request.get_json(silent=True) or {}
+        from core.server_activity import stop_session
+        res = stop_session(str(body.get("session_key") or ""), str(body.get("message") or ""))
+        return jsonify(res), (200 if res.get("ok") else 400)
+    except Exception:
+        logger.exception("stop stream failed")
+        return jsonify({"ok": False, "error": "Failed to stop the stream."}), 500
+
+
+@app.route('/api/server-activity/image')
+def get_server_activity_image():
+    """Proxy a Plex image (poster/art) for the activity view so the token never
+    reaches the browser. ?path=/library/metadata/.../thumb/..."""
+    from flask import Response
+    try:
+        from core.server_activity import fetch_image
+        got = fetch_image(request.args.get("path") or "")
+        if not got:
+            return ("", 404)
+        content, ctype = got
+        return Response(content, mimetype=ctype,
+                        headers={"Cache-Control": "public, max-age=300"})
+    except Exception:
+        logger.exception("server activity image proxy failed")
+        return ("", 404)
 
 
 from core.debug_info import (
@@ -3468,6 +3654,13 @@ def handle_settings():
                 data['_source_status'] = download_orchestrator.get_source_status()
             except Exception as e:
                 logger.debug("download source status read failed: %s", e)
+            # Deployment environment: the folder-paths guidance differs by world
+            # (Docker: leave container paths alone / bare-metal-LXC: you MUST edit
+            # them). A fresh non-Docker install still on the ./Transfer default
+            # dumps every download onto the install disk — Proxmox LXCs default
+            # to an 8GB root, which fills until the container hangs — so the UI
+            # needs to know which story to tell and when to warn.
+            data['_environment'] = {'docker': os.path.exists('/.dockerenv')}
             return jsonify(data)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -3901,6 +4094,42 @@ def list_automations():
         logger.error(f"Error listing automations: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/api/automations/master', methods=['GET'])
+def get_automations_master():
+    """The per-side global pause state ({music: bool, video: bool}).
+    It gates whether ANY automation runs on that side — individual enabled
+    flags are untouched, so un-pausing restores exactly what the user had."""
+    try:
+        from core.automation_engine import AutomationEngine
+        return jsonify({side: (automation_engine.master_enabled(side) if automation_engine
+                               else AutomationEngine.MASTER_DEFAULTS[side])
+                        for side in ('music', 'video')})
+    except Exception as e:
+        logger.error(f"Error reading automations master state: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/automations/master', methods=['POST'])
+@admin_only
+def set_automations_master():
+    """Flip one side's global automation pause. Body: {side, enabled}.
+    Admin-only — it silences every automation on a side, not just yours."""
+    try:
+        data = request.get_json(silent=True) or {}
+        side = (data.get('side') or '').strip().lower()
+        if side not in ('music', 'video'):
+            return jsonify({"success": False, "error": "side must be music or video"}), 400
+        if automation_engine is None:
+            return jsonify({"success": False, "error": "Automation engine unavailable"}), 503
+        enabled = bool(data.get('enabled'))
+        automation_engine.set_master_enabled(side, enabled)   # persists to the engine DB
+        logger.info("Automations master for %s side set to %s", side, 'ON' if enabled else 'PAUSED')
+        return jsonify({"success": True, "side": side, "enabled": enabled})
+    except Exception as e:
+        logger.error(f"Error setting automations master state: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route('/api/automations', methods=['POST'])
 def create_automation():
     """Create a new automation."""
@@ -4057,13 +4286,47 @@ def list_available_scripts():
 
 @app.route('/api/automations/blocks', methods=['GET'])
 def get_automation_blocks():
-    """Return available block types for the automation builder sidebar."""
-    return jsonify({
-        'triggers': _auto_blocks.TRIGGERS,
-        'actions': _auto_blocks.ACTIONS,
-        'notifications': _auto_blocks.NOTIFICATIONS,
-        'known_signals': _collect_known_signals(),
-    })
+    """Return available block types for the automation builder sidebar.
+
+    Music builder only — video-only blocks (scope='video') are filtered out
+    so the music builder never offers a video action. The video side fetches
+    its own scope via /api/video/automations/blocks."""
+    scoped = _auto_blocks.blocks_for_scope('music')
+    scoped['known_signals'] = _collect_known_signals()
+    return jsonify(scoped)
+
+@app.route('/api/automations/test-notify', methods=['POST'])
+def test_automation_notify():
+    """Fire ONE notification step with sample variables — the builder's Test
+    button. Sends for real (that's the point: prove the webhook/token works)
+    but against sample data, without running any automation."""
+    try:
+        if automation_engine is None:
+            return jsonify({'success': False, 'error': 'Automation engine not running'}), 400
+        data = request.get_json(silent=True) or {}
+        ntype = str(data.get('type') or '')
+        config = data.get('config') or {}
+        variables = {
+            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'name': 'Test Automation',
+            'run_count': '1',
+            'status': 'completed',
+            'artist': 'Test Artist', 'title': 'Test Track', 'album': 'Test Album',
+            'kind': 'movie', 'quality': '1080p', 'error': 'sample error text',
+        }
+        senders = {
+            'discord_webhook': automation_engine._send_discord_notification,
+            'pushbullet': automation_engine._send_pushbullet_notification,
+            'telegram': automation_engine._send_telegram_notification,
+            'webhook': automation_engine._send_webhook,
+        }
+        sender = senders.get(ntype)
+        if sender is None:
+            return jsonify({'success': False, 'error': f'Cannot test {ntype or "this step"}'}), 400
+        sender(config, variables)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 200
 
 @app.route('/api/mirrored-playlists/list', methods=['GET'])
 def get_mirrored_playlists_list():
@@ -4201,6 +4464,62 @@ def settings_config_status_endpoint():
     except Exception as e:
         logger.error(f"config-status error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+# ── Config export / import (Kazimir: "checkout" menu for migrating installs) ──
+@app.route('/api/config/export', methods=['GET'])
+@admin_only
+def export_config_bundle():
+    """One portable JSON bundle for BOTH sides. ?secrets=1 embeds real
+    credentials (plaintext — the UI gates this behind an explicit opt-in);
+    default redacts them so the export is safe to share."""
+    if not config_manager:
+        return jsonify({"error": "Config manager unavailable"}), 500
+    from datetime import datetime, timezone
+
+    from api.video import get_video_db
+    from core.config_export import build_bundle
+    include_secrets = request.args.get('secrets', '0') in ('1', 'true', 'yes')
+    # Plaintext-credential export is the ONLY endpoint that leaks real secrets,
+    # so it must sit behind actual authentication. With login OFF, @admin_only
+    # trusts every LAN request as admin — refuse, or anyone who can reach the
+    # port could pull every key. The redacted export stays available to all.
+    if include_secrets and not _require_login_enabled():
+        return jsonify({
+            "success": False,
+            "error": "Exporting credentials requires login mode. Enable "
+                     "Settings → Security → Require login first, or export "
+                     "without credentials (they'll be re-entered on the new install).",
+        }), 403
+    bundle = build_bundle(
+        config_manager, get_video_db(),
+        include_secrets=include_secrets,
+        exported_at=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        app_version=SOULSYNC_VERSION.split('+')[0],
+    )
+    return jsonify(bundle)
+
+
+@app.route('/api/config/import', methods=['POST'])
+@admin_only
+def import_config_bundle():
+    """Apply a config bundle exported from another install. Validates the
+    marker/version first; a secrets-redacted bundle never blanks existing
+    credentials (the config_manager's per-leaf guard skips the mask)."""
+    if not config_manager:
+        return jsonify({"error": "Config manager unavailable"}), 500
+    from api.video import get_video_db
+    from core.config_export import apply_bundle
+    data = request.get_json(silent=True)
+    try:
+        summary = apply_bundle(config_manager, get_video_db(), data or {})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:   # noqa: BLE001
+        logger.exception("config import failed")
+        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True, **summary,
+                    "note": "Config imported. Restart SoulSync so every service picks it up."})
 
 
 # ── Per-service verify cache ──
@@ -6433,6 +6752,10 @@ def search_music():
         results = _search_basic.run_basic_search(query, download_orchestrator, run_async, source=requested_source)
         add_activity_item("", "Search Complete", f"'{query}' - {len(results)} results", "Now")
         return jsonify({"results": results})
+    except ValueError as ve:
+        # user-facing config problem (e.g. SoundCloud link with the source
+        # disabled) — a clear 400, not a silent empty result
+        return jsonify({"error": str(ve)}), 400
     except Exception as e:
         logger.error(f"Search error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -6618,6 +6941,46 @@ def stream_enhanced_search_track():
 
 _music_video_downloads = {}  # {video_id: {status, progress, path, error}}
 
+
+def _clean_music_video_title(raw_title):
+    """Strip YouTube noise from a video title for metadata search + filing.
+
+    Handles the suffix both parenthesized — "(Official Music Video)" — and
+    BARE at the end of the title ("... Fat Official Music Video", the shape
+    fan uploads use constantly; the old parenthesized-only strip left the
+    noise in the search query, which is half of how a video ends up filed
+    under the uploader's channel name). Bare stripping is deliberately
+    conservative: only unambiguous multi-word forms ('official …', 'music
+    video', 'lyric video', 'visualizer'), so a song genuinely titled
+    "Video" or "Video Games" is never eaten."""
+    import re as _re
+    s = _re.sub(
+        r'\s*[\(\[](official\s*(music\s*)?video|official\s*lyric\s*video|official\s*audio'
+        r'|official\s*hd|hd|4k|remastered|lyric\s*video|visualizer|audio)[\)\]]',
+        '', raw_title or '', flags=_re.IGNORECASE).strip()
+    s = _re.sub(
+        r'[\s\-–—|]*\b(official\s+(music\s+|lyric\s+)?(video|audio)'
+        r'|music\s+video|lyric\s+video|visualizer)\s*$',
+        '', s, flags=_re.IGNORECASE).strip()
+    return _re.sub(r'\s*-\s*$', '', s).strip()
+
+
+def _parse_music_video_artist_title(raw_title, raw_channel):
+    """Artist/title for filing a music video, from the video's own name.
+
+    'Artist - Title' (hyphen, en or em dash) parses to the real artist —
+    the UPLOADER's channel name is only the last resort for titles with no
+    separator at all, because fan-channel uploads ("Bad Boy Edd") are the
+    norm and filing under them scatters one artist's videos across folders."""
+    import re as _re
+    for sep in (' - ', ' – ', ' — '):
+        if sep in (raw_title or ''):
+            artist, title = raw_title.split(sep, 1)
+            title = _re.sub(r'\s*[\(\[].*?[\)\]]', '', title).strip()
+            title = _clean_music_video_title(title) or title
+            return artist.strip(), title
+    return raw_channel, (_clean_music_video_title(raw_title) or raw_title)
+
 @app.route('/api/music-video/download', methods=['POST'])
 def download_music_video():
     """Download a YouTube video as a music video file to the configured music videos folder."""
@@ -6662,11 +7025,10 @@ def download_music_video():
             artist_name = raw_channel
             track_title = raw_title
             year = ''
+            matched = False
 
-            # Strip common YouTube suffixes for cleaner search
             import re as _re
-            clean_search = _re.sub(r'\s*[\(\[](official\s*(music\s*)?video|official\s*lyric\s*video|official\s*audio|official\s*hd|hd|4k|remastered|lyric\s*video|visualizer|audio)[\)\]]', '', raw_title, flags=_re.IGNORECASE).strip()
-            clean_search = _re.sub(r'\s*-\s*$', '', clean_search).strip()
+            clean_search = _clean_music_video_title(raw_title)
 
             try:
                 fallback_client = _get_metadata_fallback_client()
@@ -6683,25 +7045,25 @@ def download_music_video():
                         if name_sim > best_score:
                             best_score = name_sim
                             best = r
-                    if best and best_score >= 0.5:
-                        artist_name = best.artists[0] if best.artists else raw_channel
+                    if best and best_score >= 0.5 and best.artists:
+                        matched = True
+                        artist_name = best.artists[0]
                         track_title = best.name
                         if hasattr(best, 'release_date') and best.release_date:
                             year = str(best.release_date)[:4]
                         logger.info(f"[Music Video] Matched to: {artist_name} - {track_title} (confidence: {best_score:.2f})")
-                    else:
-                        # Parse artist from video title: "Artist - Title" pattern
-                        if ' - ' in raw_title:
-                            parts = raw_title.split(' - ', 1)
-                            artist_name = parts[0].strip()
-                            track_title = _re.sub(r'\s*[\(\[].*?[\)\]]', '', parts[1]).strip()
-                        logger.warning(f"[Music Video] No metadata match, using parsed: {artist_name} - {track_title}")
             except Exception as e:
                 logger.error(f"[Music Video] Metadata lookup failed: {e}")
-                if ' - ' in raw_title:
-                    parts = raw_title.split(' - ', 1)
-                    artist_name = parts[0].strip()
-                    track_title = _re.sub(r'\s*[\(\[].*?[\)\]]', '', parts[1]).strip()
+
+            if not matched:
+                # No confident metadata match — parse 'Artist - Title' from the
+                # video's own name. This must cover EVERY unmatched path
+                # (weak match, lookup crash, and crucially an EMPTY result
+                # list — the old code skipped the parse entirely on zero
+                # results, so the video filed under the uploader's channel:
+                # the '"Weird Al" Yankovic - Fat' → 'bad boy edd/' bug).
+                artist_name, track_title = _parse_music_video_artist_title(raw_title, raw_channel)
+                logger.warning(f"[Music Video] No metadata match, using parsed: {artist_name} - {track_title}")
 
             # Sanitize for filesystem
             def _sanitize(s):
@@ -6713,7 +7075,7 @@ def download_music_video():
                 video_template = '$artist/$title-video'
             safe_artist = _sanitize(artist_name)
             video_path = video_template
-            video_path = video_path.replace('$artistletter', safe_artist[0].upper() if safe_artist else 'A')
+            video_path = video_path.replace('$artistletter', _shared_artist_letter(safe_artist) if safe_artist else 'A')
             video_path = video_path.replace('$artist', safe_artist)
             video_path = video_path.replace('$title', _sanitize(track_title))
             video_path = video_path.replace('$year', str(year) if year else '')
@@ -7493,7 +7855,8 @@ def clear_finished_downloads():
 # Streaming sources where the candidate's `username` field IS the source name
 # (Soulseek uses a real peer username; everything else stamps the source string).
 _STREAMING_SOURCE_NAMES = frozenset((
-    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud'
+    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon',
+    'torrent', 'usenet',
 ))
 
 
@@ -9136,6 +9499,9 @@ def _build_source_only_artist_detail(artist_id, artist_name, source):
     ``jsonify``.
     """
     from core.artist_source_detail import build_source_only_artist_detail
+    from core.metadata.discography_strict import (
+        get_artist_detail_discography as _get_artist_detail_discography,
+    )
 
     # Resolve the per-source clients defensively — the original inline code
     # wrapped the whole source-side lookup in try/except so a failing
@@ -9205,6 +9571,7 @@ def _build_source_only_artist_detail(artist_id, artist_name, source):
         jiosaavn_client=js,
         bandcamp_client=bc,
         lastfm_api_key=lastfm_api_key,
+        discography_loader=_get_artist_detail_discography,
     )
     return jsonify(payload), status
 
@@ -9319,9 +9686,10 @@ def get_artist_detail(artist_id):
 
         # Get source-priority discography for proper categorization and missing releases
         artist_detail_discography = None
+        provider_error = None
         try:
             from core.metadata.lookup import MetadataLookupOptions
-            from core.metadata_service import get_artist_detail_discography as _get_artist_detail_discography
+            from core.metadata.discography_strict import get_artist_detail_discography as _get_artist_detail_discography
             from core.source_ids import source_id_map
 
             # Per-source artist IDs, read via the canonical source-ID registry
@@ -9336,6 +9704,16 @@ def get_artist_detail(artist_id):
                 artist_id,
                 artist_name=artist_info['name'],
                 options=MetadataLookupOptions(
+                    # The user navigated here FROM a specific source's artist
+                    # card — show THAT source's catalog, not the primary's
+                    # (#1026, QT3496): when the artist was already owned, the
+                    # library upgrade discarded the clicked source, so an
+                    # Apple Music card rendered Deezer's 2-album view. The
+                    # override puts the clicked source at the head of the
+                    # chain; the normal priority still backstops it when that
+                    # source has nothing. Library-page opens carry no source
+                    # param → primary as before.
+                    source_override=source_param or None,
                     allow_fallback=True,
                     skip_cache=False,
                     max_pages=0,
@@ -9350,7 +9728,25 @@ def get_artist_detail(artist_id):
                 ),
             )
 
-            if artist_detail_discography['success']:
+            if artist_detail_discography.get('state') == 'error':
+                provider_error = {
+                    "state": "error",
+                    "error": artist_detail_discography.get(
+                        "error", "Could not access the discography provider"
+                    ),
+                    "source": artist_detail_discography.get("source", "unknown"),
+                    "status_code": int(
+                        artist_detail_discography.get("status_code") or 502
+                    ),
+                }
+                logger.warning(
+                    "Discography provider failed for owned artist %s; "
+                    "returning library releases: %s",
+                    artist_info['name'],
+                    provider_error['error'],
+                )
+                merged_discography = owned_releases
+            elif artist_detail_discography['success']:
                 logger.debug(
                     "Source-priority discography found - "
                     f"Albums: {len(artist_detail_discography['albums'])}, "
@@ -9444,6 +9840,9 @@ def get_artist_detail(artist_id):
             "discography": merged_discography,
             "enrichment_coverage": enrichment_coverage
         }
+
+        if provider_error is not None:
+            response_data["provider_error"] = provider_error
 
         # Add Spotify artist data if available
         if spotify_artist_data:
@@ -9589,18 +9988,18 @@ def write_artist_image_to_disk(artist_id):
         source_override = (data.get('source_override') or '').strip().lower() or None
 
         db = get_database()
-        try:
-            artist_id_int = int(artist_id)
-        except (TypeError, ValueError):
+        # #1069: TEXT ids (Navidrome/Jellyfin) — never int() an artist id.
+        artist_id = str(artist_id or '').strip()
+        if not artist_id:
             return jsonify({"success": False, "error": "Invalid artist id"}), 400
 
-        artist_row = db.get_artist(artist_id_int)
+        artist_row = db.get_artist(artist_id)
         if artist_row is None:
             return jsonify({"success": False, "error": "Artist not found"}), 404
 
         # Find a track file on disk so we can derive the artist folder.
         # Walk albums in DB order; first one with a resolvable track wins.
-        albums = db.get_albums_by_artist(artist_id_int)
+        albums = db.get_albums_by_artist(artist_id)
         if not albums:
             return jsonify({"success": False,
                             "error": "No albums for this artist; cannot derive folder."}), 400
@@ -9637,7 +10036,7 @@ def write_artist_image_to_disk(artist_id):
         else:
             try:
                 image_url = _get_artist_image_url(
-                    artist_id_int,
+                    artist_id,
                     source_override=source_override,
                     artist_name=getattr(artist_row, 'name', None),
                 )
@@ -9809,6 +10208,155 @@ def get_artist_top_tracks_endpoint(artist_id):
         return jsonify({"success": False, "error": str(e), "tracks": []}), 500
 
 
+def _resolve_artist_source_ids(artist_id) -> dict:
+    """Per-source artist ids from the enriched library row, keyed by source.
+
+    Looks the row up by ANY id the frontend might send (library PK or any
+    provider id) and returns every stored provider id, so each source gets
+    ITS OWN id instead of someone else's (which Deezer would happily accept
+    as a different artist). Lifted from the discography endpoint; the
+    gap-fill endpoint shares it."""
+    artist_source_ids = {}
+    try:
+        _db = get_database()
+        _conn = _db._get_connection()
+        try:
+            _cur = _conn.cursor()
+            _cur.execute("""
+                SELECT spotify_artist_id, itunes_artist_id,
+                       deezer_id, musicbrainz_id
+                FROM artists
+                WHERE id = ?
+                   OR spotify_artist_id = ?
+                   OR itunes_artist_id = ?
+                   OR deezer_id = ?
+                   OR musicbrainz_id = ?
+                LIMIT 1
+            """, (artist_id, artist_id, artist_id, artist_id, artist_id))
+            _row = _cur.fetchone()
+            if _row:
+                if _row['spotify_artist_id']:
+                    artist_source_ids['spotify'] = str(_row['spotify_artist_id'])
+                if _row['itunes_artist_id']:
+                    artist_source_ids['itunes'] = str(_row['itunes_artist_id'])
+                if _row['deezer_id']:
+                    artist_source_ids['deezer'] = str(_row['deezer_id'])
+                if _row['musicbrainz_id']:
+                    artist_source_ids['musicbrainz'] = str(_row['musicbrainz_id'])
+                logger.info(
+                    f"Discography: resolved per-source IDs for artist_id={artist_id} → "
+                    f"{artist_source_ids}"
+                )
+        finally:
+            _conn.close()
+    except Exception as _id_exc:
+        logger.debug(f"Could not resolve per-source artist IDs for {artist_id}: {_id_exc}")
+    return artist_source_ids
+
+
+@app.route('/api/artist/<artist_id>/discography/gap-fill', methods=['GET'])
+def get_artist_discography_gap_fill(artist_id):
+    """Releases OTHER metadata sources know that the base source's
+    discography doesn't (#1067 — the hybrid/gap-fill view option).
+
+    Strictly additive + conservative: only sources whose ENRICHED per-source
+    artist id we hold are consulted (never a fuzzy name search — the wrong
+    artist's discography as 'gap-fill' would be worse than no feature), each
+    source is fetched with fallback disabled so a failing source contributes
+    nothing instead of double-counting another, and the dedup shows a
+    borderline edition twice rather than merging it wrongly. The base page's
+    own load path is untouched — this endpoint only ever ADDS cards."""
+    try:
+        artist_name = request.args.get('artist_name', '').strip()
+        base_source = (request.args.get('base_source', '') or '').strip().lower()
+
+        artist_source_ids = _resolve_artist_source_ids(artist_id)
+
+        from core.metadata.discography_gapfill import gap_fill_buckets
+        from core.metadata.lookup import MetadataLookupOptions
+        from core.metadata.discography_strict import get_artist_detail_discography
+
+        def _fetch(source, source_artist_id, name=''):
+            # OTHER-source fetches pass NO artist name: the per-source lookup
+            # has an internal search-by-name fallback when the id yields
+            # nothing (album_tracks.get_artist_albums_for_source), and a stale
+            # enriched id must degrade to "no gap-fill from this source" —
+            # never to a name search that could pick the wrong artist. Only
+            # the base fetch keeps the name (mirrors the page's own load).
+            disc = get_artist_detail_discography(
+                source_artist_id,
+                artist_name=name,
+                options=MetadataLookupOptions(
+                    source_override=source,
+                    allow_fallback=False,   # a down source must not answer from another
+                    skip_cache=False,
+                    max_pages=0,
+                    limit=200,
+                    artist_source_ids=artist_source_ids or None,
+                ),
+            )
+            if disc.get('state') != 'results':
+                return None
+            return {'albums': disc.get('albums') or [],
+                    'eps': disc.get('eps') or [],
+                    'singles': disc.get('singles') or []}
+
+        # Resolve the BASE the same way the page did. An explicit base_source
+        # (source-only artist pages) pins it; otherwise fetch with NO override
+        # so ragnarlotus's Library-discography-source setting (#1068 — primary /
+        # automatic / explicit) picks the source exactly like the page's own
+        # load, and read back which source actually answered.
+        if base_source:
+            base = _fetch(base_source, artist_source_ids.get(base_source) or artist_id,
+                          name=artist_name)
+            resolved_base = base_source
+        else:
+            disc = get_artist_detail_discography(
+                artist_id,
+                artist_name=artist_name,
+                options=MetadataLookupOptions(
+                    skip_cache=False, max_pages=0, limit=200,
+                    artist_source_ids=artist_source_ids or None,
+                ),
+            )
+            if disc.get('state') == 'results':
+                base = {'albums': disc.get('albums') or [],
+                        'eps': disc.get('eps') or [],
+                        'singles': disc.get('singles') or []}
+                resolved_base = str(disc.get('source') or '').lower()
+            else:
+                base, resolved_base = None, ''
+
+        if base is None:
+            # No base to diff against — returning gaps would duplicate the page
+            return jsonify({"success": True, "gaps": {"albums": [], "eps": [], "singles": []},
+                            "sources_checked": [], "base_source": resolved_base,
+                            "note": "Base discography unavailable."})
+
+        candidates = [s for s in ('spotify', 'deezer', 'itunes', 'musicbrainz')
+                      if s != resolved_base and artist_source_ids.get(s)]
+        if not candidates:
+            return jsonify({"success": True, "gaps": {"albums": [], "eps": [], "singles": []},
+                            "sources_checked": [], "base_source": resolved_base,
+                            "note": "No other sources have a verified id for this artist yet "
+                                    "(enrichment provides them)."})
+
+        others = {}
+        checked = []
+        for source in candidates:
+            disc = _fetch(source, artist_source_ids[source])
+            if disc is not None:
+                others[source] = disc
+                checked.append(source)
+
+        gaps = gap_fill_buckets(base, others, checked)
+        return jsonify({"success": True, "gaps": gaps,
+                        "sources_checked": checked, "base_source": resolved_base})
+    except Exception as e:
+        logger.error(f"Discography gap-fill failed for {artist_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/api/artist/<artist_id>/discography', methods=['GET'])
 def get_artist_discography(artist_id):
     """Get an artist's complete discography (albums and singles)"""
@@ -9837,7 +10385,7 @@ def get_artist_discography(artist_id):
         # gets the SAME release-type split (albums / eps / singles) the Artist
         # Detail view shows — EPs were being lumped into singles before, leaving
         # the modal's EPs toggle dead.
-        from core.metadata.discography import get_artist_detail_discography as _get_artist_discography
+        from core.metadata.discography_strict import get_artist_detail_discography as _get_artist_discography
 
         # Server-side per-source ID resolution. Look up the library row
         # by ANY of the IDs the frontend might send: library DB id,
@@ -9855,41 +10403,7 @@ def get_artist_discography(artist_id):
         #     back to fuzzy name search → may pick wrong artist
         # With server-side resolution, every source gets its OWN stored
         # ID regardless of which one the URL carries.
-        artist_source_ids = {}
-        try:
-            _db = get_database()
-            _conn = _db._get_connection()
-            try:
-                _cur = _conn.cursor()
-                _cur.execute("""
-                    SELECT spotify_artist_id, itunes_artist_id,
-                           deezer_id, musicbrainz_id
-                    FROM artists
-                    WHERE id = ?
-                       OR spotify_artist_id = ?
-                       OR itunes_artist_id = ?
-                       OR deezer_id = ?
-                       OR musicbrainz_id = ?
-                    LIMIT 1
-                """, (artist_id, artist_id, artist_id, artist_id, artist_id))
-                _row = _cur.fetchone()
-                if _row:
-                    if _row['spotify_artist_id']:
-                        artist_source_ids['spotify'] = str(_row['spotify_artist_id'])
-                    if _row['itunes_artist_id']:
-                        artist_source_ids['itunes'] = str(_row['itunes_artist_id'])
-                    if _row['deezer_id']:
-                        artist_source_ids['deezer'] = str(_row['deezer_id'])
-                    if _row['musicbrainz_id']:
-                        artist_source_ids['musicbrainz'] = str(_row['musicbrainz_id'])
-                    logger.info(
-                        f"Discography: resolved per-source IDs for artist_id={artist_id} → "
-                        f"{artist_source_ids}"
-                    )
-            finally:
-                _conn.close()
-        except Exception as _id_exc:
-            logger.debug(f"Could not resolve per-source artist IDs for {artist_id}: {_id_exc}")
+        artist_source_ids = _resolve_artist_source_ids(artist_id)
 
         discography = _get_artist_discography(
             artist_id,
@@ -9913,6 +10427,16 @@ def get_artist_discography(artist_id):
                 artist_source_ids=artist_source_ids or None,
             ),
         )
+
+        if discography.get('state') == 'error':
+            return jsonify({
+                "success": False,
+                "state": "error",
+                "error": discography.get(
+                    "error", "Could not access the discography provider"
+                ),
+                "source": discography.get("source", "unknown"),
+            }), int(discography.get("status_code") or 502)
 
         album_list = discography['albums']
         eps_list = discography.get('eps', [])
@@ -10040,6 +10564,17 @@ def get_artist_discography(artist_id):
 _ART_OPTIONS_CACHE = {}                       # (artist_lower, album_lower) -> (ts, candidates)
 _ART_OPTIONS_CACHE_LOCK = threading.Lock()
 _ART_OPTIONS_TTL_S = 900                       # 15 min — gathering is several slow external calls
+_ART_OPTIONS_EMPTY_TTL_S = 60                  # empties retry fast: one hiccup must not stick
+
+
+def _looks_like_image(data: bytes) -> bool:
+    """Magic-byte sniff — pasted custom URLs must not poison the thumb/poster/
+    artist.jpg with an HTML page. JPEG/PNG/GIF/WEBP/BMP cover real art."""
+    if not data or len(data) < 12:
+        return False
+    return (data[:2] == b"\xff\xd8" or data[:8] == b"\x89PNG\r\n\x1a\n"
+            or data[:4] == b"GIF8" or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+            or data[:2] == b"BM")
 
 
 @app.route('/api/album/<album_id>/art-options', methods=['GET'])
@@ -10147,6 +10682,165 @@ def set_album_art(album_id):
                         "cover_written": cover_written})
     except Exception as e:
         logger.error("[set-art] failed for album %s: %s", album_id, e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/artist/<artist_id>/art-options', methods=['GET'])
+def get_artist_art_options(artist_id):
+    """Candidate artist photos for the artist image picker (read-only).
+
+    One candidate per CONNECTED metadata source (Spotify/Deezer/iTunes/AudioDB/
+    Discogs/…), resolved concurrently: the artist's stored per-source id when
+    the library row has one (exact), otherwise a name search on that source.
+    Mirrors the album art-options endpoint."""
+    try:
+        # #1069 (matvei4iz): artists.id is TEXT since the id-columns migration —
+        # Navidrome/Jellyfin ids are strings ("7dB07x8Q…"), and int() here made
+        # the whole picker 400 for every non-Plex backend. Ids are opaque.
+        artist_id = str(artist_id or '').strip()
+        if not artist_id:
+            return jsonify({"error": "Invalid artist id"}), 400
+        db = get_database()
+        artist_row = db.get_artist(artist_id)
+        if artist_row is None:
+            return jsonify({"error": "Artist not found"}), 404
+        name = getattr(artist_row, 'name', '') or ''
+
+        # Key by ROW id, not name: two artists sharing a name must not share
+        # a cache slot. Empty results only stick for a minute — a transient
+        # source failure used to poison the picker with 'no photos' for 15.
+        cache_key = ('artist', artist_id)
+        now = time.time()
+        with _ART_OPTIONS_CACHE_LOCK:
+            hit = _ART_OPTIONS_CACHE.get(cache_key)
+            if hit and now - hit[0] < (_ART_OPTIONS_TTL_S if hit[1] else _ART_OPTIONS_EMPTY_TTL_S):
+                return jsonify({"artist_id": artist_id, "count": len(hit[1]),
+                                "candidates": hit[1], "cached": True})
+
+        source_ids = {col: getattr(artist_row, col, None)
+                      for col in ('spotify_artist_id', 'deezer_id', 'itunes_artist_id',
+                                  'audiodb_id', 'discogs_id')}
+        from core.metadata.artist_image import gather_artist_image_candidates
+        candidates = gather_artist_image_candidates(name, source_ids)
+        with _ART_OPTIONS_CACHE_LOCK:
+            _ART_OPTIONS_CACHE[cache_key] = (now, candidates)
+        return jsonify({"artist_id": artist_id, "count": len(candidates), "candidates": candidates})
+    except Exception as e:
+        # No blanket (TypeError, ValueError) → "Invalid artist id" anymore —
+        # it mislabeled any deep ValueError as an id problem (#1069).
+        logger.error("[artist-art-options] failed for %s: %s", artist_id, e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/artist/<artist_id>/art', methods=['POST'])
+def set_artist_art(artist_id):
+    """Apply a photo chosen in the artist image picker — everywhere:
+
+    1. SoulSync DB (``artists.thumb_url``; a non-empty value pins it, the
+       enrichment workers only fill empty thumbs)
+    2. the active media server (Plex/Jellyfin poster upload; Navidrome has no
+       API and is covered by step 3)
+    3. ``artist.jpg`` in the artist's folder on disk (what Navidrome reads;
+       Plex/Jellyfin also honor it as a fallback) + a Navidrome scan nudge
+
+    Steps 2 and 3 are best-effort — the response reports each target so the
+    UI can say exactly what happened. Body: ``{"url": "<image url>"}``."""
+    try:
+        data = request.get_json(silent=True) or {}
+        url = (data.get('url') or '').strip()
+        if not url:
+            return jsonify({"error": "url is required"}), 400
+
+        # #1069: TEXT ids (Navidrome/Jellyfin) — never int() an artist id.
+        artist_id = str(artist_id or '').strip()
+        if not artist_id:
+            return jsonify({"error": "Invalid artist id"}), 400
+        db = get_database()
+        artist_row = db.get_artist(artist_id)
+        if artist_row is None:
+            return jsonify({"error": "Artist not found"}), 404
+        artist_name = getattr(artist_row, 'name', '') or ''
+
+        # Download FIRST (server upload + disk write share the bytes) and
+        # validate: a custom URL that resolves to an HTML page must abort
+        # before anything is pinned. A failed download stays best-effort —
+        # hotlink-protected art can still render in the browser.
+        image_bytes = None
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "SoulSync/1.0",
+                                                       "Accept": "image/*"})
+            with urllib.request.urlopen(req, timeout=15) as resp:   # noqa: S310 (user-chosen art URL)
+                image_bytes = resp.read() or None
+        except Exception as exc:
+            logger.warning("[set-artist-art] image download failed: %s", exc)
+        if image_bytes is not None and not _looks_like_image(image_bytes):
+            return jsonify({"error": "That URL doesn't point to an image"}), 400
+
+        if not db.set_artist_thumb_url(artist_id, url):
+            return jsonify({"error": "Could not update artist"}), 500
+
+        # 2. Active media server poster (Plex/Jellyfin have APIs; Navidrome's
+        #    update_artist_poster is a documented no-op — disk write covers it).
+        server_updated = False
+        if image_bytes and media_server_engine:
+            try:
+                active = config_manager.get_active_media_server()
+                client = media_server_engine.client(active)
+                if client and hasattr(client, 'update_artist_poster'):
+                    server_artist = None
+                    if hasattr(client, '_search_artists_by_name'):        # Plex
+                        matches = client._search_artists_by_name(title=artist_name, limit=1)
+                        server_artist = matches[0] if matches else None
+                    elif hasattr(client, 'get_artist_by_id'):             # Jellyfin
+                        server_artist = client.get_artist_by_id(str(artist_id))
+                    if server_artist is not None:
+                        server_updated = bool(client.update_artist_poster(server_artist, image_bytes))
+            except Exception as exc:
+                logger.warning("[set-artist-art] server poster update failed: %s", exc)
+
+        # 3. artist.jpg on disk (Navidrome's mechanism) + scan nudge.
+        disk_written = False
+        try:
+            from core.library.artist_image import derive_artist_folder, write_artist_jpg
+            albums = db.get_albums_by_artist(artist_id) or []
+            artist_folder = None
+            for album in albums:
+                for tr in (db.get_tracks_by_album(album.id) or []):
+                    raw = getattr(tr, 'file_path', None)
+                    if not raw:
+                        continue
+                    resolved = _resolve_library_file_path(raw) or raw
+                    if resolved and os.path.exists(resolved):
+                        artist_folder = derive_artist_folder(os.path.dirname(resolved))
+                        break
+                if artist_folder:
+                    break
+            if artist_folder and image_bytes:
+                ok, detail = write_artist_jpg(artist_folder, image_bytes, overwrite=True)
+                disk_written = bool(ok)
+                if not ok:
+                    logger.warning("[set-artist-art] artist.jpg write failed: %s", detail)
+                elif media_server_engine:
+                    nav = media_server_engine.client('navidrome')
+                    if nav and config_manager.get_active_media_server() == 'navidrome':
+                        try:
+                            nav.trigger_library_scan()
+                        except Exception:
+                            logger.debug("[set-artist-art] navidrome scan nudge failed", exc_info=True)
+        except Exception as exc:
+            logger.warning("[set-artist-art] disk write failed: %s", exc)
+
+        # Invalidate the candidates cache so a re-open reflects reality.
+        # (#1069: this popped a NAME-keyed entry while the cache stores by ID —
+        # a dead pop, leaving stale candidates for a minute after Apply.)
+        with _ART_OPTIONS_CACHE_LOCK:
+            _ART_OPTIONS_CACHE.pop(('artist', artist_id), None)
+
+        return jsonify({"success": True, "artist_id": artist_id, "thumb_url": url,
+                        "server_updated": server_updated, "disk_written": disk_written})
+    except Exception as e:
+        logger.error("[set-artist-art] failed for %s: %s", artist_id, e, exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -10363,7 +11057,10 @@ def export_library_m3u():
         db = get_database()
         entries = db.get_all_library_tracks_for_export()
         from core.library.m3u_export import build_m3u
-        content = build_m3u(entries, entry_base_path=config_manager.get('m3u_export.entry_base_path', '') or '')
+        content = build_m3u(entries,
+                            entry_base_path=config_manager.get('m3u_export.entry_base_path', '') or '',
+                            rewrite_from=config_manager.get('m3u_export.rewrite_from', '') or '',
+                            rewrite_to=config_manager.get('m3u_export.rewrite_to', '') or '')
         return Response(
             content,
             mimetype='audio/x-mpegurl',
@@ -10885,18 +11582,33 @@ def library_completion_stream():
             _loop_start = time.perf_counter()
             for _i, (category, item) in enumerate(all_items):
                 try:
-                    # Map Library field names to helper field names
+                    # Map Library field names to helper field names.
+                    # CRUCIAL: carry the card's YEAR through — the re-release
+                    # year gate (0e53851fd) needs it, and dropping it here
+                    # silently disabled the gate on the library page so owning
+                    # the original still lit up every re-release (5BILLION,
+                    # round 2). The artist-detail path already passes the card
+                    # dict straight through; this one rebuilt it and forgot.
                     mapped = {
                         'id': item['id'],
                         'name': item['title'],
                         'total_tracks': item.get('track_count', 0),
-                        'album_type': item.get('album_type', 'album')
+                        'album_type': item.get('album_type', 'album'),
+                        'year': item.get('year'),
+                        'release_date': item.get('release_date') or item.get('releaseDate'),
                     }
 
+                    # Per-item source: gap-fill ("Other Sources") cards each
+                    # belong to their OWN source — their ids only mean anything
+                    # against it (#1071). Base-discography items carry no
+                    # per-item source and keep the request-level one.
+                    item_source = (str(item.get('source') or '').strip().lower()
+                                   or source_override)
+
                     if category == 'singles':
-                        result = check_single_completion(db, mapped, artist_name, source_override=source_override, candidate_albums=candidate_albums, candidate_tracks=candidate_tracks)
+                        result = check_single_completion(db, mapped, artist_name, source_override=item_source, candidate_albums=candidate_albums, candidate_tracks=candidate_tracks)
                     else:
-                        result = check_album_completion(db, mapped, artist_name, source_override=source_override, candidate_albums=candidate_albums)
+                        result = check_album_completion(db, mapped, artist_name, source_override=item_source, candidate_albums=candidate_albums)
 
                     result['id'] = item['id']
                     result['category'] = category
@@ -11445,6 +12157,13 @@ def batch_update_library_tracks():
 def _build_library_tag_db_data(track_data, album_genres=None):
     """Build the metadata payload consumed by core.tag_writer."""
     album_genres = album_genres or []
+    # #1057 — strict genre filtering applies at the tag-write seam too, so
+    # 'Write Tags' cleans up genres written before the whitelist was enabled.
+    # The tag PREVIEW uses this same builder, so the diff modal shows the
+    # cleanup as a pending change. Strict off → filter_genres is a no-op.
+    if album_genres:
+        from core.genre_filter import filter_genres
+        album_genres = filter_genres(album_genres, config_manager)
     db_data = {
         'title': track_data.get('title'),
         'artist_name': track_data.get('artist_name'),
@@ -11710,6 +12429,7 @@ _write_tags_batch_state = {
     'total': 0,
     'processed': 0,
     'written': 0,
+    'skipped': 0,       # #1052 — files already matching the DB, not rewritten
     'failed': 0,
     'current_track': '',
     'errors': [],
@@ -11762,6 +12482,7 @@ def write_tracks_tags_batch():
                 'total': len(track_ids),
                 'processed': 0,
                 'written': 0,
+                'skipped': 0,
                 'failed': 0,
                 'current_track': '',
                 'errors': [],
@@ -11784,7 +12505,9 @@ def write_tracks_tags_batch():
         # Run the actual writes in a background thread
         def _run_batch():
             try:
-                from core.tag_writer import write_tags_to_file, download_cover_art
+                from core.tag_writer import (write_tags_to_file, download_cover_art,
+                                             read_file_tags, build_tag_diff,
+                                             diff_has_actionable_change)
 
                 written_tracks = []  # Track dicts that were successfully written (for server sync)
 
@@ -11834,6 +12557,25 @@ def write_tracks_tags_batch():
                         thumb = track_data.get('album_thumb_url') or track_data.get('artist_thumb_url')
                         if thumb and thumb.startswith('http'):
                             art_data = cover_cache.get(thumb)
+
+                    # #1052 — only touch files that actually differ. Uses the SAME
+                    # build_tag_diff the preview does, so the write matches exactly
+                    # what the "N will change / M unchanged" preview showed. A
+                    # cover-only difference counts only when cover embedding is on
+                    # (otherwise the write wouldn't touch it anyway). If the diff
+                    # read fails, fall through and write — the safe default.
+                    try:
+                        existing_tags = read_file_tags(resolved_path)
+                        if not existing_tags.get('error'):
+                            diff = build_tag_diff(existing_tags, db_data)
+                            if not diff_has_actionable_change(diff, embed_cover):
+                                with _write_tags_batch_lock:
+                                    _write_tags_batch_state['processed'] += 1
+                                    _write_tags_batch_state['skipped'] += 1
+                                continue
+                    except Exception:
+                        logger.debug("tag diff pre-check failed for %s; writing anyway",
+                                     resolved_path, exc_info=True)
 
                     file_lock = get_file_lock(resolved_path)
                     with file_lock:
@@ -12058,7 +12800,7 @@ from core.replaygain import (
     analyze_track as _rg_analyze_track,
     write_replaygain_tags as _rg_write_tags,
     is_ffmpeg_available as _rg_ffmpeg_available,
-    RG_REFERENCE_LUFS as _RG_REFERENCE_LUFS,
+    get_target_lufs as _rg_get_target_lufs,
 )
 
 # State machine for album-level ReplayGain jobs
@@ -12113,7 +12855,7 @@ def analyze_track_replaygain(track_id):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-    track_gain_db = _RG_REFERENCE_LUFS - lufs
+    track_gain_db = _rg_get_target_lufs(config_manager) - lufs
 
     file_lock = get_file_lock(file_path)
     with file_lock:
@@ -12190,7 +12932,7 @@ def analyze_album_replaygain(album_id):
                 lufs, peak_dbfs = _rg_analyze_track(file_path)
                 lufs_values.append(lufs)
                 peak_values.append(peak_dbfs)
-                track_gain_db = _RG_REFERENCE_LUFS - lufs
+                track_gain_db = _rg_get_target_lufs(config_manager) - lufs
                 track_results.append((file_path, track_gain_db, peak_dbfs))
                 with _rg_album_lock:
                     _rg_album_state['analyzed'] += 1
@@ -12207,7 +12949,7 @@ def analyze_album_replaygain(album_id):
         album_peak_dbfs = None
         if lufs_values:
             mean_lufs = sum(lufs_values) / len(lufs_values)
-            album_gain_db = _RG_REFERENCE_LUFS - mean_lufs
+            album_gain_db = _rg_get_target_lufs(config_manager) - mean_lufs
             album_peak_dbfs = max(peak_values)
 
         # Pass 2: write tags to every successfully analyzed track
@@ -12302,7 +13044,7 @@ def analyze_tracks_replaygain_batch():
 
             try:
                 lufs, peak_dbfs = _rg_analyze_track(file_path)
-                track_gain_db = _RG_REFERENCE_LUFS - lufs
+                track_gain_db = _rg_get_target_lufs(config_manager) - lufs
                 file_lock = get_file_lock(file_path)
                 with file_lock:
                     _rg_write_tags(file_path, track_gain_db, peak_dbfs)
@@ -13048,17 +13790,39 @@ def _resolve_library_file_path(file_path):
             if found:
                 return found
 
-    # Couldn't resolve — log the bases we searched ONCE so a path/mount mismatch
-    # is diagnosable (e.g. files live under a dir that isn't transfer/download/
-    # a configured library path).
+    # Couldn't resolve — log the bases we searched, throttled to once per 10
+    # minutes. The old once-per-PROCESS guard self-silenced forever, which hid
+    # intermittent failures completely (TheHomeGuy: an NFS mount that drops and
+    # comes back reads as 'occasionally get this error' with no pattern —
+    # because all the other occurrences were swallowed).
     global _resolve_library_diag_logged
-    if not _resolve_library_diag_logged:
-        _resolve_library_diag_logged = True
+    _now = time.monotonic()
+    if not isinstance(_resolve_library_diag_logged, float) or _now - _resolve_library_diag_logged > 600:
+        _resolve_library_diag_logged = _now
+        # Name the FAILURE MODE, not just the miss: a genuinely absent file
+        # stats as ENOENT, while a broken NFS/bind mount surfaces ESTALE or
+        # EIO — and a base dir that suddenly lists 0 entries is an unmounted
+        # mountpoint. Turns "file not found, shrug" into "the mount under it
+        # is broken" (TheHomeGuy's Proxmox LXC bind-of-NFS).
+        import errno as _errno
+        _stat_err = 'ENOENT (plain not-found)'
+        try:
+            os.stat(file_path)
+        except OSError as _se:
+            _stat_err = '%s (errno=%s)' % (_errno.errorcode.get(_se.errno, type(_se).__name__), _se.errno)
+        _base_counts = []
+        for _b in abs_bases:
+            try:
+                _base_counts.append('%s: %d entries' % (_b, len(os.listdir(_b))))
+            except OSError as _le:
+                _base_counts.append('%s: UNLISTABLE (%s)' % (_b, _errno.errorcode.get(_le.errno, type(_le).__name__)))
         logger.warning(
             "[PathResolve] Could not resolve %r — tried direct-join + suffix-scan under %r (cwd=%r). "
+            "Raw-path stat: %s. Base dirs: %s. "
             "If files live elsewhere, set soulseek.transfer_path to the absolute mount or add "
-            "the dir under Settings > Library music paths.",
-            file_path, abs_bases, os.getcwd(),
+            "the dir under Settings > Library music paths. A base showing 0 entries or "
+            "ESTALE/EIO means the mount under it is broken (remount / restart the container).",
+            file_path, abs_bases, os.getcwd(), _stat_err, '; '.join(_base_counts) or 'none',
         )
     return None
 
@@ -16479,7 +17243,7 @@ def _apply_path_template(template: str, context: dict) -> str:
         'albumartist': album_artist_value,
         'albumtype': clean_context.get('albumtype', 'Album'),
         'playlist': clean_context.get('playlist_name', ''),
-        'artistletter': (clean_context.get('artist', 'U') or 'U')[0].upper(),
+        'artistletter': _shared_artist_letter(clean_context.get('artist', 'U')),
         'artist': clean_context.get('artist', 'Unknown Artist'),
         'album': clean_context.get('album', 'Unknown Album'),
         'title': clean_context.get('title', 'Unknown Track'),
@@ -16498,7 +17262,7 @@ def _apply_path_template(template: str, context: dict) -> str:
     result = result.replace('$playlist', clean_context.get('playlist_name', ''))
 
     # Medium length variables
-    result = result.replace('$artistletter', (clean_context.get('artist', 'U') or 'U')[0].upper())
+    result = result.replace('$artistletter', _shared_artist_letter(clean_context.get('artist', 'U')))
     result = result.replace('$artist', clean_context.get('artist', 'Unknown Artist'))
     result = result.replace('$album', clean_context.get('album', 'Unknown Album'))
     result = result.replace('$title', clean_context.get('title', 'Unknown Track'))
@@ -16920,12 +17684,24 @@ def _get_current_commit_sha():
 _current_commit_sha = _get_current_commit_sha()
 
 def _check_for_updates():
-    """Check GitHub for the latest commit SHA on main branch."""
+    """Check GitHub for the latest RELEASE (version + severity) and, as a
+    fallback signal for git-pull users running between releases, the latest
+    commit SHA on main."""
     import time as _time
     now = _time.time()
     if now - _update_cache['last_check'] < _UPDATE_CHECK_INTERVAL:
         return  # Still fresh
     _update_cache['last_check'] = now
+    # Releases first — this is what drives the version glow (green routine /
+    # yellow major / red critical) and gives the user a number, not a hash.
+    try:
+        from core.update_check import evaluate_update, fetch_releases
+        releases = fetch_releases(_GITHUB_REPO)
+        _update_cache['release_info'] = evaluate_update(_SOULSYNC_BASE_VERSION, releases)
+        _update_cache['error'] = None
+    except Exception as e:
+        _update_cache['error'] = str(e)
+        logger.debug(f"Release check failed: {e}")
     try:
         import urllib.request
         import json as _json
@@ -16936,24 +17712,65 @@ def _check_for_updates():
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = _json.loads(resp.read().decode())
             _update_cache['latest_sha'] = data.get('sha')
-            _update_cache['error'] = None
     except Exception as e:
         _update_cache['error'] = str(e)
         logger.debug(f"Update check failed: {e}")
 
 @app.route('/api/update-check', methods=['GET'])
 def check_for_update():
-    """Check if a newer version is available on GitHub."""
+    """Check if a newer version is available on GitHub. Release-aware: a
+    published release newer than the running base version reports its
+    number + severity; the commit-SHA comparison stays as the fallback
+    signal when no release info is available."""
     _check_for_updates()
     current = _current_commit_sha
     latest = _update_cache.get('latest_sha')
-    update_available = bool(current and latest and current != latest)
+    rel = _update_cache.get('release_info') or {}
+    sha_update = bool(current and latest and current != latest)
+    update_available = bool(rel.get('available')) or (not rel and sha_update)
     return jsonify({
         'update_available': update_available,
         'current_sha': current[:8] if current else None,
         'latest_sha': latest[:8] if latest else None,
+        'current_version': _SOULSYNC_BASE_VERSION,
+        'latest_version': rel.get('latest_version'),
+        'severity': rel.get('severity'),
+        'release_url': rel.get('release_url'),
         'is_docker': os.path.exists('/.dockerenv'),
     })
+
+
+# ── Notification history (Kazimir) ───────────────────────────────
+@app.route('/api/notifications/log', methods=['POST'])
+def log_notifications():
+    """Journal a batch of UI toasts so 'Clear All' in the bell panel loses
+    nothing. The frontend flushes these fire-and-forget every few seconds."""
+    from database.music_database import get_database
+    body = request.get_json(silent=True) or {}
+    entries = body.get('entries')
+    if not isinstance(entries, list):
+        return jsonify({'success': False, 'error': 'entries must be a list'}), 400
+    logged = get_database().add_notifications(entries[:50], profile_id=get_current_profile_id())
+    return jsonify({'success': True, 'logged': logged})
+
+
+@app.route('/api/notifications/history', methods=['GET', 'DELETE'])
+def notification_history():
+    """The persistent notification journal for the ACTIVE profile —
+    filterable by type, searchable, paginated. DELETE clears it."""
+    from database.music_database import get_database
+    db = get_database()
+    pid = get_current_profile_id()
+    if request.method == 'DELETE':
+        return jsonify({'success': True, 'removed': db.clear_notification_history(pid)})
+    rows = db.get_notification_history(
+        pid,
+        type_filter=request.args.get('type'),
+        search=request.args.get('q'),
+        limit=request.args.get('limit', default=100, type=int) or 100,
+        offset=request.args.get('offset', default=0, type=int) or 0,
+    )
+    return jsonify({'success': True, 'notifications': rows})
 
 
 def _simple_monitor_task():
@@ -17080,7 +17897,7 @@ def is_watchlist_actually_scanning():
 
     return True
 
-def _process_wishlist_automatically(automation_id=None):
+def _process_wishlist_automatically(automation_id=None, apply_backoff=None):
     """Main automatic processing logic that runs in background thread."""
     global wishlist_auto_processing, wishlist_auto_processing_timestamp
     from core.wishlist_service import get_wishlist_service
@@ -17124,7 +17941,8 @@ def _process_wishlist_automatically(automation_id=None):
         profile_id=1,
     )
 
-    _process_wishlist_automatically_impl(runtime, automation_id=automation_id)
+    _process_wishlist_automatically_impl(runtime, automation_id=automation_id,
+                                         apply_backoff=apply_backoff)
 
 # ===============================
 # == DATABASE UPDATER API      ==
@@ -17169,6 +17987,9 @@ def _db_update_finished_callback(total_artists, total_albums, total_tracks, succ
     # incremental, full refresh) converges on this callback, so writing here keeps it current.
     # Destination = the configured M3U output folder if set, else the Transfer folder. Fully
     # guarded — a playlist write must never disturb scan completion.
+    # The outcome is surfaced in the scan summary (m3u_note) so "did it trigger?"
+    # is answerable from the UI, not just app.log (#1041).
+    m3u_note = ""
     try:
         if config_manager.get('m3u_export.library_enabled', False):
             from core.library.m3u_export import write_library_m3u
@@ -17177,11 +17998,21 @@ def _db_update_finished_callback(total_artists, total_albums, total_tracks, succ
                 or config_manager.get('soulseek.transfer_path', './Transfer')
             _dest = docker_resolve_path(_dest)
             _base = config_manager.get('m3u_export.entry_base_path', '') or ''
-            _written = write_library_m3u(_entries, _dest, entry_base_path=_base)
+            _written = write_library_m3u(
+                _entries, _dest, entry_base_path=_base,
+                rewrite_from=config_manager.get('m3u_export.rewrite_from', '') or '',
+                rewrite_to=config_manager.get('m3u_export.rewrite_to', '') or '')
             if _written:
                 logger.info("[library-m3u] auto-synced %d tracks -> %s", len(_entries), _written)
+                m3u_note = f" | Library M3U: {len(_entries)} tracks → {_written}"
+            else:
+                m3u_note = " | Library M3U write failed (see app.log)"
+        else:
+            # One line per scan so a "never triggers" report diagnoses itself.
+            logger.info("[library-m3u] skipped — Library M3U auto-sync is disabled in Settings")
     except Exception as _m3u_err:
         logger.warning("[library-m3u] auto-sync failed: %s", _m3u_err)
+        m3u_note = " | Library M3U write failed (see app.log)"
     # Check for removal results from the worker
     removed_artists = 0
     removed_albums = 0
@@ -17211,11 +18042,11 @@ def _db_update_finished_callback(total_artists, total_albums, total_tracks, succ
                 skipped_tracks = getattr(db_update_worker, 'processed_albums', 0)
 
     if total_tracks > 0:
-        phase_msg = f"Completed: {total_artists} artists, {total_albums} albums, {total_tracks} new tracks{removal_msg}."
+        phase_msg = f"Completed: {total_artists} artists, {total_albums} albums, {total_tracks} new tracks{removal_msg}{m3u_note}."
     elif successful > 0:
-        phase_msg = f"Completed: {successful} artists scanned, library up to date{removal_msg}."
+        phase_msg = f"Completed: {successful} artists scanned, library up to date{removal_msg}{m3u_note}."
     else:
-        phase_msg = f"Completed: {successful} successful, {failed} failed{removal_msg}."
+        phase_msg = f"Completed: {successful} successful, {failed} failed{removal_msg}{m3u_note}."
 
     with db_update_lock:
         db_update_state["status"] = "finished"
@@ -17230,6 +18061,7 @@ def _db_update_finished_callback(total_artists, total_albums, total_tracks, succ
     auto_summary = f"{total_tracks} tracks, {total_albums} albums from {total_artists} artists"
     if removed_artists > 0 or removed_albums > 0:
         auto_summary += f" | Removed {removed_artists} artists, {removed_albums} albums"
+    auto_summary += m3u_note
     _update_automation_progress(_db_update_automation_id,
         status='finished', progress=100, phase='Complete',
         log_line=auto_summary, log_type='success')
@@ -17266,8 +18098,17 @@ def _db_update_finished_callback(total_artists, total_albums, total_tracks, succ
     # WISHLIST CLEANUP: Automatically clean up wishlist after database update
     try:
         logger.info("[DB Update] Database update completed, starting automatic wishlist cleanup...")
-        # Run cleanup in background to avoid blocking the UI
-        missing_download_executor.submit(_automatic_wishlist_cleanup_after_db_update)
+        # Dedicated thread, NOT `missing_download_executor` — that pool (3
+        # workers) also runs post-processing of completed downloads, and on a
+        # big wishlist one cleanup pass takes HOURS (per-track fuzzy matching).
+        # Stacked cleanups saturated the pool and finished downloads stopped
+        # moving to Completed until restart (jadux). The cleanup itself is
+        # overlap-guarded (skip-if-running) in core/wishlist/processing.py.
+        threading.Thread(
+            target=_automatic_wishlist_cleanup_after_db_update,
+            name="WishlistCleanup",
+            daemon=True,
+        ).start()
     except Exception as cleanup_error:
         logger.error(f"[DB Update] Error starting automatic wishlist cleanup: {cleanup_error}")
 
@@ -18175,6 +19016,20 @@ def remove_album_from_wishlist():
         logger.error(f"Error removing album from wishlist: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route('/api/wishlist/remove-artist', methods=['POST'])
+def remove_artist_from_wishlist():
+    """Remove every wishlist track by one artist (#1065 — one click instead
+    of unchecking a whole discography album by album)."""
+    try:
+        data = request.get_json() or {}
+        runtime = _build_wishlist_route_runtime()
+        payload, status_code = _wishlist_remove_artist_from_wishlist(
+            runtime, artist_name=data.get('artist_name'))
+        return jsonify(payload), status_code
+    except Exception as e:
+        logger.error(f"Error removing artist from wishlist: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route('/api/wishlist/remove-batch', methods=['POST'])
 def remove_batch_from_wishlist():
     """Endpoint to remove multiple tracks from the wishlist."""
@@ -18243,6 +19098,14 @@ def add_album_track_to_wishlist():
         album = data.get('album')
         source_type = data.get('source_type', 'album')
         source_context = data.get('source_context', {})
+
+        # The Quality Profile the user picked in the shared acquisition dialog.
+        # Before P1-01 this field did not exist and every manual Search /
+        # Discover / Library add silently used the global default.
+        quality_profile_id, error = _parse_requested_quality_profile_id(data)
+        if error:
+            return error
+
         runtime = _build_wishlist_route_runtime()
         payload, status_code = _wishlist_add_album_track_to_wishlist(
             runtime,
@@ -18251,6 +19114,7 @@ def add_album_track_to_wishlist():
             album=album,
             source_type=source_type,
             source_context=source_context,
+            quality_profile_id=quality_profile_id,
         )
         return jsonify(payload), status_code
     except Exception as e:
@@ -19338,7 +20202,103 @@ def _build_master_deps():
 
 
 
+def _resolve_batch_quality_profile_id(
+    playlist_ref,
+    playlist_name,
+    profile_id=1,
+    explicit_quality_profile_id=None,
+    source=None,
+):
+    """The Quality Profile a whole batch runs under, or ``None``.
+
+    Precedence, highest first:
+
+    1. ``explicit_quality_profile_id`` — the user picked one in the acquisition
+       dialog for THIS action (P1-01);
+    2. the persisted mirror assignment, when the ref resolves to a mirror;
+    3. nothing, i.e. the app-wide default is applied later.
+
+    Split out of :func:`_tracks_with_mirrored_quality_profile` so the answer is
+    available BEFORE the sync-history row is written. Recording history first
+    and resolving the mirror afterwards stored ``NULL`` for every
+    mirror-assigned batch, and a later re-add then fell back to the global
+    default (R2-07).
+    """
+    if explicit_quality_profile_id is not None:
+        return explicit_quality_profile_id
+    try:
+        database = get_database()
+        mirror = database.resolve_mirrored_playlist_assignment(
+            playlist_ref,
+            playlist_name,
+            profile_id=int(profile_id or 1),
+            source=source,
+        )
+        return mirror.get('quality_profile_id') if mirror else None
+    except Exception as exc:
+        logger.debug("Could not resolve mirrored playlist Quality Profile: %s", exc)
+        return None
+
+
+def _tracks_with_mirrored_quality_profile(
+    playlist_ref,
+    playlist_name,
+    tracks_json,
+    profile_id=1,
+    explicit_quality_profile_id=None,
+    source=None,
+):
+    """Stamp the effective Quality Profile onto a provider-agnostic track list.
+
+    Older source-specific endpoints do not all carry ``source`` through to the
+    worker.  The database resolver handles that compatibility boundary; from
+    here onward the chosen profile travels with each track and therefore also
+    survives failed-download-to-Wishlist processing.
+
+    A track that already carries its OWN ``quality_profile_id`` keeps it unless
+    the user made an explicit choice for this action. Wishlist rows carry a
+    per-item assignment (P1-02), and a batch-level mirror match — which can come
+    from nothing more than a matching playlist name — must not silently discard
+    it (R2-13).
+    """
+    if not isinstance(tracks_json, list):
+        return tracks_json, None
+    try:
+        quality_profile_id = _resolve_batch_quality_profile_id(
+            playlist_ref,
+            playlist_name,
+            profile_id=profile_id,
+            explicit_quality_profile_id=explicit_quality_profile_id,
+            source=source,
+        )
+        if quality_profile_id is None:
+            return tracks_json, None
+        explicit = explicit_quality_profile_id is not None
+        enriched = []
+        for track in tracks_json:
+            if isinstance(track, dict):
+                track = dict(track)
+                if explicit or track.get('quality_profile_id') is None:
+                    track['quality_profile_id'] = quality_profile_id
+            enriched.append(track)
+        return enriched, quality_profile_id
+    except Exception as exc:
+        logger.debug("Could not apply mirrored playlist Quality Profile: %s", exc)
+        return tracks_json, None
+
+
 def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, serialize=False):
+    batch = download_batches.get(batch_id, {})
+    tracks_json, quality_profile_id = _tracks_with_mirrored_quality_profile(
+        batch.get('playlist_id') or playlist_id,
+        batch.get('playlist_name'),
+        tracks_json,
+        profile_id=batch.get('profile_id', 1),
+        explicit_quality_profile_id=batch.get('requested_quality_profile_id'),
+        source=batch.get('playlist_source'),
+    )
+    if quality_profile_id is not None:
+        batch['quality_profile_id'] = quality_profile_id
     return _downloads_master.run_full_missing_tracks_process(
         batch_id, playlist_id, tracks_json, _build_master_deps(), serialize=serialize
     )
@@ -20146,12 +21106,16 @@ def cancel_download_task():
 
             # Add to wishlist, treating cancellation as a failure
             # Pass the spotify data directly instead of creating a fake Track object
+            # A cancel/retry must not silently change the requested quality: carry
+            # the task's Quality Profile through, exactly like the regular
+            # failed-download path already does (P2-06).
             success = wishlist_service.add_spotify_track_to_wishlist(
                 spotify_track_data=spotify_track_data,
                 failure_reason="Download cancelled by user",
                 source_type="playlist",
                 source_context=source_context,
-                profile_id=get_current_profile_id()
+                profile_id=get_current_profile_id(),
+                quality_profile_id=resolve_task_quality_profile_id(task),
             )
 
             if success:
@@ -20551,8 +21515,11 @@ def get_sync_history():
         source = request.args.get('source') or None
 
         db = MusicDatabase()
-        entries, total = db.get_sync_history(source=source, page=page, limit=limit)
-        stats = db.get_sync_history_stats()
+        profile_id = get_current_profile_id()
+        entries, total = db.get_sync_history(
+            source=source, page=page, limit=limit, profile_id=profile_id
+        )
+        stats = db.get_sync_history_stats(profile_id=profile_id)
 
         # Parse artist/album names from JSON context for display
         for entry in entries:
@@ -20587,7 +21554,7 @@ def get_sync_history_entry(entry_id):
     """Get a single sync history entry with full cached data for re-trigger."""
     try:
         db = MusicDatabase()
-        entry = db.get_sync_history_entry(entry_id)
+        entry = db.get_sync_history_entry(entry_id, profile_id=get_current_profile_id())
         if not entry:
             return jsonify({"success": False, "error": "Entry not found"}), 404
 
@@ -20610,7 +21577,8 @@ def readd_sync_track_to_wishlist(entry_id, track_index):
     behaves identically to the auto-add. Only 'wishlist'-status rows are eligible."""
     try:
         db = MusicDatabase()
-        entry = db.get_sync_history_entry(entry_id)
+        profile_id = get_current_profile_id()
+        entry = db.get_sync_history_entry(entry_id, profile_id=profile_id)
         if not entry:
             return jsonify({"success": False, "error": "Sync entry not found"}), 404
 
@@ -20621,6 +21589,16 @@ def readd_sync_track_to_wishlist(entry_id, track_index):
         spotify_track_data = reconstruct_sync_track_data(track_results, tracks, track_index)
         if not spotify_track_data:
             return jsonify({"success": False, "error": "This track can't be re-added to the wishlist"}), 400
+
+        # A retry must reproduce the ORIGINAL request, not the caller's defaults:
+        # the run's own SoulSync profile and Quality Profile, falling back to the
+        # per-track stamp the payload carries (P1-04).
+        readd_profile_id = int(entry.get('profile_id') or profile_id)
+        readd_quality_profile_id = (
+            entry.get('quality_profile_id')
+            if entry.get('quality_profile_id') is not None
+            else spotify_track_data.get('quality_profile_id')
+        )
 
         from core.wishlist_service import get_wishlist_service
         added = get_wishlist_service().add_spotify_track_to_wishlist(
@@ -20633,6 +21611,8 @@ def readd_sync_track_to_wishlist(entry_id, track_index):
                 'sync_type': 'automatic_sync',
                 'timestamp': datetime.now().isoformat(),
             },
+            profile_id=readd_profile_id,
+            quality_profile_id=readd_quality_profile_id,
         )
         return jsonify({"success": True, "added": bool(added),
                         "name": spotify_track_data.get('name', '')})
@@ -20646,7 +21626,7 @@ def delete_sync_history_entry_api(entry_id):
     """Delete a sync history entry."""
     try:
         db = MusicDatabase()
-        deleted = db.delete_sync_history_entry(entry_id)
+        deleted = db.delete_sync_history_entry(entry_id, profile_id=get_current_profile_id())
         return jsonify({"success": deleted})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -20656,7 +21636,7 @@ def get_sync_history_playlist_names():
     """Return distinct playlist names ever synced, for server playlist cross-reference."""
     try:
         db = MusicDatabase()
-        names = db.get_sync_history_playlist_names()
+        names = db.get_sync_history_playlist_names(profile_id=get_current_profile_id())
         return jsonify(names)
     except Exception as e:
         return jsonify([])
@@ -20677,13 +21657,19 @@ def _detect_sync_source(playlist_id):
 
 def _record_sync_history_start(batch_id, playlist_id, playlist_name, tracks,
                                 is_album_download, album_context, artist_context,
-                                playlist_folder_mode, source_page=None):
+                                playlist_folder_mode, source_page=None,
+                                profile_id=None, quality_profile_id=None):
     """Record a sync start to the database."""
+    if profile_id is None:
+        profile_id = get_current_profile_id()
+    # The derivation itself now lives in core.downloads.history so every caller
+    # gets it, not just this one (R2-06).
     _downloads_history.record_sync_history_start(
         MusicDatabase(),
         batch_id, playlist_id, playlist_name, tracks,
         is_album_download, album_context, artist_context,
         playlist_folder_mode, source_page=source_page,
+        profile_id=profile_id, quality_profile_id=quality_profile_id,
     )
 
 
@@ -20897,10 +21883,11 @@ def get_server_playlist_tracks(playlist_id):
         elif playlist_name:
             # Legacy fallback: cross-reference with sync history
             db = get_database()
-            entries, _ = db.get_sync_history(page=1, limit=50)
+            _hist_profile_id = get_current_profile_id()
+            entries, _ = db.get_sync_history(page=1, limit=50, profile_id=_hist_profile_id)
             for entry in entries:
                 if entry.get('playlist_name', '').lower() == playlist_name.lower():
-                    full_entry = db.get_sync_history_entry(entry['id'])
+                    full_entry = db.get_sync_history_entry(entry['id'], profile_id=_hist_profile_id)
                     if full_entry:
                         try:
                             tr = json.loads(full_entry.get('track_results') or '[]')
@@ -20927,22 +21914,22 @@ def get_server_playlist_tracks(playlist_id):
         # exact/fuzzy passes entirely. Stale-cache safe — if the cached
         # server track no longer exists, the override is silently
         # skipped and normal matching runs.
-        from core.sync.match_overrides import resolve_override_server_id, resolve_match_overrides
+        from core.sync.match_overrides import build_bulk_override_lookup, resolve_match_overrides
         _db_for_overrides = get_database()
         # Set of server track ids currently in this playlist — used to validate
         # a cached/durable match actually exists in this playlist before pairing it.
         _server_ids = {str(t.get('id')) for t in server_tracks if isinstance(t, dict) and t.get('id') is not None}
         _ov_profile = get_current_profile_id()
 
-        def _override_lookup(src_id):
-            # Validated fast-cache hit, else durable manual match (#787) which
-            # self-heals a stale library id via the stored file path. A cache hit
-            # that no longer points into THIS playlist must not short-circuit the
-            # durable path, or the manual match silently never applies (wolf39us).
-            return resolve_override_server_id(
-                _db_for_overrides, _ov_profile, src_id, active_server, _server_ids,
-                _db_for_overrides.read_sync_match_cache,
-            )
+        # Validated fast-cache hit, else durable manual match (#787) which
+        # self-heals a stale library id via the stored file path. A cache hit
+        # that no longer points into THIS playlist must not short-circuit the
+        # durable path, or the manual match silently never applies (wolf39us).
+        # Bulk-backed (#1005): the per-track resolver opened 2-3 fresh SQLite
+        # connections (and committed per cache hit) for EVERY source track —
+        # ~15s of pass-0 churn on a 1500-track playlist.
+        _override_lookup = build_bulk_override_lookup(
+            _db_for_overrides, _ov_profile, active_server, _server_ids, source_tracks)
 
         _override_pairs = resolve_match_overrides(source_tracks, server_tracks, _override_lookup)
 
@@ -21143,6 +22130,13 @@ def _persist_find_and_add_match(source_track_id, server_source, server_track_id,
        Find & Add now also records a manual library match (one-way; the manual
        match tool has no playlist to act on, so it doesn't reverse-create)."""
     if not source_track_id:
+        # Nothing to key the override by — the pairing will NOT survive a
+        # reload. Loud, because to the user this looks like "matched it, then
+        # it unmatched itself" (the wolf39us report shape).
+        logger.warning(
+            "[ServerPlaylist] Find & Add match for '%s' NOT persisted — the source row "
+            "carries no source_track_id, so the pairing can't be stored and will "
+            "revert on the next compare load.", server_track_title or source_title or server_track_id)
         return
     db = get_database()
     try:
@@ -21578,6 +22572,17 @@ def start_missing_tracks_process(playlist_id):
     skip_acoustid = bool(data.get('skip_acoustid', False))
     # Blocklist override (Phase 2b): set by the modal's "download anyway" confirm.
     ignore_blocklist = bool(data.get('ignore_blocklist', False))
+    # Quality Profile chosen in the shared acquisition dialog. Search, Discover,
+    # Library, album, single, discography and playlist-explorer all POST here, so
+    # this one field gives every manual path the same explicit choice (P1-01).
+    # It outranks the mirror's persisted assignment for this action only; the
+    # mirror row itself is unchanged unless the user edits it on the playlist.
+    requested_quality_profile_id, quality_profile_error = _parse_requested_quality_profile_id(data)
+    if quality_profile_error:
+        return quality_profile_error
+    # Provider hint so a mirror lookup can't be defeated by two providers sharing
+    # an upstream playlist id (P2-01).
+    playlist_source = data.get('source') or data.get('playlist_source') or None
 
     if not tracks:
         return jsonify({"success": False, "error": "No tracks provided"}), 400
@@ -21629,6 +22634,7 @@ def start_missing_tracks_process(playlist_id):
             db_pref.set_mirrored_playlist_organize_by_playlist(
                 int(mirrored_pl['id']),
                 bool(playlist_folder_mode),
+                profile_id=profile_id,
             )
     except Exception as pref_err:
         logger.debug(f"[Playlist Folder] Could not persist mirrored preference: {pref_err}")
@@ -21663,6 +22669,12 @@ def start_missing_tracks_process(playlist_id):
             'analysis_processed': 0,
             'analysis_results': [],
             'force_download_all': force_download_all,  # Pass the force flag to the batch
+            # Replace-intent (#1045): ONLY a user-checked Force toggle means
+            # "rewrite the existing file". force_download_all alone is NOT that
+            # signal — wishlist batches set it to skip ownership checks, and
+            # Wing It auto-ors it in client-side — so wing_it is excluded here
+            # and the wishlist never sets this key at all.
+            'force_replace': bool(force_download_all and not wing_it),
             'ignore_manual_matches': ignore_manual_matches,
             # Blocklist override (Phase 2b) — the user confirmed "download anyway"
             # at the modal, so the per-track filter (2a) skips this batch.
@@ -21675,6 +22687,10 @@ def start_missing_tracks_process(playlist_id):
             'wing_it': wing_it,
             'skip_acoustid': skip_acoustid,  # #797 per-request AcoustID bypass
             'batch_source': _downloads_history.detect_sync_source(playlist_id),
+            # Explicit user choice for this batch — travels onto every track and
+            # therefore also onto any failed-download Wishlist row (P1-01).
+            'requested_quality_profile_id': requested_quality_profile_id,
+            'playlist_source': playlist_source,
         }
 
     # Record sync history — derive source_page from context
@@ -21686,9 +22702,20 @@ def start_missing_tracks_process(playlist_id):
         _source_page = 'sync'
     else:
         _source_page = 'sync'
+    # Resolve the mirror assignment BEFORE writing history. The per-track stamp
+    # is applied later, inside _run_full_missing_tracks_process, so a history row
+    # written first saw no stamp and recorded NULL for a mirror-assigned batch
+    # (R2-07).
+    _history_quality_profile_id = _resolve_batch_quality_profile_id(
+        playlist_id, playlist_name,
+        profile_id=get_current_profile_id(),
+        explicit_quality_profile_id=requested_quality_profile_id,
+        source=playlist_source,
+    )
     _record_sync_history_start(batch_id, playlist_id, playlist_name, tracks,
                                is_album_download, album_context, artist_context,
-                               playlist_folder_mode, source_page=_source_page)
+                               playlist_folder_mode, source_page=_source_page,
+                               quality_profile_id=_history_quality_profile_id)
 
     # Link YouTube playlist to download process if this is a YouTube playlist
     if playlist_id.startswith('youtube_'):
@@ -21831,6 +22858,49 @@ def _save_sync_status_file(sync_statuses):
     except Exception as e:
         logger.error(f"Error saving sync status: {e}")
 
+def _parse_requested_quality_profile_id(data):
+    """``(quality_profile_id, error_response)`` for an acquisition request.
+
+    One validator for every manual acquisition surface — Search, Discover,
+    Library, album, single, top tracks, discography, playlist explorer — so the
+    same request field means the same thing everywhere (P1-01). Absent/None
+    keeps whatever the server would have chosen (mirror assignment, then the
+    global default); an unknown id is a 400 rather than a silent downgrade.
+    """
+    if not isinstance(data, dict) or data.get('quality_profile_id') is None:
+        return None, None
+    parsed = parse_strict_int(data.get('quality_profile_id'))
+    if parsed is None or parsed <= 0:
+        return None, (jsonify({"success": False, "error": "Invalid quality_profile_id"}), 400)
+    if not get_database().quality_profile_exists(parsed):
+        return None, (jsonify({"success": False, "error": "Unknown quality_profile_id"}), 400)
+    return parsed, None
+
+
+def _invalidate_mirror_sync_fingerprint(playlist_id):
+    """Drop the smart-skip fingerprint for a mirror so the next sync really runs.
+
+    Auto-Sync short-circuits when the track list is byte-identical to the last
+    run. That is right for a provider refresh but wrong for an authoritative
+    Quality Profile change, which must re-stamp the existing Wishlist rows even
+    though not a single track id moved (P1-03). Clearing the stored hashes is
+    the smallest change that makes the very next scheduled run authoritative,
+    and it degrades safely: a lost preference write only costs one extra sync.
+    """
+    key = f"auto_mirror_{int(playlist_id)}"
+    try:
+        sync_statuses = _load_sync_status_file()
+        status = sync_statuses.get(key)
+        if not status:
+            return
+        for field in ('tracks_hash', 'mirror_tracks_hash', 'matched_tracks'):
+            status.pop(field, None)
+        sync_statuses[key] = status
+        _save_sync_status_file(sync_statuses)
+    except Exception as e:
+        logger.debug("Could not invalidate sync fingerprint for %s: %s", key, e)
+
+
 def _sync_status_timestamp(status_info):
     """Return comparable timestamp for a persisted sync-status record."""
     if not status_info or 'last_synced' not in status_info:
@@ -21897,7 +22967,11 @@ def _update_and_save_sync_status(playlist_id, playlist_name, playlist_owner, sna
             'last_synced': now.isoformat()
         }
         # Store match counts and track hash for smart-skip on scheduled syncs
-        for key in ('matched_tracks', 'total_tracks', 'discovered_tracks', 'tracks_hash', 'mirror_tracks_hash'):
+        # `quality_profile_id` is part of the smart-skip fingerprint: an
+        # authoritative profile change must re-run the sync even when the track
+        # list is byte-identical (P1-03).
+        for key in ('matched_tracks', 'total_tracks', 'discovered_tracks', 'tracks_hash',
+                    'mirror_tracks_hash', 'quality_profile_id'):
             if key in kwargs:
                 status[key] = kwargs[key]
         sync_statuses[playlist_id] = status
@@ -26719,6 +27793,12 @@ def _run_sync_task(
     if sync_mode is None:
         from core.sync.playlist_edit import normalize_sync_mode
         sync_mode = normalize_sync_mode(None, config_manager.get('playlist_sync.mode', 'replace'))
+    tracks_json, _quality_profile_id = _tracks_with_mirrored_quality_profile(
+        playlist_id,
+        playlist_name,
+        tracks_json,
+        profile_id=profile_id,
+    )
     return _discovery_sync.run_sync_task(
         playlist_id, playlist_name, tracks_json, automation_id, profile_id, playlist_image_url,
         _build_sync_deps(),
@@ -27094,13 +28174,26 @@ def hydrate_artist_bubbles():
         # Update bubble statuses with live data
         hydrated_bubbles = {}
         for artist_id, bubble_data in saved_bubbles.items():
+            # A malformed snapshot entry (no artist dict / no downloads list) must be
+            # dropped here — hydrating it breaks the client's Library page init (#1038).
+            if not isinstance(bubble_data, dict) or not isinstance(bubble_data.get('artist'), dict) \
+                    or bubble_data.get('artist', {}).get('id') is None:
+                logger.warning(f"Skipping malformed artist bubble snapshot entry: {artist_id}")
+                continue
             hydrated_bubble = {
                 'artist': bubble_data['artist'],
                 'downloads': [],
                 'hasCompletedDownloads': False
             }
-            
-            for download in bubble_data.get('downloads', []):
+
+            downloads = bubble_data.get('downloads') or []
+            if not isinstance(downloads, list):
+                downloads = []
+            for download in downloads:
+                if not isinstance(download, dict) or not isinstance(download.get('album'), dict) \
+                        or not download.get('virtualPlaylistId'):
+                    logger.warning(f"Skipping malformed download in bubble snapshot for artist {artist_id}")
+                    continue
                 virtual_playlist_id = download['virtualPlaylistId']
                 
                 # Determine current live status
@@ -27463,10 +28556,15 @@ def create_profile():
                             'error': 'Login mode is on — give this profile a login '
                                      'password so they can sign in.'}), 400
 
-        # Profile settings: home_page, allowed_pages, can_download
+        # Profile settings: home_page, allowed_pages, can_download, allowed_sides
         home_page = data.get('home_page') or None
         allowed_pages = data.get('allowed_pages')  # list or None
         can_download = data.get('can_download', True)
+        # Side access — music | video | both, never nothing. Anything else
+        # falls back to the shipped default (music-only for non-admins).
+        allowed_sides = data.get('allowed_sides')
+        if allowed_sides not in ('music', 'video', 'both'):
+            allowed_sides = None
 
         # Validate page IDs
         if home_page and home_page not in VALID_PAGE_IDS:
@@ -27482,7 +28580,8 @@ def create_profile():
 
         profile_id = database.create_profile(
             name, avatar_color, pin_hash, is_admin=False, avatar_url=avatar_url,
-            home_page=home_page, allowed_pages=allowed_pages, can_download=bool(can_download)
+            home_page=home_page, allowed_pages=allowed_pages, can_download=bool(can_download),
+            allowed_sides=allowed_sides
         )
         if profile_id is None:
             return jsonify({'success': False, 'error': 'Profile name already exists'}), 409
@@ -27559,6 +28658,13 @@ def update_profile(profile_id):
                 kwargs['allowed_pages'] = ap
             if 'can_download' in data:
                 kwargs['can_download'] = int(bool(data['can_download']))
+            if 'allowed_sides' in data:
+                # music | video | both, never nothing — invalid values reset to
+                # NULL (the shipped music-only default for non-admins). Stored
+                # values on ADMIN profiles are inert: the read side always
+                # resolves admins to 'both'.
+                sides = data['allowed_sides']
+                kwargs['allowed_sides'] = sides if sides in ('music', 'video', 'both') else None
 
         success = database.update_profile(profile_id, **kwargs)
         return jsonify({'success': success})
@@ -27583,6 +28689,9 @@ def delete_profile(profile_id):
             return jsonify({'success': False, 'error': 'Profile not found'}), 404
 
         success = database.delete_profile(profile_id)
+        if success:
+            from api.profiles import _sweep_video_profile_data
+            _sweep_video_profile_data(profile_id)
         return jsonify({'success': success})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -28790,7 +29899,9 @@ def start_playlist_export_listenbrainz(playlist_id):
         body = request.get_json(silent=True) or {}
         mode = 'push' if body.get('mode') == 'push' else 'download'
         db = get_database()
-        meta = db.get_mirrored_playlist(int(playlist_id)) or {}
+        meta = _owned_mirrored_playlist(db, int(playlist_id))
+        if not meta:
+            return jsonify({"success": False, "error": "Playlist not found"}), 404
         title = (meta.get('name') or meta.get('title') or 'SoulSync Export').strip() or 'SoulSync Export'
 
         import uuid
@@ -28832,7 +29943,9 @@ def start_playlist_export_service(playlist_id, service):
         body = request.get_json(silent=True) or {}
         backfill = bool(body.get('backfill'))
         db = get_database()
-        meta = db.get_mirrored_playlist(int(playlist_id)) or {}
+        meta = _owned_mirrored_playlist(db, int(playlist_id))
+        if not meta:
+            return jsonify({"success": False, "error": "Playlist not found"}), 404
         title = (meta.get('name') or meta.get('title') or 'SoulSync Export').strip() or 'SoulSync Export'
 
         import uuid
@@ -28949,20 +30062,34 @@ def export_library_artists():
 def add_to_watchlist():
     """Add an artist to the watchlist"""
     try:
-        data = request.get_json()
-        artist_id = data.get('artist_id')
+        data = request.get_json() or {}
+        # Strict types: `artist_id` used to be truthiness-checked only, so a list
+        # or int survived until a `.isdigit()` deep in the DB raised a 500 (P3-01).
+        artist_id = parse_strict_id(data.get('artist_id'))
         artist_name = data.get('artist_name')
+        artist_name = artist_name.strip() if isinstance(artist_name, str) else None
 
         if not artist_id or not artist_name:
             return jsonify({"success": False, "error": "Missing artist_id or artist_name"}), 400
 
         database = get_database()
+        quality_profile_id = None
+        if data.get('quality_profile_id') is not None:
+            quality_profile_id = parse_strict_int(data.get('quality_profile_id'))
+            if quality_profile_id is None or quality_profile_id <= 0:
+                return jsonify({"success": False, "error": "Invalid quality_profile_id"}), 400
+            if not database.quality_profile_exists(quality_profile_id):
+                return jsonify({"success": False, "error": "Unknown quality_profile_id"}), 400
         # Callers that KNOW the id's source (e.g. the Discovery Web, whose candidates carry
         # [source, id] pairs) can pass it explicitly — numeric Deezer/iTunes ids are ambiguous and
         # the detection below can otherwise mistake them for a library DB row id.
-        explicit_source = (data.get('source') or '').strip().lower()
-        if explicit_source not in ('spotify', 'deezer', 'itunes', 'discogs', 'musicbrainz'):
-            explicit_source = None
+        # An unrecognised source is a client error, not a reason to guess (P1-05).
+        from core.watchlist_sources import normalize_source
+        explicit_source = None
+        if data.get('source') is not None:
+            explicit_source = normalize_source(data.get('source'))
+            if explicit_source is None:
+                return jsonify({"success": False, "error": "Unknown source"}), 400
         # Detect source from ID — check if it's a library DB ID first
         is_numeric_id = artist_id.isdigit()
         source = explicit_source
@@ -29009,8 +30136,19 @@ def add_to_watchlist():
                 logger.debug("watchlist artist source lookup failed: %s", e)
         fallback_source = _get_metadata_fallback_source()   # always defined — image block below reads it
         if not source:
-            source = fallback_source if is_numeric_id else 'spotify'
-        success = database.add_artist_to_watchlist(artist_id, artist_name, profile_id=get_current_profile_id(), source=source)
+            # The fallback source is a hint, not a storable provider: hydrabase,
+            # jiosaavn and bandcamp are in METADATA_SOURCE_PRIORITY but have no
+            # watchlist id column, and handing one of those to the strict
+            # provider check turned a working add into a hard failure (R2-01).
+            from core.watchlist_sources import storable_source
+            source = storable_source(fallback_source, artist_id) if is_numeric_id else 'spotify'
+        success = database.add_artist_to_watchlist(
+            artist_id,
+            artist_name,
+            profile_id=get_current_profile_id(),
+            source=source,
+            quality_profile_id=quality_profile_id,
+        )
         if success:
             database.backfill_watchlist_musicbrainz_ids_from_library(profile_id=get_current_profile_id())
 
@@ -29154,9 +30292,18 @@ def add_batch_to_watchlist():
         if not artists or not isinstance(artists, list):
             return jsonify({"success": False, "error": "Missing or invalid artists list"}), 400
 
+        from core.watchlist_sources import storable_source
+
         database = get_database()
         added = 0
         skipped = 0
+        rejected = []
+
+        # The metadata fallback source is read once, not per artist, and the
+        # Quality Profile is validated with the dedicated existence check
+        # instead of pulling the whole profile table inside the loop (R2-15).
+        fb_source = _get_metadata_fallback_source()
+        checked_profile_ids = set()
 
         for artist in artists:
             artist_id = artist.get('artist_id')
@@ -29170,16 +30317,34 @@ def add_batch_to_watchlist():
                 continue
 
             is_numeric = artist_id.isdigit()
-            fb_source = _get_metadata_fallback_source()
-            src = fb_source if is_numeric else 'spotify'
-            success = database.add_artist_to_watchlist(artist_id, artist_name, profile_id=get_current_profile_id(), source=src)
+            src = storable_source(fb_source, artist_id) if is_numeric else 'spotify'
+            quality_profile_id = artist.get('quality_profile_id')
+            if quality_profile_id is not None:
+                try:
+                    quality_profile_id = int(quality_profile_id)
+                except (TypeError, ValueError):
+                    # A rejected artist is reported, never silently dropped from
+                    # the count the client sees (R2-15).
+                    rejected.append({'artist_name': artist_name, 'reason': 'Invalid quality_profile_id'})
+                    continue
+                if quality_profile_id not in checked_profile_ids:
+                    if not database.quality_profile_exists(quality_profile_id):
+                        rejected.append({'artist_name': artist_name, 'reason': 'Unknown quality_profile_id'})
+                        continue
+                    checked_profile_ids.add(quality_profile_id)
+            success = database.add_artist_to_watchlist(
+                artist_id,
+                artist_name,
+                profile_id=get_current_profile_id(),
+                source=src,
+                quality_profile_id=quality_profile_id,
+            )
             if success:
                 added += 1
                 # Cache artist image
                 try:
                     is_numeric_id = artist_id.isdigit()
                     if is_numeric_id:
-                        fb_source = _get_metadata_fallback_source()
                         if fb_source == 'deezer':
                             fb_client = _get_metadata_fallback_client()
                             fb_artist = fb_client.get_artist(artist_id)
@@ -29205,12 +30370,18 @@ def add_batch_to_watchlist():
                                 database.update_watchlist_artist_image(artist_id, image_url)
                 except Exception as img_error:
                     logger.error(f"Could not fetch artist image for {artist_name}: {img_error}")
+            else:
+                rejected.append({'artist_name': artist_name, 'reason': 'Could not be added to the watchlist'})
 
+        message = f"Added {added} artist{'s' if added != 1 else ''} to watchlist ({skipped} already watched)"
+        if rejected:
+            message += f", {len(rejected)} rejected"
         return jsonify({
             "success": True,
             "added": added,
             "skipped": skipped,
-            "message": f"Added {added} artist{'s' if added != 1 else ''} to watchlist ({skipped} already watched)"
+            "rejected": rejected,
+            "message": message
         })
 
     except Exception as e:
@@ -29485,6 +30656,20 @@ def start_watchlist_scan():
                     cancel_check=lambda: watchlist_scan_state.get('cancel_requested', False),
                 )
 
+                # --- Label watchlist phase (same thread, same live state) ---
+                # Labels ride the normal watchlist scan via the SHARED helper
+                # (also used by the scheduled automation), so one "Scan Watchlist"
+                # covers artists THEN labels with the identical live display.
+                _lbl_tracks = 0
+                if not watchlist_scan_state.get('cancel_requested', False):
+                    try:
+                        from core.automation.handlers.scan_watchlist_labels import run_label_scan_phase
+                        _lbl_tracks = run_label_scan_phase(
+                            watchlist_scan_state, database=database,
+                            get_deezer=_get_deezer_client, profile_id=scan_profile_id)
+                    except Exception as _lbl_err:
+                        logger.error("Label watchlist scan phase failed: %s", _lbl_err, exc_info=True)
+
                 # Store final results (skip if cancelled — already set by cancel handler)
                 was_cancelled = watchlist_scan_state.get('cancel_requested', False)
                 if not was_cancelled:
@@ -29498,15 +30683,23 @@ def start_watchlist_scan():
                     watchlist_scan_state['completed_at'] = datetime.now()
                     watchlist_scan_state['current_phase'] = 'completed'
 
+                    try:
+                        _labels_scanned = len(database.get_watchlist_labels() or [])
+                    except Exception:
+                        # a label COUNT must never abort an otherwise successful scan
+                        _labels_scanned = 0
                     watchlist_scan_state['summary'] = {
                         'total_artists': len(scan_results),
                         'successful_scans': len(successful_scans),
-                        'new_tracks_found': total_new_tracks,
-                        'tracks_added_to_wishlist': total_added_to_wishlist
+                        'new_tracks_found': total_new_tracks + _lbl_tracks,
+                        'tracks_added_to_wishlist': total_added_to_wishlist + _lbl_tracks,
+                        # label breakdown (additive; existing UI ignores extra keys)
+                        'labels_scanned': _labels_scanned,
+                        'label_tracks_added': _lbl_tracks,
                     }
 
                     logger.info(f"Watchlist scan completed: {len(successful_scans)}/{len(scan_results)} artists scanned successfully")
-                    logger.info(f"Found {total_new_tracks} new tracks, added {total_added_to_wishlist} to wishlist")
+                    logger.info(f"Found {total_new_tracks} new tracks, added {total_added_to_wishlist} to wishlist (+ {_lbl_tracks} from labels)")
                 else:
                     logger.warning("Watchlist scan cancelled — skipping post-scan steps")
 
@@ -29773,6 +30966,7 @@ def watchlist_artist_config(artist_id):
         from database.music_database import get_database
 
         database = get_database()
+        active_profile_id = get_current_profile_id()
 
         if request.method == 'GET':
             database.backfill_watchlist_musicbrainz_ids_from_library(profile_id=get_current_profile_id())
@@ -29785,11 +30979,14 @@ def watchlist_artist_config(artist_id):
                        artist_name, image_url, spotify_artist_id, itunes_artist_id,
                        last_scan_timestamp, date_added, include_instrumentals, deezer_artist_id,
                        lookback_days, discogs_artist_id, preferred_metadata_source,
-                       amazon_artist_id, musicbrainz_artist_id, auto_download
+                       amazon_artist_id, musicbrainz_artist_id, auto_download,
+                       quality_profile_id
                 FROM watchlist_artists
-                WHERE spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
+                WHERE profile_id = ? AND (
+                      spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
                       OR discogs_artist_id = ? OR amazon_artist_id = ? OR musicbrainz_artist_id = ?
-            """, (artist_id, artist_id, artist_id, artist_id, artist_id, artist_id))
+                )
+            """, (active_profile_id, artist_id, artist_id, artist_id, artist_id, artist_id, artist_id))
             result = cursor.fetchone()
             conn.close()
 
@@ -29916,6 +31113,7 @@ def watchlist_artist_config(artist_id):
                 'preferred_metadata_source': result[17] if len(result) > 17 else None,
                 # follow-only toggle (default True/auto-download when column absent)
                 'auto_download': bool(result[20]) if len(result) > 20 and result[20] is not None else True,
+                'quality_profile_id': int(result[21]) if len(result) > 21 and result[21] is not None else None,
             }
 
             from core.metadata.registry import get_primary_source
@@ -29932,6 +31130,7 @@ def watchlist_artist_config(artist_id):
                 "musicbrainz_artist_id": musicbrainz_id,
                 "watchlist_name": result[7],  # Original stored watchlist artist name
                 "global_metadata_source": get_primary_source(),
+                "quality_profiles": database.list_quality_profiles(),
             })
 
         else:  # POST
@@ -29939,65 +31138,133 @@ def watchlist_artist_config(artist_id):
             if not data:
                 return jsonify({"success": False, "error": "No data provided"}), 400
 
-            include_albums = data.get('include_albums', True)
-            include_eps = data.get('include_eps', True)
-            include_singles = data.get('include_singles', True)
-            include_live = data.get('include_live', False)
-            include_remixes = data.get('include_remixes', False)
-            include_acoustic = data.get('include_acoustic', False)
-            include_compilations = data.get('include_compilations', False)
-            include_instrumentals = data.get('include_instrumentals', False)
-            lookback_days = data.get('lookback_days', None)  # None = use global setting
-            # Validate lookback_days if provided
-            if lookback_days is not None:
-                lookback_days = int(lookback_days) if lookback_days != '' else None
-            preferred_metadata_source = data.get('preferred_metadata_source', None)
-            # Validate — only accept known sources, empty string means clear override
-            _watchlist_meta_sources = (
-                'spotify', 'deezer', 'itunes', 'discogs', 'musicbrainz',
-            )
-            from core.metadata.registry import EXPERIMENTAL_SOURCES, is_source_enabled
-            _watchlist_meta_sources = _watchlist_meta_sources + tuple(
-                name for name in EXPERIMENTAL_SOURCES if is_source_enabled(name)
-            )
-            if preferred_metadata_source == '' or preferred_metadata_source not in _watchlist_meta_sources:
-                preferred_metadata_source = None
+            # Read the CURRENT configuration first. This endpoint used to fill
+            # every absent field with a hardcoded default and then write the lot
+            # back, so a client sending only `quality_profile_id` silently reset
+            # release types, lookback, metadata source and auto-download (P2-03).
+            # Absent now means "keep", so a partial request really is partial
+            # while a full form request behaves exactly as before.
+            conn = sqlite3.connect(str(database.database_path))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT include_albums, include_eps, include_singles, include_live,
+                       include_remixes, include_acoustic, include_compilations,
+                       include_instrumentals, lookback_days, preferred_metadata_source,
+                       auto_download, quality_profile_id
+                FROM watchlist_artists
+                WHERE profile_id = ? AND (
+                      spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
+                      OR discogs_artist_id = ? OR amazon_artist_id = ? OR musicbrainz_artist_id = ?
+                )
+            """, (active_profile_id, artist_id, artist_id, artist_id, artist_id, artist_id, artist_id))
+            old_row = cursor.fetchone()
+            if old_row is None:
+                conn.close()
+                return jsonify({"success": False, "error": "Artist not found in watchlist"}), 404
+
+            class _BadBool(Exception):
+                def __init__(self, field):
+                    self.field = field
+
+            def _field(name, fallback):
+                """Sent value, or the stored one when the client omitted the field.
+
+                An unparseable value is an error, NOT a reason to substitute the
+                hardcoded default: doing that silently flipped a stored setting
+                off on a 200 response, and disagreed with the modular API, which
+                answers 400 for the same input (R2-08).
+                """
+                if name not in data:
+                    return old_row[name] if old_row[name] is not None else fallback
+                parsed = parse_strict_bool(data.get(name))
+                if parsed is None:
+                    raise _BadBool(name)
+                return parsed
+
+            try:
+                include_albums = _field('include_albums', True)
+                include_eps = _field('include_eps', True)
+                include_singles = _field('include_singles', True)
+                include_live = _field('include_live', False)
+                include_remixes = _field('include_remixes', False)
+                include_acoustic = _field('include_acoustic', False)
+                include_compilations = _field('include_compilations', False)
+                include_instrumentals = _field('include_instrumentals', False)
+            except _BadBool as bad:
+                conn.close()
+                return jsonify({"success": False, "error": f"{bad.field} must be a boolean"}), 400
+
+            if 'lookback_days' in data:
+                lookback_days = data.get('lookback_days')  # None = use global setting
+                if lookback_days is not None:
+                    try:
+                        lookback_days = int(lookback_days) if lookback_days != '' else None
+                    except (TypeError, ValueError):
+                        conn.close()
+                        return jsonify({"success": False, "error": "Invalid lookback_days"}), 400
+            else:
+                lookback_days = old_row['lookback_days']
+
+            if 'preferred_metadata_source' in data:
+                preferred_metadata_source = data.get('preferred_metadata_source', None)
+                # Validate — only accept known sources, empty string means clear override
+                _watchlist_meta_sources = (
+                    'spotify', 'deezer', 'itunes', 'discogs', 'musicbrainz',
+                )
+                from core.metadata.registry import EXPERIMENTAL_SOURCES, is_source_enabled
+                _watchlist_meta_sources = _watchlist_meta_sources + tuple(
+                    name for name in EXPERIMENTAL_SOURCES if is_source_enabled(name)
+                )
+                if preferred_metadata_source == '' or preferred_metadata_source not in _watchlist_meta_sources:
+                    preferred_metadata_source = None
+            else:
+                preferred_metadata_source = old_row['preferred_metadata_source']
+
             # Follow-only toggle: default True so an older client that omits the
             # field keeps auto-downloading.
-            auto_download = bool(data.get('auto_download', True))
+            try:
+                auto_download = _field('auto_download', True)
+            except _BadBool as bad:
+                conn.close()
+                return jsonify({"success": False, "error": f"{bad.field} must be a boolean"}), 400
+
+            if 'quality_profile_id' in data and data.get('quality_profile_id') is not None:
+                quality_profile_id = parse_strict_int(data.get('quality_profile_id'))
+                if quality_profile_id is None or quality_profile_id <= 0:
+                    conn.close()
+                    return jsonify({"success": False, "error": "Invalid quality_profile_id"}), 400
+                if not database.quality_profile_exists(quality_profile_id):
+                    conn.close()
+                    return jsonify({"success": False, "error": "Unknown quality_profile_id"}), 400
+            else:
+                quality_profile_id = old_row['quality_profile_id']
 
             # Validate at least one release type is selected
             if not (include_albums or include_eps or include_singles):
+                conn.close()
                 return jsonify({"success": False, "error": "At least one release type must be selected"}), 400
 
-            # Update database
-            conn = sqlite3.connect(str(database.database_path))
-            cursor = conn.cursor()
-
-            # Check if lookback_days changed — if so, clear last_scan_timestamp to force rescan
-            cursor.execute("""
-                SELECT lookback_days FROM watchlist_artists
-                WHERE spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
-                      OR discogs_artist_id = ? OR musicbrainz_artist_id = ?
-            """, (artist_id, artist_id, artist_id, artist_id, artist_id))
-            old_row = cursor.fetchone()
-            old_lookback = old_row[0] if old_row else None
-            lookback_changed = old_lookback != lookback_days
+            # lookback_days changed — clear last_scan_timestamp to force rescan
+            lookback_changed = old_row['lookback_days'] != lookback_days
 
             cursor.execute("""
                 UPDATE watchlist_artists
                 SET include_albums = ?, include_eps = ?, include_singles = ?,
                     include_live = ?, include_remixes = ?, include_acoustic = ?, include_compilations = ?,
                     include_instrumentals = ?, lookback_days = ?, preferred_metadata_source = ?,
-                    auto_download = ?,
+                    auto_download = ?, quality_profile_id = ?,
                     last_scan_timestamp = CASE WHEN ? THEN NULL ELSE last_scan_timestamp END,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
-                      OR discogs_artist_id = ? OR musicbrainz_artist_id = ?
+                WHERE profile_id = ? AND (
+                      spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
+                      OR discogs_artist_id = ? OR amazon_artist_id = ? OR musicbrainz_artist_id = ?
+                )
             """, (int(include_albums), int(include_eps), int(include_singles),
                   int(include_live), int(include_remixes), int(include_acoustic), int(include_compilations),
-                  int(include_instrumentals), lookback_days, preferred_metadata_source, int(auto_download), lookback_changed,
-                  artist_id, artist_id, artist_id, artist_id, artist_id))
+                  int(include_instrumentals), lookback_days, preferred_metadata_source, int(auto_download),
+                  quality_profile_id, lookback_changed, active_profile_id,
+                  artist_id, artist_id, artist_id, artist_id, artist_id, artist_id))
             conn.commit()
 
             if cursor.rowcount == 0:
@@ -30021,6 +31288,7 @@ def watchlist_artist_config(artist_id):
                     'include_compilations': include_compilations,
                     'include_instrumentals': include_instrumentals,
                     'auto_download': auto_download,
+                    'quality_profile_id': quality_profile_id,
                 }
             })
 
@@ -30315,6 +31583,7 @@ def _build_watchlist_auto_scan_deps():
         _set_auto_scanning_timestamp=_set_ts,
         _get_watchlist_scan_state=_get_state,
         _set_watchlist_scan_state=_set_state,
+        get_deezer_client=_get_deezer_client,
     )
 
 
@@ -36134,6 +37403,14 @@ def mirror_playlist_endpoint():
 
         database = get_database()
         profile_id = get_current_profile_id()
+        quality_profile_id = data.get('quality_profile_id')
+        if quality_profile_id is not None:
+            try:
+                quality_profile_id = int(quality_profile_id)
+            except (TypeError, ValueError):
+                return jsonify({"error": "Invalid quality_profile_id"}), 400
+            if not database.quality_profile_exists(quality_profile_id):
+                return jsonify({"error": "Unknown quality_profile_id"}), 400
 
         playlist_id = database.mirror_playlist(
             source=source,
@@ -36141,6 +37418,7 @@ def mirror_playlist_endpoint():
             name=name,
             tracks=tracks,
             profile_id=profile_id,
+            quality_profile_id=quality_profile_id,
             description=data.get('description'),
             owner=data.get('owner'),
             image_url=data.get('image_url')
@@ -36210,6 +37488,37 @@ def get_mirrored_playlists_endpoint():
         logger.error(f"Error getting mirrored playlists: {e}")
         return jsonify({"error": str(e)}), 500
 
+def _mirror_scope_profile_id():
+    """None for admin, else the active profile.
+
+    Merged from upstream/dev's ``mirrored_playlist_visible`` admin bypass: an
+    admin can read/manage any profile's mirror, matching the parallel
+    isolation-audit work upstream did on the same by-id mirror routes. ``None``
+    is the existing "trusted caller who already resolved the mirror" scope
+    (see ``_mirror_owner_clause``), so admin gets the unscoped read/write on a
+    playlist_id that a non-admin would only get after passing the ownership
+    check below.
+    """
+    try:
+        is_admin = bool(getattr(g, "is_admin", True))
+    except RuntimeError:
+        is_admin = True  # no request context = system caller
+    return None if is_admin else get_current_profile_id()
+
+
+def _owned_mirrored_playlist(database, playlist_id):
+    """The mirror ``playlist_id`` IF it belongs to the active SoulSync profile,
+    or any mirror when the caller is admin.
+
+    Request handlers must never look a mirror up by primary key alone: the ids
+    are small integers and the synthetic ``auto_mirror_<pk>`` form is guessable,
+    so an unscoped lookup let any profile read, rename, re-point, run, clear or
+    delete another profile's mirror — and read its Quality Profile (P0-01).
+    A foreign mirror is reported exactly like a missing one.
+    """
+    return database.get_mirrored_playlist(playlist_id, profile_id=_mirror_scope_profile_id())
+
+
 @app.route('/api/mirrored-playlists/<int:playlist_id>', methods=['GET'])
 def get_mirrored_playlist_endpoint(playlist_id):
     """Get a mirrored playlist with its tracks."""
@@ -36217,7 +37526,7 @@ def get_mirrored_playlist_endpoint(playlist_id):
         from core.playlists.source_refs import describe_mirrored_source_ref
         from core.playlists.naming import effective_mirrored_name
         database = get_database()
-        playlist = database.get_mirrored_playlist(playlist_id)
+        playlist = _owned_mirrored_playlist(database, playlist_id)
         if not playlist:
             return jsonify({"error": "Playlist not found"}), 404
         source_ref = describe_mirrored_source_ref(playlist)
@@ -36241,7 +37550,7 @@ def update_mirrored_playlist_source_ref_endpoint(playlist_id):
         source_ref = data.get('source_ref') or data.get('source_playlist_id') or data.get('url')
 
         database = get_database()
-        playlist = database.get_mirrored_playlist(playlist_id)
+        playlist = _owned_mirrored_playlist(database, playlist_id)
         if not playlist:
             return jsonify({"error": "Playlist not found"}), 404
 
@@ -36272,11 +37581,12 @@ def update_mirrored_playlist_source_ref_endpoint(playlist_id):
             playlist_id,
             normalized.source_playlist_id,
             normalized.description,
+            profile_id=_mirror_scope_profile_id(),
         )
         if not ok:
             return jsonify({"error": "Failed to update source reference"}), 500
 
-        updated = database.get_mirrored_playlist(playlist_id) or {}
+        updated = _owned_mirrored_playlist(database, playlist_id) or {}
         return jsonify({"success": True, "playlist": updated})
     except Exception as e:
         logger.error(f"Error updating mirrored playlist source reference: {e}")
@@ -36292,16 +37602,18 @@ def update_mirrored_playlist_custom_name_endpoint(playlist_id):
         from core.playlists.naming import effective_mirrored_name
         data = request.get_json() or {}
         database = get_database()
-        playlist = database.get_mirrored_playlist(playlist_id)
+        playlist = _owned_mirrored_playlist(database, playlist_id)
         if not playlist:
             return jsonify({"error": "Playlist not found"}), 404
 
         # `custom_name` may be '' / null to CLEAR the alias.
-        ok = database.set_mirrored_playlist_custom_name(playlist_id, data.get('custom_name'))
+        ok = database.set_mirrored_playlist_custom_name(
+            playlist_id, data.get('custom_name'), profile_id=_mirror_scope_profile_id()
+        )
         if not ok:
             return jsonify({"error": "Failed to update name"}), 500
 
-        updated = database.get_mirrored_playlist(playlist_id) or {}
+        updated = _owned_mirrored_playlist(database, playlist_id) or {}
         updated['display_name'] = effective_mirrored_name(updated)
         return jsonify({"success": True, "playlist": updated})
     except Exception as e:
@@ -36314,20 +37626,52 @@ def update_mirrored_playlist_preferences_endpoint(playlist_id):
     """Update per-playlist download preferences (e.g. organize by playlist folder)."""
     try:
         data = request.get_json() or {}
-        if 'organize_by_playlist' not in data:
-            return jsonify({"error": "organize_by_playlist is required"}), 400
+        if not ({'organize_by_playlist', 'quality_profile_id'} & set(data)):
+            return jsonify({"error": "No supported preference supplied"}), 400
 
         database = get_database()
-        playlist = database.get_mirrored_playlist(playlist_id)
+        profile_id = _mirror_scope_profile_id()
+        playlist = _owned_mirrored_playlist(database, playlist_id)
         if not playlist:
             return jsonify({"error": "Playlist not found"}), 404
 
-        enabled = bool(data.get('organize_by_playlist'))
-        ok = database.set_mirrored_playlist_organize_by_playlist(playlist_id, enabled)
-        if not ok:
+        organize_by_playlist = None
+        if 'organize_by_playlist' in data:
+            organize_by_playlist = parse_strict_bool(data.get('organize_by_playlist'))
+            if organize_by_playlist is None:
+                return jsonify({"error": "Invalid organize_by_playlist"}), 400
+
+        quality_profile_id = None
+        if 'quality_profile_id' in data:
+            quality_profile_id = parse_strict_int(data.get('quality_profile_id'))
+            if quality_profile_id is None:
+                return jsonify({"error": "Invalid quality_profile_id"}), 400
+
+        # Both fields are validated and written in ONE transaction: a rejected
+        # Quality Profile used to leave the already-committed organize toggle
+        # behind while the response said 400 (P2-02).
+        outcome = database.update_mirrored_playlist_preferences(
+            playlist_id,
+            profile_id=profile_id,
+            organize_by_playlist=organize_by_playlist,
+            quality_profile_id=quality_profile_id,
+        )
+        if outcome == 'not_found':
+            return jsonify({"error": "Playlist not found"}), 404
+        if outcome == 'unknown_quality_profile':
+            return jsonify({"error": "Unknown quality_profile_id"}), 400
+        if outcome != 'ok':
             return jsonify({"error": "Failed to update preferences"}), 500
 
-        updated = database.get_mirrored_playlist(playlist_id) or {}
+        if (
+            quality_profile_id is not None
+            and quality_profile_id != playlist.get('quality_profile_id')
+        ):
+            # A profile-only change must not be swallowed by the auto-sync
+            # "tracks unchanged" fast path (P1-03).
+            _invalidate_mirror_sync_fingerprint(playlist_id)
+
+        updated = _owned_mirrored_playlist(database, playlist_id) or {}
         return jsonify({"success": True, "playlist": updated})
     except Exception as e:
         logger.error(f"Error updating mirrored playlist preferences: {e}")
@@ -36352,32 +37696,44 @@ def resolve_mirrored_playlist_endpoint():
         )
         if not playlist:
             return jsonify({"found": False, "playlist": None})
+        # Belt and braces: the resolver is owner-scoped, but this endpoint is the
+        # one that hands a persisted quality_profile_id to the browser (P0-01).
+        if int(playlist.get('profile_id') or 1) != int(profile_id):
+            return jsonify({"found": False, "playlist": None})
         return jsonify({"found": True, "playlist": playlist})
     except Exception as e:
         logger.error(f"Error resolving mirrored playlist: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-def _playlist_pipeline_state_key(playlist_id):
-    return f"mirrored_{int(playlist_id)}"
+def _playlist_pipeline_state_key(playlist_id, profile_id=None):
+    """Progress-state key for a manual pipeline run.
+
+    Keyed by ``(profile, mirror)``: two profiles running a pipeline against
+    mirrors that happen to share a primary key must not read or overwrite each
+    other's progress, log lines or result (P0-01).
+    """
+    if profile_id is None:
+        profile_id = get_current_profile_id()
+    return f"p{int(profile_id)}:mirrored_{int(playlist_id)}"
 
 
-def _snapshot_playlist_pipeline_state(playlist_id):
-    key = _playlist_pipeline_state_key(playlist_id)
+def _snapshot_playlist_pipeline_state(playlist_id, profile_id=None):
+    key = _playlist_pipeline_state_key(playlist_id, profile_id)
     with playlist_pipeline_progress_lock:
         state = playlist_pipeline_progress_states.get(key)
         return dict(state) if state else None
 
 
-def _replace_playlist_pipeline_state(playlist_id, state):
-    key = _playlist_pipeline_state_key(playlist_id)
+def _replace_playlist_pipeline_state(playlist_id, state, profile_id=None):
+    key = _playlist_pipeline_state_key(playlist_id, profile_id)
     with playlist_pipeline_progress_lock:
         playlist_pipeline_progress_states[key] = dict(state)
         return dict(playlist_pipeline_progress_states[key])
 
 
-def _update_playlist_pipeline_progress(playlist_id, **kwargs):
-    key = _playlist_pipeline_state_key(playlist_id)
+def _update_playlist_pipeline_progress(playlist_id, profile_id=None, **kwargs):
+    key = _playlist_pipeline_state_key(playlist_id, profile_id)
     with playlist_pipeline_progress_lock:
         state = playlist_pipeline_progress_states.setdefault(key, {
             'run_id': key,
@@ -36409,18 +37765,27 @@ def _update_playlist_pipeline_progress(playlist_id, **kwargs):
 class _PlaylistPipelineDepsProxy:
     """Forward automation deps while routing progress into playlist UI state."""
 
-    def __init__(self, base_deps, playlist_id):
+    def __init__(self, base_deps, playlist_id, profile_id):
         self._base_deps = base_deps
         self._playlist_id = playlist_id
+        self._profile_id = profile_id
 
     def __getattr__(self, name):
         return getattr(self._base_deps, name)
 
     def update_progress(self, _automation_id, **kwargs):
-        _update_playlist_pipeline_progress(self._playlist_id, **kwargs)
+        _update_playlist_pipeline_progress(
+            self._playlist_id, profile_id=self._profile_id, **kwargs
+        )
 
 
-def _run_mirrored_playlist_pipeline_for_ui(playlist_id, skip_wishlist=False):
+def _run_mirrored_playlist_pipeline_for_ui(playlist_id, skip_wishlist=False, profile_id=1):
+    # The caller is a bare thread, so neither Flask's `g` nor the request-scoped
+    # profile survives. Without this the whole pipeline — sync, organize batch,
+    # failed-track Wishlist writes — silently ran as admin (profile 1) for every
+    # non-default user (P0-01). Declare the owner for the whole unit of work.
+    from core.profile_context import set_background_profile, reset_background_profile
+    profile_token = set_background_profile(int(profile_id))
     try:
         if _automation_deps is None:
             raise RuntimeError("Automation dependencies are not available")
@@ -36430,13 +37795,14 @@ def _run_mirrored_playlist_pipeline_for_ui(playlist_id, skip_wishlist=False):
         from core.automation.handlers._pipeline_shared import run_sync_and_wishlist
         from core.playlists.pipeline import run_mirrored_playlist_pipeline
 
-        deps = _PlaylistPipelineDepsProxy(_automation_deps, playlist_id)
+        deps = _PlaylistPipelineDepsProxy(_automation_deps, playlist_id, profile_id)
         result = run_mirrored_playlist_pipeline(
             {
                 'playlist_id': str(playlist_id),
                 'all': False,
                 'skip_wishlist': bool(skip_wishlist),
-                '_automation_id': _playlist_pipeline_state_key(playlist_id),
+                'profile_id': int(profile_id),
+                '_automation_id': _playlist_pipeline_state_key(playlist_id, profile_id),
             },
             deps,
             refresh_fn=auto_refresh_mirrored,
@@ -36448,6 +37814,7 @@ def _run_mirrored_playlist_pipeline_for_ui(playlist_id, skip_wishlist=False):
         if status == 'completed':
             _update_playlist_pipeline_progress(
                 playlist_id,
+                profile_id=profile_id,
                 status='finished',
                 progress=100,
                 phase='Pipeline complete',
@@ -36456,6 +37823,7 @@ def _run_mirrored_playlist_pipeline_for_ui(playlist_id, skip_wishlist=False):
         elif status == 'skipped':
             _update_playlist_pipeline_progress(
                 playlist_id,
+                profile_id=profile_id,
                 status='skipped',
                 progress=100,
                 phase='Pipeline already running',
@@ -36467,6 +37835,7 @@ def _run_mirrored_playlist_pipeline_for_ui(playlist_id, skip_wishlist=False):
         else:
             _update_playlist_pipeline_progress(
                 playlist_id,
+                profile_id=profile_id,
                 status='error',
                 progress=100,
                 phase='Pipeline error',
@@ -36477,6 +37846,7 @@ def _run_mirrored_playlist_pipeline_for_ui(playlist_id, skip_wishlist=False):
         logger.error(f"Manual mirrored playlist pipeline failed for {playlist_id}: {e}")
         _update_playlist_pipeline_progress(
             playlist_id,
+            profile_id=profile_id,
             status='error',
             progress=100,
             phase='Pipeline error',
@@ -36484,6 +37854,8 @@ def _run_mirrored_playlist_pipeline_for_ui(playlist_id, skip_wishlist=False):
             log_line=f'Pipeline failed: {e}',
             log_type='error',
         )
+    finally:
+        reset_background_profile(profile_token)
 
 
 @app.route('/api/mirrored-playlists/<int:playlist_id>/pipeline/run', methods=['POST'])
@@ -36491,7 +37863,8 @@ def run_mirrored_playlist_pipeline_endpoint(playlist_id):
     """Run the all-in-one mirrored playlist pipeline from the playlist UI."""
     try:
         database = get_database()
-        playlist = database.get_mirrored_playlist(playlist_id)
+        profile_id = get_current_profile_id()
+        playlist = _owned_mirrored_playlist(database, playlist_id)
         if not playlist:
             return jsonify({"error": "Playlist not found"}), 404
         if playlist.get('source') in ('file', 'beatport'):
@@ -36503,7 +37876,7 @@ def run_mirrored_playlist_pipeline_endpoint(playlist_id):
 
         data = request.get_json(silent=True) or {}
         state = _replace_playlist_pipeline_state(playlist_id, {
-            'run_id': _playlist_pipeline_state_key(playlist_id),
+            'run_id': _playlist_pipeline_state_key(playlist_id, profile_id),
             'playlist_id': int(playlist_id),
             'playlist_name': playlist.get('name') or '',
             'status': 'running',
@@ -36518,11 +37891,11 @@ def run_mirrored_playlist_pipeline_endpoint(playlist_id):
             'finished_at': None,
             'result': None,
             'error': None,
-        })
+        }, profile_id=profile_id)
 
         threading.Thread(
             target=_run_mirrored_playlist_pipeline_for_ui,
-            args=(playlist_id, bool(data.get('skip_wishlist', False))),
+            args=(playlist_id, bool(data.get('skip_wishlist', False)), int(profile_id)),
             daemon=True,
             name=f"playlist-pipeline-{playlist_id}",
         ).start()
@@ -36537,10 +37910,14 @@ def run_mirrored_playlist_pipeline_endpoint(playlist_id):
 def get_mirrored_playlist_pipeline_status_endpoint(playlist_id):
     """Return the latest manual pipeline progress for a mirrored playlist."""
     try:
+        if not mirrored_playlist_visible(get_database().get_mirrored_playlist(playlist_id)):
+            return jsonify({"error": "Playlist not found"}), 404
         state = _snapshot_playlist_pipeline_state(playlist_id)
         if not state:
             return jsonify({
                 "run_id": _playlist_pipeline_state_key(playlist_id),
+                # The key is profile-scoped, so a foreign run reads as idle here
+                # rather than leaking another profile's phase/log/result.
                 "playlist_id": int(playlist_id),
                 "status": "idle",
                 "progress": 0,
@@ -36590,7 +37967,7 @@ def delete_mirrored_playlist_endpoint(playlist_id):
     """Delete a mirrored playlist."""
     try:
         database = get_database()
-        if database.delete_mirrored_playlist(playlist_id):
+        if database.delete_mirrored_playlist(playlist_id, profile_id=_mirror_scope_profile_id()):
             return jsonify({"success": True})
         return jsonify({"error": "Playlist not found"}), 404
     except Exception as e:
@@ -36602,10 +37979,13 @@ def clear_mirrored_discovery_endpoint(playlist_id):
     """Clear discovery data for all tracks in a mirrored playlist, including discovery cache."""
     try:
         database = get_database()
+        profile_id = _mirror_scope_profile_id()
+        if not _owned_mirrored_playlist(database, playlist_id):
+            return jsonify({"error": "Playlist not found"}), 404
 
         # Clear discovery cache entries for these tracks so re-discovery does fresh lookups
         try:
-            tracks = database.get_mirrored_playlist_tracks(playlist_id)
+            tracks = database.get_mirrored_playlist_tracks(playlist_id, profile_id=profile_id)
             if tracks:
                 conn = database._get_connection()
                 cursor = conn.cursor()
@@ -36620,7 +38000,7 @@ def clear_mirrored_discovery_endpoint(playlist_id):
         except Exception as cache_err:
             logger.warning(f"Error clearing discovery cache: {cache_err}")
 
-        cleared = database.clear_mirrored_playlist_discovery(playlist_id)
+        cleared = database.clear_mirrored_playlist_discovery(playlist_id, profile_id=profile_id)
         return jsonify({"success": True, "cleared": cleared})
     except Exception as e:
         logger.error(f"Error clearing mirrored discovery: {e}")
@@ -36837,11 +38217,12 @@ def prepare_mirrored_discovery(playlist_id):
     """Register a mirrored playlist into youtube_playlist_states so the YouTube discovery pipeline can run."""
     try:
         database = get_database()
-        playlist = database.get_mirrored_playlist(playlist_id)
+        profile_id = _mirror_scope_profile_id()
+        playlist = _owned_mirrored_playlist(database, playlist_id)
         if not playlist:
             return jsonify({"error": "Playlist not found"}), 404
 
-        tracks_data = database.get_mirrored_playlist_tracks(playlist_id)
+        tracks_data = database.get_mirrored_playlist_tracks(playlist_id, profile_id=profile_id)
         url_hash = f"mirrored_{playlist_id}"
 
         # Build track list in the format the YouTube discovery worker expects
@@ -37023,6 +38404,8 @@ def prepare_mirrored_discovery(playlist_id):
 def retry_failed_mirrored_discovery(playlist_id):
     """Re-run discovery only for tracks that failed or are pending in a mirrored playlist."""
     try:
+        if not mirrored_playlist_visible(get_database().get_mirrored_playlist(playlist_id)):
+            return jsonify({"error": "Playlist not found"}), 404
         url_hash = f"mirrored_{playlist_id}"
         state = youtube_playlist_states.get(url_hash)
         if not state:
@@ -37134,6 +38517,7 @@ def _build_playlist_explorer_deps():
         get_metadata_fallback_client=_get_metadata_fallback_client,
         get_metadata_fallback_source=_get_metadata_fallback_source,
         get_metadata_cache=get_metadata_cache,
+        get_current_profile_id=get_current_profile_id,
     )
 
 
@@ -38546,6 +39930,10 @@ try:
     # Store refs for WebSocket push loop
     repair_worker._progress_lock_ref = repair_job_progress_lock
     repair_worker._progress_states_ref = repair_job_progress_states
+    # Bridge repair events into the automation engine ('Maintenance Finding
+    # Raised' / 'Maintenance Scan Done' triggers — music parity with video)
+    if automation_engine is not None:
+        repair_worker._event_emit = automation_engine.emit
     repair_worker.start()
     logger.info("Repair worker initialized and started")
 except Exception as e:
@@ -38816,6 +40204,53 @@ def repair_findings_bulk_fix():
     except Exception as e:
         logger.error(f"Error bulk fixing findings: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/repair/findings/bulk-fix-start', methods=['POST'])
+def repair_findings_bulk_fix_start():
+    """Start a background bulk-fix run (Fix All at library scale).
+
+    The synchronous /bulk-fix endpoint runs its loop inside the request,
+    which times out the browser at thousands of findings while the server
+    quietly keeps working. This returns immediately; poll
+    /api/repair/bulk-fix/status for progress."""
+    try:
+        if repair_worker is None:
+            return jsonify({'error': 'Repair worker not initialized'}), 400
+
+        data = request.get_json(silent=True) or {}
+        result = repair_worker.start_bulk_fix(
+            job_id=data.get('job_id') or None,
+            severity=data.get('severity') or None,
+            finding_ids=data.get('ids') or None,
+            fix_action=data.get('fix_action') or None,
+        )
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"Error starting background bulk fix: {e}")
+        return jsonify({'started': False, 'error': str(e)}), 500
+
+@app.route('/api/repair/bulk-fix/status', methods=['GET'])
+def repair_bulk_fix_status():
+    """Progress of the current (or most recent) background bulk fix."""
+    try:
+        if repair_worker is None:
+            return jsonify({'running': False}), 200
+        return jsonify(repair_worker.get_bulk_fix_status()), 200
+    except Exception as e:
+        logger.error(f"Error getting bulk fix status: {e}")
+        return jsonify({'running': False, 'error': str(e)}), 500
+
+@app.route('/api/repair/bulk-fix/stop', methods=['POST'])
+def repair_bulk_fix_stop():
+    """Stop a running background bulk fix after its current item."""
+    try:
+        if repair_worker is None:
+            return jsonify({'success': False}), 400
+        repair_worker.stop_bulk_fix()
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        logger.error(f"Error stopping bulk fix: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/repair/findings/bulk', methods=['POST'])
 def repair_findings_bulk():
@@ -39330,19 +40765,38 @@ def _hydrabase_reconnect_loop():
         except Exception as e:
             logger.debug("hydrabase monitor loop: %s", e)
 
+# --- Global connected-client tracking (gates idle broadcast loops below) ---
+# Same pattern as _activity_sids, but for "is anyone listening at all" rather
+# than a specific room: dashboard-wide push loops have no per-client work to
+# skip, only an all-or-nothing "does this broadcast have an audience".
+_connected_sids = set()
+_connected_sids_lock = threading.Lock()
+
+
+def _has_connected_clients() -> bool:
+    with _connected_sids_lock:
+        return bool(_connected_sids)
+
+
 def _emit_service_status_loop():
-    """Background thread that pushes service status every 5 seconds."""
+    """Background thread that pushes service status every 5 seconds.
+    Skipped entirely while no client is connected."""
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(5)
+        if not _has_connected_clients():
+            continue
         try:
             socketio.emit('status:update', _build_status_payload())
         except Exception as e:
             logger.debug(f"Error emitting service status: {e}")
 
 def _emit_watchlist_count_loop():
-    """Background thread that pushes watchlist count every 10 seconds to each profile room."""
+    """Background thread that pushes watchlist count every 10 seconds to each profile room.
+    Skipped entirely while no client is connected."""
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(10)
+        if not _has_connected_clients():
+            continue
         try:
             database = get_database()
             profiles = database.get_all_profiles()
@@ -39352,10 +40806,158 @@ def _emit_watchlist_count_loop():
         except Exception as e:
             logger.debug(f"Error emitting watchlist count: {e}")
 
+# Soulseek chat push (P3): watch the community room + PM unread state through
+# slskd and push deltas over the socket, so the nav badge and the bell react
+# without the chat page being open. First pass after boot only BASELINES the
+# room (no replaying history as "new"). Wholly idle-gated: zero slskd calls
+# while no browser is connected.
+_chat_push_state = {'room_key': None, 'pm_unread': -1, 'room': None}
+
+def _emit_chat_push_loop():
+    while not globals().get('IS_SHUTTING_DOWN', False):
+        socketio.sleep(6)
+        try:
+            if not _has_connected_clients():
+                continue
+            _slsk = download_orchestrator.client("soulseek") if download_orchestrator else None
+            if not _slsk or not _slsk.base_url:
+                continue
+            room = str(config_manager.get('soulseek.chat_room', 'SoulSync') or 'SoulSync')
+            if room != _chat_push_state['room']:
+                # room renamed (settings cog): re-baseline so the new room's
+                # history never replays as 'new' badge/notification spam
+                _chat_push_state['room'] = room
+                _chat_push_state['room_key'] = None
+            joined = run_async(_slsk.get_joined_rooms()) or []
+            if room not in joined:
+                # auto-join at startup / after an slskd restart (joins don't
+                # persist). chat_auto_join=false is the opt-out for users who
+                # don't want their account sitting in a public room — without
+                # it the loop would re-join them every 6s (un-leaveable). The
+                # chat PAGE still joins on open (an explicit user action).
+                if not config_manager.get('soulseek.chat_auto_join', True):
+                    room = None
+                elif not run_async(_slsk.join_room(room)):
+                    room = None
+            if not room:
+                msgs = []
+            else:
+                msgs = run_async(_slsk.get_room_messages(room)) or []
+            msgs.sort(key=lambda m: str(m.get('timestamp') or ''))
+            key = (str(msgs[-1].get('timestamp') or '') + ':' + str(len(msgs))) if msgs else ''
+            prev_key = _chat_push_state['room_key']
+            if prev_key is None:
+                _chat_push_state['room_key'] = key      # baseline, never replay history
+            elif key != prev_key:
+                prev_stamp = prev_key.rsplit(':', 1)[0]
+                fresh = [m for m in msgs if str(m.get('timestamp') or '') > prev_stamp]
+                _chat_push_state['room_key'] = key
+                if fresh:
+                    # live pushes carry the same DECODED view the API serves
+                    from core import chat_codec
+                    proto_events = []
+                    def _unwrap(m, _sink=proto_events):   # bound at def (B023)
+                        dec = chat_codec.decode(m.get('message'))
+                        if dec is not None and chat_codec.reaction_of(dec):
+                            return None      # reaction carriers never render/badge
+                        if dec is not None:
+                            _p = chat_codec.protocol_of(dec)
+                            if _p:
+                                # machine coordination: never archived, pushed
+                                # on its own channel for real-time handling.
+                                # Only PURE carriers (empty text) vanish —
+                                # piggybacked text still renders/archives.
+                                _sink.append({
+                                    'username': m.get('username'),
+                                    'timestamp': m.get('timestamp'), 'p': _p})
+                                if not dec.get('t'):
+                                    return None
+                        out = {'username': m.get('username'),
+                               'message': dec['t'] if dec else m.get('message'),
+                               'timestamp': m.get('timestamp')}
+                        if dec:
+                            out['rich'] = True
+                            rep = chat_codec.reply_of(dec)
+                            if rep:
+                                out['reply'] = rep
+                            _f = chat_codec.file_of(dec)
+                            if _f:
+                                out['file'] = _f
+                        return out
+                    decoded = [x for x in (_unwrap(m) for m in fresh) if x]
+                    if proto_events:
+                        socketio.emit('chat:room_protocol', {
+                            'room': room, 'events': proto_events[-40:]})
+                    if decoded:      # a reaction-only tick still tracks PMs below
+                        try:
+                            get_database().add_chat_messages(room, decoded)
+                        except Exception:
+                            logger.debug("chat: loop archive write failed", exc_info=True)
+                        socketio.emit('chat:room_message', {
+                            'room': room,
+                            'messages': decoded[-20:],
+                        })
+            convos = run_async(_slsk.get_conversations()) or []
+            unread_users = [str(c.get('username') or '') for c in convos
+                            if c.get('hasUnAcknowledgedMessages')
+                            or (c.get('unAcknowledgedMessageCount') or 0) > 0]
+            unread = len([u for u in unread_users if u])
+            prev = _chat_push_state['pm_unread']
+            if unread != prev:
+                _chat_push_state['pm_unread'] = unread
+                socketio.emit('chat:unread', {
+                    'pms': unread,
+                    'users': [u for u in unread_users if u][:3],
+                    # 'grew' gates the toast: only a RISING count notifies (a read
+                    # clearing the flag must not), and never the boot baseline
+                    'grew': prev >= 0 and unread > prev,
+                })
+        except Exception:
+            logger.debug("chat push loop error", exc_info=True)
+
+# Anti-leech challenge auto-responder ("please type 'human' in this chat"):
+# NOT idle-gated — the whole point is answering at 3am with no browser open,
+# so blocked overnight grabs unblock themselves. One cheap conversations poll
+# per minute; the heavy lifting + guard rails live in core/chat_autoprove.py.
+def _chat_auto_prove_loop():
+    from core import chat_autoprove
+    state = {}
+    while not globals().get('IS_SHUTTING_DOWN', False):
+        socketio.sleep(60)
+        try:
+            if not config_manager.get('soulseek.chat_auto_prove', True):
+                continue
+            _slsk = download_orchestrator.client("soulseek") if download_orchestrator else None
+            if not _slsk or not _slsk.base_url:
+                continue
+            replies = chat_autoprove.scan_and_respond(_slsk, run_async, state=state)
+            for r in replies:
+                msg = "Auto-replied '%s' to %s's prove-you're-human challenge" % (
+                    r['token'], r['username'])
+                # observable both ways: durable bell history + a live toast
+                try:
+                    get_database().add_notifications([{'type': 'info', 'message': msg}],
+                                                     profile_id=1)
+                except Exception:
+                    logger.debug("autoprove: notification write failed", exc_info=True)
+                socketio.emit('dashboard:toast', {
+                    'icon': '🤖', 'title': 'Chat auto-reply',
+                    'subtitle': "answered %s's download challenge with '%s'" % (
+                        r['username'], r['token']),
+                })
+        except Exception:
+            logger.debug("chat auto-prove loop error", exc_info=True)
+
 def _emit_download_status_loop():
-    """Background thread that pushes download batch status every 2 seconds to subscribed rooms."""
+    """Background thread that pushes download batch status every 2 seconds to subscribed rooms.
+    Skipped entirely while no client is connected — the transfer fetch below is a real
+    slskd API call (TTL-cached), so at idle this loop polled slskd every ~2s for nobody.
+    Download progression doesn't depend on it (the workers poll transfers themselves);
+    this cache is populated on demand by its other callers."""
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(2)
+        if not _has_connected_clients():
+            continue
         try:
             live_transfers_lookup = get_cached_transfer_data()
             with tasks_lock:
@@ -39372,6 +40974,27 @@ def _emit_download_status_loop():
                         logger.debug(f"Error building batch status for {batch_id}: {e}")
         except Exception as e:
             logger.debug(f"Error in download status emit loop: {e}")
+
+# --- Server Activity (Tautulli replacement) live push ---
+# Subscriber-gated: one Plex/Jellyfin poll per tick broadcast to EVERY open drawer
+# (the multi-client dedup win — N users watching = 1 upstream poll, not N), and the
+# loop idles completely when nobody has the drawer open.
+_activity_sids = set()
+_activity_sids_lock = threading.Lock()
+
+def _emit_server_activity_loop():
+    """Push live server activity to subscribed drawers every 3s. Skips the upstream
+    poll entirely when no client is subscribed, so it costs nothing at rest."""
+    while not globals().get('IS_SHUTTING_DOWN', False):
+        socketio.sleep(3)
+        try:
+            with _activity_sids_lock:
+                if not _activity_sids:
+                    continue
+            from core.server_activity import get_activity
+            socketio.emit('activity:update', get_activity(), room='activity:live')
+        except Exception as e:
+            logger.debug(f"Error in server activity emit loop: {e}")
 
 # --- Socket.IO event handlers ---
 
@@ -39408,11 +41031,37 @@ def handle_connect():
     if _ws_connection_blocked():
         logger.warning("Rejected WebSocket connection — access gate active, session not verified (#852)")
         return False
+    with _connected_sids_lock:
+        _connected_sids.add(request.sid)
     logger.info("WebSocket client connected")
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    # Drop this client from the server-activity live set so the push loop goes
+    # idle again once the last drawer closes / navigates away.
+    try:
+        with _activity_sids_lock:
+            _activity_sids.discard(request.sid)
+    except Exception:   # noqa: BLE001, S110 - cleanup only; a missing sid is fine
+        pass
+    with _connected_sids_lock:
+        _connected_sids.discard(request.sid)
     logger.info("WebSocket client disconnected")
+
+@socketio.on('activity:subscribe')
+def handle_activity_subscribe():
+    """A drawer opened → join the live room so the push loop starts feeding it."""
+    join_room('activity:live')
+    with _activity_sids_lock:
+        _activity_sids.add(request.sid)
+    logger.debug("activity: client subscribed (%d live)", len(_activity_sids))
+
+@socketio.on('activity:unsubscribe')
+def handle_activity_unsubscribe():
+    """A drawer closed / left the Activity tab → stop feeding this client."""
+    leave_room('activity:live')
+    with _activity_sids_lock:
+        _activity_sids.discard(request.sid)
 
 @socketio.on('downloads:subscribe')
 def handle_download_subscribe(data):
@@ -39432,31 +41081,64 @@ def handle_download_unsubscribe(data):
 
 @socketio.on('profile:join')
 def handle_profile_join(data):
-    """Client joins a profile room for scoped WebSocket emits (watchlist/wishlist counts)."""
-    profile_id = data.get('profile_id')
-    if profile_id:
-        # Leave any previous profile rooms
-        old_id = data.get('old_profile_id')
-        if old_id:
-            leave_room(f'profile:{old_id}')
-        join_room(f'profile:{profile_id}')
-        logger.debug(f"Client joined profile room: profile:{profile_id}")
+    """Client joins a profile room for scoped WebSocket emits (watchlist/wishlist counts).
+
+    The room is derived from the SESSION, not the payload — the socket
+    handshake carries the Flask session cookie, so the server already knows
+    which profile this client is. Trusting data['profile_id'] let any
+    connected client join any profile's room and receive their scoped pushes
+    (profile-isolation audit). Admins may join any room (their UI legitimately
+    watches all); everyone else gets exactly their own."""
+    requested = data.get('profile_id')
+    pid, is_admin = _ws_session_profile()
+    target = requested if (is_admin and requested) else pid
+    if target != requested and requested:
+        logger.warning("profile:join — client asked for profile %s but session is %s; "
+                       "joining the session's room", requested, pid)
+    old_id = data.get('old_profile_id')
+    if old_id:
+        leave_room(f'profile:{old_id}')
+    join_room(f'profile:{target}')
+    logger.debug(f"Client joined profile room: profile:{target}")
+
+
+def _ws_session_profile():
+    """(profile_id, is_admin) for the CURRENT socket's session — server-side
+    truth for room joins. Fail-closed to the session profile; profile 1 or an
+    is_admin-flagged profile counts as admin."""
+    try:
+        pid = int(session.get('profile_id', 1) or 1)
+    except (TypeError, ValueError):
+        pid = 1
+    if pid == 1:
+        return pid, True
+    try:
+        profile = get_database().get_profile(pid)
+        return pid, bool((profile or {}).get('is_admin', False))
+    except Exception:
+        return pid, False
 
 # --- Phase 2: Dashboard emitters ---
 
 def _emit_system_stats_loop():
-    """Background thread that pushes system stats every 10 seconds."""
+    """Background thread that pushes system stats every 10 seconds.
+    Skipped entirely while no client is connected."""
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(10)
+        if not _has_connected_clients():
+            continue
         try:
             socketio.emit('dashboard:stats', _build_system_stats())
         except Exception as e:
             logger.debug(f"Error emitting system stats: {e}")
 
 def _emit_activity_feed_loop():
-    """Background thread that pushes activity feed every 2 seconds."""
+    """Background thread that pushes activity feed every 2 seconds.
+    Skipped entirely while no client is connected."""
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(2)
+        if not _has_connected_clients():
+            continue
         try:
             with activity_feed_lock:
                 activities = activity_feed[-10:][::-1]
@@ -39465,9 +41147,12 @@ def _emit_activity_feed_loop():
             logger.debug(f"Error emitting activity feed: {e}")
 
 def _emit_db_stats_loop():
-    """Background thread that pushes database stats every 10 seconds."""
+    """Background thread that pushes database stats every 10 seconds.
+    Skipped entirely while no client is connected."""
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(10)
+        if not _has_connected_clients():
+            continue
         try:
             db = get_database()
             stats = db.get_database_info_for_server()
@@ -39476,9 +41161,12 @@ def _emit_db_stats_loop():
             logger.debug(f"Error emitting db stats: {e}")
 
 def _emit_wishlist_count_loop():
-    """Background thread that pushes wishlist count every 10 seconds to each profile room."""
+    """Background thread that pushes wishlist count every 10 seconds to each profile room.
+    Skipped entirely while no client is connected."""
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(10)
+        if not _has_connected_clients():
+            continue
         try:
             from core.wishlist_service import get_wishlist_service
             ws = get_wishlist_service()
@@ -39660,6 +41348,49 @@ _configure_enrichment_api(
 
 app.register_blueprint(_create_enrichment_blueprint())
 
+# Soulseek chat (rooms + PMs through slskd) — side-neutral, absolute /api/chat
+# paths, mounted OUTSIDE the video blueprint so music-only profiles reach it.
+from api.chat import configure as _configure_chat_api, create_blueprint as _create_chat_blueprint
+def _chat_youtube_search(query, max_results):
+    """Jukebox search seam: the shared yt-dlp client, or None → paste-only."""
+    yt = download_orchestrator.client("youtube")
+    if yt is None:
+        return []
+    return run_async(yt.search_videos(query, max_results=max_results))
+
+
+_configure_chat_api(
+    client_getter=lambda: download_orchestrator.client("soulseek"),
+    run_async=run_async,
+    config_get=lambda key, default=None: config_manager.get(key, default),
+    config_set=lambda key, value: config_manager.set(key, value),
+    db_getter=get_database,
+    youtube_search=_chat_youtube_search,
+)
+app.register_blueprint(_create_chat_blueprint())
+
+# Record-label watchlist (search labels / browse a label's catalog / follow) —
+# purely additive, self-contained blueprint reading only watchlist_labels + the
+# keyless MusicBrainz catalog layer; absolute /api/labels/* paths, no prefix.
+from api.labels import configure as _configure_labels_api, create_blueprint as _create_labels_blueprint
+_configure_labels_api(db_getter=get_database, itunes_getter=_get_itunes_client,
+                      deezer_getter=_get_deezer_client)
+app.register_blueprint(_create_labels_blueprint())
+
+# Video side API (isolated: reads database/video_library.db only, never music)
+from api.video import create_video_blueprint as _create_video_blueprint
+app.register_blueprint(_create_video_blueprint(), url_prefix='/api/video')
+
+# Resume video downloads at boot: without this the monitor only starts on a grab or
+# when the Downloads page opens, so in-flight downloads (and orphaned 'searching' rows)
+# after a restart would sit untracked until the user happened to visit the page.
+try:
+    from core.video.download_monitor import ensure_started as _ensure_video_download_monitor
+    from api.video import get_video_db as _get_video_db
+    _ensure_video_download_monitor(_get_video_db)
+except Exception:
+    logger.warning("could not start the video download monitor at boot", exc_info=True)
+
 
 def _emit_rate_monitor_loop():
     """Background thread that pushes API call rate data every 1 second for speedometer gauges.
@@ -39675,6 +41406,8 @@ def _emit_rate_monitor_loop():
 
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(1)
+        if not _has_connected_clients():
+            continue
         try:
             from core.api_call_tracker import api_call_tracker
             payload = api_call_tracker.get_all_rates()
@@ -39786,6 +41519,11 @@ def _emit_enrichment_status_loop():
         except Exception as e:
             logger.debug(f"Error in download-yield check: {e}")
 
+        # Auto-pause/resume above must run regardless of listeners; the stats
+        # gather + broadcast below is pure UI and costs nothing to skip.
+        if not _has_connected_clients():
+            continue
+
         for name, get_worker in workers.items():
             try:
                 worker = get_worker()
@@ -39799,6 +41537,36 @@ def _emit_enrichment_status_loop():
             except Exception as e:
                 logger.debug(f"Error emitting {name} status: {e}")
 
+def _emit_video_enrichment_status_loop():
+    """Push the VIDEO enrichment worker statuses over the socket every 2s, exactly
+    like the music enrichment loop — so the video dashboard listens instead of
+    polling /api/video/enrichment/<svc>/status (that browser polling was flooding
+    the access log). No-op until the video engine is actually running, so this
+    never spins it up on the music side."""
+    from core.video.enrichment.engine import peek_video_enrichment_engine
+    while not globals().get('IS_SHUTTING_DOWN', False):
+        socketio.sleep(2)
+        eng = peek_video_enrichment_engine()
+        if eng is None:
+            continue
+        # Emit for EVERY registered worker (matchers + backfill: fanart / opensubtitles
+        # / ryd / sponsorblock) so new dashboard buttons get live status with no extra
+        # wiring here.
+        for svc, w in (eng.workers or {}).items():
+            try:
+                socketio.emit(f'enrichment:{svc}', w.get_stats())
+            except Exception as e:
+                logger.debug(f"Error emitting video {svc} status: {e}")
+        # The YouTube date enricher is a standalone daemon (not an engine worker),
+        # but it reports the SAME stats shape — push it on the same socket so its
+        # dashboard orb listens like the others (no /enrichment/youtube/status poll).
+        try:
+            from core.video.youtube_enrichment import get_youtube_date_enricher
+            socketio.emit('enrichment:youtube', get_youtube_date_enricher().stats())
+        except Exception as e:
+            logger.debug(f"Error emitting video youtube status: {e}")
+
+
 def _emit_tool_progress_loop():
     """Background thread that pushes all tool progress statuses every 1 second."""
     while not globals().get('IS_SHUTTING_DOWN', False):
@@ -39810,6 +41578,16 @@ def _emit_tool_progress_loop():
         # (which skipped HTTP polling while the socket was up) never learned
         # its stream was ready. Each client polls /api/stream/status instead,
         # which resolves its own session from the cookie.
+        # Self-heal a hung DB-update job (#859) — functional, must run even
+        # when nobody's watching the broadcast below.
+        try:
+            _check_db_update_stall()
+        except Exception as e:
+            logger.debug(f"Error in db update stall self-heal: {e}")
+
+        if not _has_connected_clients():
+            continue
+
         # Duplicate Cleaner (add computed space_freed_mb)
         try:
             with duplicate_cleaner_lock:
@@ -39820,7 +41598,6 @@ def _emit_tool_progress_loop():
             logger.debug(f"Error emitting duplicate cleaner status: {e}")
         # DB Update
         try:
-            _check_db_update_stall()  # self-heal a hung job, then broadcast (#859)
             with db_update_lock:
                 socketio.emit('tool:db-update', dict(db_update_state))
         except Exception as e:
@@ -39915,10 +41692,37 @@ def handle_logs_unsubscribe(data):
     leave_room('logs:live')
 
 
+def _playlist_room_allowed(raw_id, spid, is_admin) -> bool:
+    """May THIS session join a playlist-keyed push room (sync:/discovery:)?
+
+    Ids that resolve to a mirrored playlist get the owner-or-admin rule (the
+    push-side twin of the HTTP IDOR fix). Every other key shape — YouTube url
+    hashes, Beatport chart ids, 'mirrored_<n>' composites, ids with no row
+    behind them — joins exactly as before: those rooms carry no per-profile
+    data (or no data at all), and refusing them would break legit
+    subscriptions whose key shapes aren't numeric."""
+    s = str(raw_id)
+    if s.isdigit():
+        n = int(s)
+    elif s.startswith('mirrored_') and s[len('mirrored_'):].isdigit():
+        n = int(s[len('mirrored_'):])
+    else:
+        return True
+    try:
+        pl = get_database().get_mirrored_playlist(n)
+    except Exception:
+        return True
+    if not pl:
+        return True   # no row = empty room, nothing to leak
+    return is_admin or int(pl.get('profile_id') or 1) == spid
+
+
 @socketio.on('sync:subscribe')
 def handle_sync_subscribe(data):
+    _spid, _is_admin = _ws_session_profile()
     for pid in data.get('playlist_ids', []):
-        join_room(f'sync:{pid}')
+        if _playlist_room_allowed(pid, _spid, _is_admin):
+            join_room(f'sync:{pid}')
 
 @socketio.on('sync:unsubscribe')
 def handle_sync_unsubscribe(data):
@@ -39927,8 +41731,10 @@ def handle_sync_unsubscribe(data):
 
 @socketio.on('discovery:subscribe')
 def handle_discovery_subscribe(data):
+    _spid, _is_admin = _ws_session_profile()
     for pid in data.get('ids', []):
-        join_room(f'discovery:{pid}')
+        if _playlist_room_allowed(pid, _spid, _is_admin):
+            join_room(f'discovery:{pid}')
 
 @socketio.on('discovery:unsubscribe')
 def handle_discovery_unsubscribe(data):
@@ -40003,9 +41809,13 @@ def _emit_sync_progress_loop():
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(1)
         try:
-            # Reconcile stuck 'syncing' discovery states BEFORE emitting, so the
-            # sync:progress event we push already carries the terminal status.
+            # Reconcile stuck 'syncing' discovery states — this is a functional
+            # self-heal (#972), not just UI push, so it must run even when no
+            # client is connected to see the emit below.
             _reconcile_discovery_sync_phases()
+
+            if not _has_connected_clients():
+                continue
 
             with sync_lock:
                 for pid, state in list(sync_states.items()):
@@ -40321,6 +42131,10 @@ def start_runtime_services():
         socketio.start_background_task(_emit_service_status_loop)
         socketio.start_background_task(_emit_watchlist_count_loop)
         socketio.start_background_task(_emit_download_status_loop)
+        socketio.start_background_task(_emit_chat_push_loop)
+        socketio.start_background_task(_chat_auto_prove_loop)
+        # Server Activity — subscriber-gated live push (idle when no drawer open)
+        socketio.start_background_task(_emit_server_activity_loop)
         # Phase 2: Dashboard pollers
         socketio.start_background_task(_emit_system_stats_loop)
         socketio.start_background_task(_emit_activity_feed_loop)
@@ -40328,6 +42142,9 @@ def start_runtime_services():
         socketio.start_background_task(_emit_wishlist_count_loop)
         # Phase 3: Enrichment sidebar workers
         socketio.start_background_task(_emit_enrichment_status_loop)
+        # Phase 3 (video): push video enrichment status so the video dashboard
+        # listens instead of polling (matches music; no access-log flood).
+        socketio.start_background_task(_emit_video_enrichment_status_loop)
         # Phase 4: Tool progress pollers
         socketio.start_background_task(_emit_tool_progress_loop)
         # Phase 5: Sync/discovery progress + scans

@@ -43,7 +43,9 @@ function initializeLibraryPage() {
 
     } catch (error) {
         console.error("❌ Error initializing Library page:", error);
-        showToast("Failed to initialize Library page", "error");
+        // Name the real error so bug reports carry the cause, not just the symptom
+        const why = error && error.message ? `: ${error.message}` : "";
+        showToast(`Failed to initialize Library page${why}`, "error");
     }
 }
 
@@ -1009,14 +1011,19 @@ async function loadArtistDetailData(artistId, artistName) {
             `/api/artist-detail/${encodeURIComponent(artistId)}${qs ? '?' + qs : ''}`
         );
 
-        if (!response.ok) {
-            throw new Error(`Failed to load artist data: ${response.statusText}`);
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok || !data.success) {
+            throw new Error(
+                data.error || `Failed to load artist data: ${response.statusText}`
+            );
         }
 
-        const data = await response.json();
-
-        if (!data.success) {
-            throw new Error(data.error || 'Failed to load artist data');
+        if (data.provider_error?.error) {
+            showToast(
+                `Discography provider warning: ${data.provider_error.error}`,
+                "error"
+            );
         }
 
         const isSourceOnlyArtist = !data.artist?.server_source;
@@ -1039,6 +1046,14 @@ async function loadArtistDetailData(artistId, artistName) {
 
         console.log(`🎨 Main content visibility:`, document.getElementById('artist-detail-main'));
         console.log(`🎨 Albums section:`, document.getElementById('albums-section'));
+
+        // Gap-fill (#1067): fire-and-forget — the base page never waits on it.
+        // The rendered discography is stashed for the client-side final dedup:
+        // the server diffs against the SOURCE list, but library artists render
+        // a library-MERGED view, so an owned album the source doesn't list
+        // would otherwise reappear as a 'missing' gap card.
+        artistDetailPageState._renderedDiscography = data.discography || null;
+        _loadDiscographyGapFill(artistId, artistName);
 
         // Populate the page with data (which updates the hero section and sets textContent)
         populateArtistDetailPage(data);
@@ -1921,6 +1936,208 @@ function populateReleaseSection(sectionType, releases) {
     console.log(`📀 Populated ${sectionType} section: ${ownedCount} owned, ${missingCount} missing`);
 }
 
+// ── discography gap-fill (#1067): "show me what my source is missing" ───────
+// A VIEW option (on-page chip, persisted per browser — same pattern as the
+// chat SoulSync-only filter). The base discography renders untouched; this
+// only ever APPENDS a section of releases other sources know, each card
+// carrying its owning source so clicks flow through the existing per-source
+// machinery (see the _gap_source override in the card click handler).
+
+function _gapFillEnabled() {
+    try { return localStorage.getItem('discog_gapfill') === '1'; } catch (e) { return false; }
+}
+
+// JS mirror of the backend's conservative same-release rule (title normalized
+// with edition parens KEPT + year within ±1 or unknown) — used for the final
+// client-side dedup against the page's library-merged discography.
+function _gapNorm(t) {
+    return String(t || '').toLowerCase().replace(/[^\w\s()]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function _gapYear(card) {
+    let y = card.year;
+    if (y == null && card.release_date) y = String(card.release_date).slice(0, 4);
+    y = parseInt(y, 10);
+    return (y >= 1000 && y <= 3000) ? y : null;
+}
+function _gapSameRelease(a, b) {
+    const ta = _gapNorm(a.title || a.name), tb = _gapNorm(b.title || b.name);
+    if (!ta || ta !== tb) return false;
+    const ya = _gapYear(a), yb = _gapYear(b);
+    if (ya == null || yb == null) return true;
+    return Math.abs(ya - yb) <= 1;
+}
+
+function _resetGapFillSection() {
+    // Gap cards live INSIDE the real Album/EP/Single grids (Boulder's live
+    // feedback: a separate section felt bolted-on) — removal walks the class.
+    document.querySelectorAll('.gapfill-card').forEach(card => {
+        const grid = card.parentElement;
+        card.remove();
+        // a section that only existed because of gap cards goes back to empty
+        if (grid && grid.childElementCount === 0) {
+            const section = grid.closest('.discography-section');
+            if (section) section.style.display = 'none';
+        }
+    });
+}
+
+function _ensureGapFillChip() {
+    // The chip is static markup in the filters row (Sources group) — just bind.
+    const btn = document.getElementById('gapfill-toggle-btn');
+    if (!btn) return;
+    btn.classList.toggle('active', _gapFillEnabled());
+    if (btn._gapBound) return;
+    btn._gapBound = true;
+    btn.addEventListener('click', () => {
+        const on = !_gapFillEnabled();
+        try { localStorage.setItem('discog_gapfill', on ? '1' : '0'); } catch (e) { /* ignore */ }
+        btn.classList.toggle('active', on);
+        if (on) {
+            _loadDiscographyGapFill(artistDetailPageState.currentArtistId,
+                                    artistDetailPageState.currentArtistName);
+        } else {
+            _resetGapFillSection();
+        }
+    });
+}
+
+// Insert a gap card into a grid at its year-sorted position (grids render
+// newest-first; unknown years sink to the end — mirrors the backend sort).
+function _insertGapCardSorted(grid, card, year) {
+    const y = year || 0;
+    for (const child of grid.children) {
+        const cy = _gapYear(child._releaseData || {}) || 0;
+        if (cy < y) { grid.insertBefore(card, child); return; }
+    }
+    grid.appendChild(card);
+}
+
+let _gapFillReqSeq = 0;
+
+async function _loadDiscographyGapFill(artistId, artistName) {
+    _resetGapFillSection();
+    _ensureGapFillChip();
+    if (!_gapFillEnabled() || !artistId) return;
+    const seq = ++_gapFillReqSeq;
+    try {
+        const params = new URLSearchParams();
+        if (artistName) params.set('artist_name', artistName);
+        if (artistDetailPageState.currentArtistSource) {
+            params.set('base_source', artistDetailPageState.currentArtistSource);
+        }
+        const res = await fetch(`/api/artist/${encodeURIComponent(artistId)}/discography/gap-fill?${params}`);
+        const data = await res.json().catch(() => ({}));
+        if (seq !== _gapFillReqSeq) return;   // user navigated to another artist
+        if (!res.ok || !data.success) return;
+        const gaps = data.gaps || {};
+        let all = [
+            ...(gaps.albums || []).map(g => ({ ...g, _bucket: 'album' })),
+            ...(gaps.eps || []).map(g => ({ ...g, _bucket: 'ep' })),
+            ...(gaps.singles || []).map(g => ({ ...g, _bucket: 'single' })),
+        ];
+        // Final dedup against what the page ACTUALLY rendered (the
+        // library-merged view can contain owned releases the base source
+        // doesn't list — those must not come back as 'missing' gap cards).
+        const rendered = artistDetailPageState._renderedDiscography;
+        if (rendered) {
+            const renderedCards = [
+                ...(rendered.albums || []), ...(rendered.eps || []), ...(rendered.singles || []),
+            ];
+            all = all.filter(g => !renderedCards.some(r => _gapSameRelease(g, r)));
+        }
+        if (!all.length) return;
+
+        // Cards slot into the REAL sections, year-sorted among the base cards
+        // (Boulder: "figured it would appear in the album/ep/single sections
+        // like others do") — the source badge is what marks them.
+        const gridFor = { album: 'albums-grid', ep: 'eps-grid', single: 'singles-grid' };
+        const touchedGrids = new Set();
+        all.forEach(g => {
+            const grid = document.getElementById(gridFor[g._bucket] || 'albums-grid');
+            if (!grid) return;
+            const release = {
+                id: g.id,
+                title: g.title || g.name || 'Unknown Release',
+                image_url: g.image_url || '',
+                year: g.year,
+                release_date: g.release_date,
+                album_type: g.album_type || g._bucket,
+                owned: false,
+                _gap_source: g.gap_source,
+            };
+            const card = createReleaseCard(release);
+            card.classList.add('gapfill-card');
+            const badge = document.createElement('div');
+            badge.className = 'gapfill-source-badge';
+            badge.textContent = (typeof SOURCE_LABELS !== 'undefined' && SOURCE_LABELS[g.gap_source]?.text)
+                ? SOURCE_LABELS[g.gap_source].text : (g.gap_source || '');
+            badge.title = `Only listed on ${badge.textContent} — opens and downloads from there`;
+            card.appendChild(badge);
+            _insertGapCardSorted(grid, card, _gapYear(release));
+            touchedGrids.add(grid);
+        });
+        touchedGrids.forEach(grid => {
+            const section = grid.closest('.discography-section');
+            if (section && section.style.display === 'none') section.style.display = '';
+            if (typeof observeLazyBackgrounds === 'function') observeLazyBackgrounds(grid);
+        });
+        // current filter state applies to the new cards too
+        if (typeof applyDiscographyFilters === 'function') applyDiscographyFilters();
+
+        // #1071: gap cards get REAL ownership checks like every other card —
+        // an album bought on another platform must light up OWNED here too.
+        // Each card streams against its own source (its id only means
+        // anything there); results land through the same card updater.
+        _streamGapOwnership(artistName, all, seq);
+    } catch (e) {
+        console.debug('gap-fill load failed:', e);
+    }
+}
+
+async function _streamGapOwnership(artistName, gapEntries, seq) {
+    const bucketKey = { album: 'albums', ep: 'eps', single: 'singles' };
+    const payload = { artist_name: artistName, albums: [], eps: [], singles: [], source: null };
+    gapEntries.forEach(g => {
+        payload[bucketKey[g._bucket] || 'albums'].push({
+            id: g.id,
+            title: g.title || g.name || '',
+            track_count: g.track_count || g.total_tracks || 0,
+            album_type: g.album_type || g._bucket,
+            year: g.year,
+            release_date: g.release_date,
+            source: g.gap_source || null,
+        });
+    });
+    try {
+        const response = await fetch('/api/library/completion-stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!response.ok) return;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (seq !== _gapFillReqSeq) { reader.cancel(); return; }   // navigated away
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const eventData = JSON.parse(line.slice(6));
+                    if (eventData.type === 'completion') updateLibraryReleaseCard(eventData);
+                } catch (e) { /* partial frame — next chunk completes it */ }
+            }
+        }
+    } catch (e) {
+        console.debug('gap ownership stream failed:', e);
+    }
+}
+
 function createReleaseCard(release) {
     const card = document.createElement("div");
     const isChecking = release.owned === null;
@@ -2085,6 +2302,11 @@ function createReleaseCard(release) {
             const _aat2 = new URLSearchParams({ name: albumData.name || '', artist: currentArtist.name || '' });
             if (currentArtist.source) {
                 _aat2.set('source', currentArtist.source);
+            }
+            // Gap-fill cards (#1067) belong to ANOTHER source — fetch their
+            // tracks from it, exactly as if that source were selected.
+            if (rel._gap_source) {
+                _aat2.set('source', rel._gap_source);
             }
             const response = await fetch(`/api/album/${albumData.id}/tracks?${_aat2}`);
             if (!response.ok) {
@@ -2607,6 +2829,37 @@ async function openDiscographyModal() {
         ...(discography.singles || []).map(a => ({ ...a, _type: 'single' })),
     ];
 
+    // Gap-fill (#1067): when '+ Other sources' is on, the Download Discography
+    // modal includes those releases too — each keeps its own source, which the
+    // backend already honors per entry (entry['source']).
+    if (typeof _gapFillEnabled === 'function' && _gapFillEnabled()) {
+        try {
+            const gp = new URLSearchParams();
+            if (artist.name) gp.set('artist_name', artist.name);
+            if (artist.source) gp.set('base_source', artist.source);
+            const gres = await fetch(`/api/artist/${encodeURIComponent(artist.id)}/discography/gap-fill?${gp}`);
+            const gdata = await gres.json().catch(() => ({}));
+            if (gres.ok && gdata.success) {
+                const gaps = gdata.gaps || {};
+                const gapReleases = [
+                    ...(gaps.albums || []).map(g => ({ ...g, _type: 'album' })),
+                    ...(gaps.eps || []).map(g => ({ ...g, _type: 'ep' })),
+                    ...(gaps.singles || []).map(g => ({ ...g, _type: 'single' })),
+                ];
+                for (const g of gapReleases) {
+                    if (allReleases.some(r => _gapSameRelease(g, r))) continue;
+                    allReleases.push({
+                        ...g,
+                        name: g.title || g.name || 'Unknown Release',
+                        _gap_source: g.gap_source,
+                    });
+                }
+            }
+        } catch (e) {
+            console.debug('discog modal gap-fill skipped:', e);
+        }
+    }
+
     // Build modal
     const overlay = document.createElement('div');
     overlay.className = 'discog-modal-overlay';
@@ -2702,14 +2955,14 @@ function _renderDiscogCard(release, index, completionData) {
     const albumName = release.name || release.title || '';
     return `
         <label class="discog-card ${statusClass}" data-type="${release._type}" data-is-live="${cc.isLive}" data-is-compilation="${cc.isCompilation}" data-is-featured="${cc.isFeatured}" style="animation-delay:${index * 0.03}s">
-            <input type="checkbox" class="discog-card-cb" data-album-id="${release.id}" data-album-name="${_esc(albumName)}" data-tracks="${tracks}" ${checked ? 'checked' : ''} onchange="_updateDiscogFooterCount()">
+            <input type="checkbox" class="discog-card-cb" data-album-id="${release.id}" data-album-name="${_esc(albumName)}" data-tracks="${tracks}" data-gap-source="${_esc(release._gap_source || '')}" ${checked ? 'checked' : ''} onchange="_updateDiscogFooterCount()">
             <div class="discog-card-art">
                 ${img ? `<img src="${img}" alt="" loading="lazy">` : '<div class="discog-card-art-placeholder">🎵</div>'}
                 ${statusIcon ? `<span class="discog-card-status">${statusIcon}</span>` : ''}
             </div>
             <div class="discog-card-info">
                 <div class="discog-card-title">${_esc(albumName)}${release.explicit === true ? ' <span class="explicit-badge">E</span>' : ''}</div>
-                <div class="discog-card-meta">${year}${year && tracks ? ' · ' : ''}${tracks ? tracks + ' tracks' : ''}</div>
+                <div class="discog-card-meta">${year}${year && tracks ? ' · ' : ''}${tracks ? tracks + ' tracks' : ''}${release._gap_source ? ` · <span class="discog-gap-src">${_esc(release._gap_source)}</span>` : ''}</div>
             </div>
             <div class="discog-card-check"></div>
         </label>
@@ -2789,7 +3042,9 @@ async function startDiscographyDownload() {
             albumEntries.push({
                 id: cb.dataset.albumId,
                 name: cb.dataset.albumName || '',
-                tracks: parseInt(cb.dataset.tracks) || 0
+                tracks: parseInt(cb.dataset.tracks) || 0,
+                // gap-fill releases resolve from THEIR source (#1067)
+                gapSource: cb.dataset.gapSource || null
             });
         }
     });
@@ -2856,7 +3111,9 @@ async function startDiscographyDownload() {
         id: e.id,
         name: e.name,
         artist_name: artist.name,
-        source: sourceForBatch,
+        // a gap-fill release must resolve from ITS source, not the batch's
+        // (#1067) — the backend honors source per entry
+        source: e.gapSource || sourceForBatch,
     }));
 
     try {
@@ -3729,7 +3986,17 @@ function openAlbumArtPicker(album) {
                     '<img loading="lazy" src="' + _esc(c.url) + '" alt="">' +
                     '<span class="art-picker-badge">' + _esc(c.source) + '</span>' +
                     '<span class="art-picker-check">' + _checkSvg + '</span>';
-                tile.querySelector('img').onerror = () => tile.remove();
+                tile.querySelector('img').onerror = () => {
+                    // a dead image URL removes its tile — but a grid that
+                    // empties out must SAY so, not sit silently blank
+                    tile.remove();
+                    if (!grid.querySelector('.art-picker-tile')) {
+                        body.innerHTML = '<div class="art-picker-empty">Sources returned photos, ' +
+                            'but none of the images would load — try again in a minute.</div>';
+                    } else {
+                        countEl.textContent = grid.querySelectorAll('.art-picker-tile').length + ' available';
+                    }
+                };
                 tile.onclick = () => {
                     grid.querySelectorAll('.art-picker-tile.selected').forEach(t => t.classList.remove('selected'));
                     tile.classList.add('selected');
@@ -3740,6 +4007,13 @@ function openAlbumArtPicker(album) {
             });
             body.innerHTML = '';
             body.appendChild(grid);
+            // custom-URL row BELOW the grid (and after the innerHTML reset,
+            // which would otherwise wipe it)
+            _artPickerCustomRow(body, grid, tileUrl => {
+                grid.querySelectorAll('.art-picker-tile.selected').forEach(t => t.classList.remove('selected'));
+                selectedUrl = tileUrl;
+                applyBtn.disabled = false;
+            });
         })
         .catch(() => { body.innerHTML = '<div class="art-picker-empty">Couldn\'t load cover options.</div>'; });
 
@@ -3765,6 +4039,201 @@ function openAlbumArtPicker(album) {
         }).catch(() => {
             applyBtn.disabled = false; applyBtn.classList.remove('loading'); applyBtn.textContent = 'Apply';
             if (typeof showToast === 'function') showToast('Failed to update art', 'error');
+        });
+    };
+}
+
+// Custom-URL row for the artist photo picker: paste a link → instant preview
+// tile → click it → Apply. The preview <img> is the validation (a bad link
+// shows its own error); the backend re-validates bytes before applying.
+// NB: module scope — the pickers' _checkSvg consts are function-LOCAL, so
+// this needs its own (referencing theirs was a silent ReferenceError).
+const _ART_CHECK_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+
+function _artPickerCustomRow(body, grid, onSelect) {
+    const row = document.createElement('div');
+    row.className = 'art-picker-custom';
+    row.innerHTML =
+        '<input type="url" class="art-picker-url" placeholder="…or paste an image URL" autocomplete="off">' +
+        '<div class="art-picker-custom-slot"></div>';
+    const input = row.querySelector('.art-picker-url');
+    const slot = row.querySelector('.art-picker-custom-slot');
+    let timer = null;
+    input.addEventListener('input', () => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+            const url = input.value.trim();
+            slot.innerHTML = '';
+            if (!/^https?:\/\//i.test(url)) return;
+            const tile = document.createElement('button');
+            tile.className = 'art-picker-tile art-picker-tile--custom';
+            tile.innerHTML =
+                '<img loading="lazy" src="' + _esc(url) + '" alt="">' +
+                '<span class="art-picker-badge">custom</span>' +
+                '<span class="art-picker-check">' + _ART_CHECK_SVG + '</span>';
+            tile.querySelector('img').onerror = () => {
+                slot.innerHTML = '<div class="art-picker-custom-err">Couldn\'t load that image.</div>';
+            };
+            tile.onclick = () => {
+                document.querySelectorAll('.art-picker-tile.selected').forEach(t => t.classList.remove('selected'));
+                tile.classList.add('selected');
+                onSelect(url);
+            };
+            slot.appendChild(tile);
+        }, 350);
+    });
+    body.appendChild(row);
+}
+
+function openArtistArtPicker() {
+    // Artist twin of openAlbumArtPicker: candidates from every CONNECTED
+    // metadata source; applying writes the pick to the SoulSync DB, the
+    // active media server, and artist.jpg on disk (what Navidrome reads) —
+    // so a wrong photo from an old mis-match gets corrected everywhere.
+    const artistId = artistDetailPageState.currentArtistId;
+    const artistName = artistDetailPageState.currentArtistName || '';
+    if (!artistId) {
+        if (typeof showToast === 'function') showToast('No artist selected', 'error');
+        return;
+    }
+
+    const _closeSvg = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+    const _checkSvg = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+
+    const old = document.getElementById('art-picker-overlay');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'art-picker-overlay';
+    overlay.className = 'art-picker-overlay';
+    let skeleton = '';
+    for (let i = 0; i < 8; i++) skeleton += '<div class="art-picker-skel"></div>';
+    overlay.innerHTML =
+        '<div class="art-picker-modal" role="dialog" aria-modal="true">' +
+          '<div class="art-picker-header">' +
+            '<div class="art-picker-titles">' +
+              '<div class="art-picker-title">Choose artist photo</div>' +
+              '<div class="art-picker-subtitle">' + _esc(artistName) + ' · applies to SoulSync, your server, and artist.jpg on disk</div>' +
+            '</div>' +
+            '<button class="art-picker-close" aria-label="Close">' + _closeSvg + '</button>' +
+          '</div>' +
+          '<div class="art-picker-body"><div class="art-picker-grid loading">' + skeleton + '</div></div>' +
+          '<div class="art-picker-footer">' +
+            '<div class="art-picker-count"></div>' +
+            '<div class="art-picker-actions">' +
+              '<button class="art-picker-btn art-picker-cancel">Cancel</button>' +
+              '<button class="art-picker-btn art-picker-apply" disabled>Apply</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => overlay.classList.add('visible'));
+
+    const close = () => { overlay.classList.remove('visible'); setTimeout(() => overlay.remove(), 200); };
+    const onEsc = (e) => { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onEsc); } };
+    document.addEventListener('keydown', onEsc);
+    overlay.querySelector('.art-picker-close').onclick = close;
+    overlay.querySelector('.art-picker-cancel').onclick = close;
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+    const body = overlay.querySelector('.art-picker-body');
+    const applyBtn = overlay.querySelector('.art-picker-apply');
+    const countEl = overlay.querySelector('.art-picker-count');
+    let selectedUrl = null;
+
+    fetch('/api/artist/' + encodeURIComponent(artistId) + '/art-options')
+        .then(r => r.json())
+        .then(data => {
+            const cands = (data && data.candidates) || [];
+            if (!cands.length) {
+                body.innerHTML = '<div class="art-picker-empty">No photos found on your connected sources for this artist.</div>';
+                _artPickerCustomRow(body, null, tileUrl => {
+                    selectedUrl = tileUrl;
+                    applyBtn.disabled = false;
+                });
+                return;
+            }
+            countEl.textContent = cands.length + ' source' + (cands.length === 1 ? '' : 's');
+            const grid = document.createElement('div');
+            grid.className = 'art-picker-grid';
+            // the CURRENT photo leads the grid as a reference tile — read from
+            // the page (the DB often stores a local cache path, which must
+            // never be re-applied as if it were a source URL). Display-only.
+            const curImg = document.getElementById('artist-detail-image');
+            if (curImg && curImg.src && curImg.style.display !== 'none') {
+                const cur = document.createElement('div');
+                cur.className = 'art-picker-tile art-picker-tile--current';
+                cur.innerHTML =
+                    '<img loading="lazy" src="' + _esc(curImg.src) + '" alt="">' +
+                    '<span class="art-picker-badge art-picker-badge--current">current</span>';
+                cur.querySelector('img').onerror = () => cur.remove();
+                grid.appendChild(cur);
+            }
+            cands.forEach(c => {
+                const tile = document.createElement('button');
+                tile.className = 'art-picker-tile';
+                tile.innerHTML =
+                    '<img loading="lazy" src="' + _esc(c.url) + '" alt="">' +
+                    '<span class="art-picker-badge">' + _esc(c.source) + '</span>' +
+                    '<span class="art-picker-check">' + _checkSvg + '</span>';
+                tile.querySelector('img').onerror = () => {
+                    // a dead image URL removes its tile — but a grid that
+                    // empties out must SAY so, not sit silently blank
+                    tile.remove();
+                    if (!grid.querySelector('.art-picker-tile')) {
+                        body.innerHTML = '<div class="art-picker-empty">Sources returned photos, ' +
+                            'but none of the images would load — try again in a minute.</div>';
+                    } else {
+                        countEl.textContent = grid.querySelectorAll('.art-picker-tile').length + ' available';
+                    }
+                };
+                tile.onclick = () => {
+                    grid.querySelectorAll('.art-picker-tile.selected').forEach(t => t.classList.remove('selected'));
+                    tile.classList.add('selected');
+                    selectedUrl = c.url;
+                    applyBtn.disabled = false;
+                };
+                grid.appendChild(tile);
+            });
+            body.innerHTML = '';
+            body.appendChild(grid);
+            // custom-URL row BELOW the grid (and after the innerHTML reset,
+            // which would otherwise wipe it)
+            _artPickerCustomRow(body, grid, tileUrl => {
+                grid.querySelectorAll('.art-picker-tile.selected').forEach(t => t.classList.remove('selected'));
+                selectedUrl = tileUrl;
+                applyBtn.disabled = false;
+            });
+        })
+        .catch(() => { body.innerHTML = '<div class="art-picker-empty">Couldn\'t load photo options.</div>'; });
+
+    applyBtn.onclick = () => {
+        if (!selectedUrl) return;
+        applyBtn.disabled = true;
+        applyBtn.classList.add('loading');
+        applyBtn.textContent = 'Applying…';
+        fetch('/api/artist/' + encodeURIComponent(artistId) + '/art', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: selectedUrl })
+        }).then(r => r.json()).then(res => {
+            if (res && res.success) {
+                const heroImg = document.getElementById('artist-detail-image');
+                if (heroImg) { heroImg.src = selectedUrl; heroImg.style.display = ''; }
+                const fallback = document.getElementById('artist-detail-image-fallback');
+                if (fallback) fallback.style.display = 'none';
+                const parts = [];
+                if (res.server_updated) parts.push('server');
+                if (res.disk_written) parts.push('artist.jpg');
+                const extra = parts.length ? ' (also updated: ' + parts.join(', ') + ')' : '';
+                if (typeof showToast === 'function') showToast('Artist photo updated' + extra, 'success');
+                close();
+            } else {
+                applyBtn.disabled = false; applyBtn.classList.remove('loading'); applyBtn.textContent = 'Apply';
+                if (typeof showToast === 'function') showToast((res && res.error) || 'Failed to update photo', 'error');
+            }
+        }).catch(() => {
+            applyBtn.disabled = false; applyBtn.classList.remove('loading'); applyBtn.textContent = 'Apply';
+            if (typeof showToast === 'function') showToast('Failed to update photo', 'error');
         });
     };
 }
@@ -4218,16 +4687,26 @@ function _deriveEnhancedMissingTracks(album, canonicalTracks) {
 function _getEnhancedAlbumTrackRows(album) {
     const ownedTracks = Array.isArray(album.tracks) ? album.tracks : [];
     const rowsBySlot = new Map();
+    const ownedSlots = new Set();
     ownedTracks.forEach(track => {
-        const key = _trackSlotKey(track);
-        rowsBySlot.set(key === '1:0' ? `owned:${track.id}` : key, track);
+        // #1051: every owned track is a real physical file — key by its unique id,
+        // NEVER by disc:track slot. Multi-disc albums whose tags all claim disc 1
+        // (or the scanner's #916 disc collapse) make disc1-trackN and disc2-trackN
+        // share a slot; keying the render Map by slot silently overwrote one with
+        // the other, so a disc-2 track rendered in a disc-1 row (some tracks vanished).
+        // Keying by id renders every owned file; ownedSlots still drives the
+        // "is this slot already owned?" check for the missing-track merge below.
+        rowsBySlot.set(`owned:${track.id}`, track);
+        ownedSlots.add(_trackSlotKey(track));
     });
 
     const explicitMissing = Array.isArray(album.missing_tracks) ? album.missing_tracks : [];
     explicitMissing.forEach(missing => {
         const row = _normalizeExpectedMissingTrack(missing, album);
         const key = _trackSlotKey(row);
-        if (row._hasActionableContext && !rowsBySlot.has(key)) rowsBySlot.set(key, row);
+        if (row._hasActionableContext && !ownedSlots.has(key) && !rowsBySlot.has(`missing:${key}`)) {
+            rowsBySlot.set(`missing:${key}`, row);
+        }
     });
 
     return Array.from(rowsBySlot.values()).sort((a, b) => {
@@ -4280,8 +4759,11 @@ function _buildTrackRow(track, album, admin) {
 
     // Disc number
     const discTd = document.createElement('td');
-    discTd.className = 'col-disc';
+    discTd.className = 'col-disc' + (admin ? ' editable' : '');
     discTd.textContent = track.disc_number || '-';
+    // Disc # describes a real file's tags — like the title cell (and unlike a
+    // phantom "Missing" row), it's only editable for owned tracks. #1051
+    if (track._missingExpected) discTd.classList.remove('editable');
     tr.appendChild(discTd);
 
     // Title
@@ -4549,6 +5031,8 @@ function _attachTableDelegation(table, album) {
                 e.stopPropagation();
                 if (cell.classList.contains('col-num')) {
                     startInlineEdit(cell, 'track', track.id, 'track_number', track.track_number || '');
+                } else if (cell.classList.contains('col-disc')) {
+                    startInlineEdit(cell, 'track', track.id, 'disc_number', track.disc_number || '');
                 } else if (cell.classList.contains('col-title')) {
                     startInlineEdit(cell, 'track', track.id, 'title', track.title || '');
                 } else if (cell.classList.contains('col-bpm')) {
@@ -5978,7 +6462,7 @@ function startInlineEdit(cell, type, id, field, currentValue) {
     if (cell.querySelector('.enhanced-inline-input')) return;
     cancelInlineEdit();
 
-    const isNumeric = ['track_number', 'bpm'].includes(field);
+    const isNumeric = ['track_number', 'disc_number', 'bpm'].includes(field);
     const originalContent = cell.innerHTML;
     cell.dataset.originalContent = originalContent;
 
@@ -5987,7 +6471,7 @@ function startInlineEdit(cell, type, id, field, currentValue) {
     input.className = 'enhanced-inline-input' + (isNumeric ? ' num' : '');
     input.value = currentValue || '';
     if (field === 'bpm') input.step = '0.1';
-    if (field === 'track_number') { input.min = '1'; input.step = '1'; }
+    if (field === 'track_number' || field === 'disc_number') { input.min = '1'; input.step = '1'; }
 
     cell.innerHTML = '';
     cell.appendChild(input);
@@ -6021,7 +6505,7 @@ async function saveInlineEdit(type, id, field, newValue) {
     artistDetailPageState.editingCell = null;
 
     let parsedValue = newValue;
-    if (field === 'track_number') parsedValue = parseInt(newValue) || null;
+    if (field === 'track_number' || field === 'disc_number') parsedValue = parseInt(newValue) || null;
     else if (field === 'bpm') parsedValue = parseFloat(newValue) || null;
     else if (field === 'explicit') parsedValue = parseInt(newValue) || 0;
 
@@ -7437,7 +7921,9 @@ function _pollBatchWriteTagsStatus() {
                 }
                 _batchWriteTagsPollTimer = setTimeout(poll, 1000);
             } else if (state.status === 'done') {
-                let msg = `Tags written: ${state.written} succeeded, ${state.failed} failed`;
+                let msg = `Tags written: ${state.written} updated`;
+                if ((state.skipped || 0) > 0) msg += `, ${state.skipped} unchanged`;
+                if (state.failed > 0) msg += `, ${state.failed} failed`;
                 if (state.sync_phase === 'done') {
                     const serverName = state.sync_server === 'plex' ? 'Plex' : state.sync_server === 'jellyfin' ? 'Jellyfin' : state.sync_server;
                     if (state.sync_synced > 0 && state.sync_failed === 0) {

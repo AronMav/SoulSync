@@ -2333,30 +2333,27 @@ const HELPER_TOURS = {
         icon: '📊',
         steps: [
             // Header area (top of page)
-            { page: 'dashboard', selector: '.dashboard-header', title: 'Welcome to SoulSync', description: 'This is your System Dashboard — the central hub for monitoring your music system. Let\'s walk through everything from top to bottom.' },
+            { page: 'dashboard', selector: '.dashboard-header', title: 'Welcome to SoulSync', description: 'This is your Music Dashboard — the central hub for monitoring your music system. Let\'s walk through everything from top to bottom.' },
+            { page: 'dashboard', selector: '.dashboard-header .header-actions', title: 'Enrichment Worker Orbs', description: 'Each orb is a live metadata worker — MusicBrainz, AudioDB, Deezer, Spotify, iTunes, Last.fm, Genius and friends. They pulse while enriching your library; hover one for its current status and progress.' },
             { page: 'dashboard', selector: '#watchlist-button', title: 'Watchlist', description: 'Artists you follow for new releases. Click to manage watched artists, run scans, and configure per-artist download preferences.' },
             { page: 'dashboard', selector: '#wishlist-button', title: 'Wishlist', description: 'Tracks queued for download. Failed downloads, watchlist discoveries, and manual additions all land here for retry.' },
 
-            // Service cards
-            { page: 'dashboard', selector: '#metadata-source-service-card', title: 'Metadata Source', description: 'Shows your metadata source connection (Spotify, iTunes, or Deezer). This determines where album, artist, and track info comes from. Click "Test Connection" to verify.' },
-            { page: 'dashboard', selector: '#media-server-service-card', title: 'Media Server', description: 'Your media server (Plex, Jellyfin, or Navidrome). This is where your music library lives. SoulSync reads your collection and sends downloads here.' },
-            { page: 'dashboard', selector: '#soulseek-service-card', title: 'Download Source', description: 'Your primary download source status. In hybrid mode, shows the first source in your priority chain.' },
-
-            // System stats
+            // Main content — top to bottom
+            { page: 'dashboard', selector: '.service-status-grid', title: 'Service Status', description: 'Your three core connections at a glance: metadata source (Spotify/iTunes/Deezer), media server (Plex/Jellyfin/Navidrome), and download source. Each card shows live status, response time, and a Test button.' },
             { page: 'dashboard', selector: '.stats-grid-dashboard', title: 'System Stats', description: 'Real-time metrics: active downloads, speed, sync operations, uptime, and memory usage. Updates live via WebSocket.' },
+            { page: 'dashboard', selector: '#library-status-card', title: 'Library', description: 'Your library at a glance — artists, albums, tracks, and total size — plus the scan buttons. Incremental scan picks up new content fast; Deep Scan re-reads everything and clears out stale entries.' },
+            { page: 'dashboard', selector: '#sync-history-cards', title: 'Recent Syncs', description: 'Your latest playlist sync runs — what matched, what downloaded, what failed. Click one to jump into the details.' },
+            { page: 'dashboard', selector: '.dash-card--quick-actions', title: 'Quick Actions', description: 'One-click shortcuts to the things you do most — start a sync, open the tool pages, jump to search. The bigger Tools collection lives on its own pages under the System section of the sidebar.' },
+            { page: 'dashboard', selector: '#dashboard-activity-feed', title: 'Recent Activity', description: 'Live stream of system events — downloads, syncs, enrichment updates, errors. Newest at the top, updates in real-time via WebSocket.' },
+            { page: 'dashboard', selector: '#enrichment-pills-section', title: 'Enrichment Services', description: 'Per-service enrichment coverage — how much of your library each metadata service has processed, with controls to manage priorities and intervals.' },
 
-            // Tools — in page order
-            { page: 'dashboard', selector: '#db-updater-card', title: 'Database Updater', description: 'Syncs your media server\'s library into SoulSync\'s database. Three modes: Incremental (fast, new content only), Full Refresh (rebuilds everything), Deep Scan (finds and removes stale entries).' },
-            { page: 'dashboard', selector: '#metadata-updater-card', title: 'Metadata Enrichment', description: 'Background workers that enrich your library from 9 services — Spotify, MusicBrainz, Deezer, Last.fm, iTunes, AudioDB, Genius, Tidal, Qobuz. Runs automatically at the configured interval.' },
-            { page: 'dashboard', selector: '#duplicate-cleaner-card', title: 'Duplicate Cleaner', description: 'Finds and removes duplicate tracks by comparing title, artist, album, and audio characteristics. Always reviews before deleting.' },
-            { page: 'dashboard', selector: '#discovery-pool-card', title: 'Discovery Pool', description: 'Tracks from similar artists found during watchlist scans. Matched tracks feed the Discover page playlists and genre browser. Fix failed matches manually.' },
-            { page: 'dashboard', selector: '#retag-tool-card', title: 'Retag Tool', description: 'Queue of tracks needing metadata corrections. When enrichment detects better tags than what\'s in your files, they appear here for batch review.' },
-            { page: 'dashboard', selector: '#media-scan-card', title: 'Media Server Scan', description: 'Manually trigger a library scan on your media server. Usually automatic after downloads, but useful after bulk imports.' },
-            { page: 'dashboard', selector: '#backup-manager-card', title: 'Backup Manager', description: 'Create and manage database backups. Includes all metadata, settings, enrichment data, and automation configs — everything except audio files.' },
-            { page: 'dashboard', selector: '#metadata-cache-card', title: 'Metadata Cache', description: 'Browse cached API responses from all metadata searches. Every artist, album, and track looked up is stored here, speeding up future lookups and feeding the Genre Explorer.' },
-
-            // Activity feed (bottom)
-            { page: 'dashboard', selector: '#dashboard-activity-feed', title: 'Activity Feed', description: 'Live stream of system events — downloads, syncs, enrichment updates, errors. Newest at the top, updates in real-time via WebSocket. That\'s the dashboard! 🎉' },
+            // The shell around every page
+            { page: 'dashboard', selector: '.side-toggle', title: 'Music / Video Toggle', description: 'SoulSync has two whole sides. This switch flips between the MUSIC app and the VIDEO app (movies + TV) — each has its own pages, library, and settings.' },
+            { page: 'dashboard', selector: '#profile-indicator', title: 'Your Profile', description: 'Who\'s signed in. Click to switch profiles; the small icons open My Accounts (per-profile streaming logins) and My Settings.' },
+            { page: 'dashboard', selector: '.nav-section-label[data-section="find"]', title: 'Find', description: 'Discovery lives here — Search, Discover, and the Artist Map. Section headers collapse if you like a tidy sidebar.' },
+            { page: 'dashboard', selector: '.nav-section-label[data-section="music"]', title: 'Music', description: 'Your collection: Library, Playlists & Sync, Downloads, and Import for files you already have.' },
+            { page: 'dashboard', selector: '.nav-section-label[data-section="system"]', title: 'System', description: 'The machinery: Automations, Tools, Stats, Issues, and Settings.' },
+            { page: 'dashboard', selector: '.version-button', title: 'Version & Support', description: 'Click the version number for release notes — it glows when an update is available (green routine, yellow major, red critical). Support SoulSync lives right above it. That\'s the dashboard! 🎉' },
         ]
     },
     'first-download': {
@@ -2366,7 +2363,7 @@ const HELPER_TOURS = {
         steps: [
             { page: 'search', selector: '#enh-source-row', title: 'Pick a Search Source', description: 'Each icon is a metadata source. The highlighted one is where your next search goes — defaults to your configured primary source. Click a different icon to switch to Spotify, Apple Music, Deezer, Discogs, Hydrabase, MusicBrainz, Music Videos, or Soulseek (raw P2P files). A small dot marks sources you\'ve already searched for the current query.' },
             { page: 'search', selector: '.enhanced-search-input-wrapper', title: 'Search for Music', description: 'Type an artist or album name here. Results appear in categorized sections — Artists, Albums, Singles/EPs, and Tracks. Try searching for your favorite artist now!' },
-            { page: 'search', selector: '#enh-results-container', title: 'Search Results', description: 'After searching, results appear organized by type: Artists at the top as cards, then Albums, Singles/EPs, and individual Tracks. "In Library" badges mark items you already own.' },
+            { page: 'search', selector: '#enhanced-results-container', title: 'Search Results', description: 'After searching, results appear organized by type: Artists at the top as cards, then Albums, Singles/EPs, and individual Tracks. "In Library" badges mark items you already own.' },
             { page: 'search', selector: '.enhanced-search-input-wrapper', title: 'Downloading an Album', description: 'Click any album card to open the download modal. You\'ll see the tracklist, quality options, and a big "Download Album" button. Individual tracks have a play button to preview before downloading.' },
             { page: 'search', selector: '.enhanced-search-input-wrapper', title: 'That\'s It!', description: 'Search, click, download. Albums go to your configured download path, get tagged with metadata, and sync to your media server automatically. Active downloads live on the dedicated Downloads page.' },
         ]
@@ -2501,15 +2498,14 @@ const HELPER_TOURS = {
         icon: '📥',
         steps: [
             // Header
-            { page: 'import', selector: '.import-page-header', title: 'Import Music', description: 'Import audio files from your import folder into your organized library. Files are matched to album metadata, tagged, and moved to the correct location.' },
-            { page: 'import', selector: '.import-page-staging-bar', title: 'Import Folder', description: 'Shows your configured import folder path and stats (file count, total size). This is where you drop audio files before importing. Configure the path in Settings → Downloads.' },
-            { page: 'import', selector: '.import-page-refresh-btn', title: 'Refresh', description: 'Re-scans your import folder for new audio files. Hit this after dropping new files in.' },
+            { page: 'import', selector: '#import-page', title: 'Import Music', description: 'Import audio files from your import folder into your organized library. Files are matched to album metadata, tagged, and moved to the correct location.' },
+            { page: 'import', selector: '#import-page-staging-path', title: 'Import Folder', description: 'Shows your configured import folder path and stats (file count, total size). This is where you drop audio files before importing — the refresh arrow re-scans it after you add files. Configure the path in Settings → Downloads.' },
 
             // Queue
             { page: 'import', selector: '#import-page-queue', title: 'Processing Queue', description: 'When you process albums or singles, jobs appear here with progress indicators. "Clear finished" removes completed jobs from the list.' },
 
             // Tabs
-            { page: 'import', selector: '.import-page-tab-bar', title: 'Albums vs Singles', description: 'Two modes: Albums tab matches full albums to metadata (cover art, track numbers, disc info). Singles tab processes individual files one at a time.' },
+            { page: 'import', selector: '#import-page-tab-album', title: 'Albums vs Singles', description: 'Two modes: Albums tab matches full albums to metadata (cover art, track numbers, disc info). Singles tab processes individual files one at a time.' },
 
             // Album workflow
             { page: 'import', selector: '#import-page-suggestions', title: 'Album Suggestions', description: 'The importer analyzes your import files and suggests album matches based on embedded tags. Click a suggestion to start the matching process.' },
@@ -2626,32 +2622,57 @@ function showTourStep() {
         const currentPage = document.querySelector('.page.active')?.id?.replace('-page', '') || '';
         if (currentPage !== step.page) {
             navigateToPage(step.page);
-            // Wait for page to render, then show the step
-            setTimeout(() => _renderTourStep(tour, step), 350);
-            return;
         }
     }
-
-    _renderTourStep(tour, step);
+    // Resolve the anchor with RETRIES — pages render async (React mounts,
+    // fetch-then-render lists), and the old fixed 350ms wait was the "box
+    // jumps to a corner and lives there" bug: the selector missed once and
+    // every later step rendered against nothing.
+    _resolveTourTarget(step.selector, (target) => {
+        // The user may have advanced/exited while we were resolving.
+        if (HelperState.tourId && tour.steps[HelperState.tourStep] === step) {
+            _renderTourStep(tour, step, target);
+        }
+    });
 }
 
-function _renderTourStep(tour, step) {
-    const target = document.querySelector(step.selector);
+// Poll for a VISIBLE anchor (display:none / unmounted elements don't count),
+// then give up honestly after ~2s so the step centers itself instead of
+// anchoring to a hidden element's garbage rect.
+function _resolveTourTarget(selector, cb, attempt = 0) {
+    const el = selector ? document.querySelector(selector) : null;
+    const visible = el && el.offsetParent !== null && el.getClientRects().length > 0;
+    if (visible) { cb(el); return; }
+    if (attempt >= 8) { cb(null); return; }
+    setTimeout(() => _resolveTourTarget(selector, cb, attempt + 1), 250);
+}
 
-    // Create spotlight overlay
+function _renderTourStep(tour, step, target) {
+
+    // Spotlight scrim: FOUR panels around a real hole. The old single
+    // overlay + z-index-raise-the-target trick failed for any target inside
+    // an ancestor stacking context (transform/backdrop-filter — most
+    // dashboard cards), which is why highlighted elements stayed dimmed
+    // and blurred behind the overlay.
     _tourOverlay = document.createElement('div');
     _tourOverlay.className = 'helper-tour-overlay';
-    _tourOverlay.addEventListener('click', (e) => {
-        if (e.target === _tourOverlay) dismissTour();
-    });
+    for (let i = 0; i < 4; i++) {
+        const panel = document.createElement('div');
+        panel.className = 'helper-tour-scrim';
+        panel.addEventListener('click', () => dismissTour());
+        _tourOverlay.appendChild(panel);
+    }
     document.body.appendChild(_tourOverlay);
 
-    // Highlight target
+    // Highlight target — scroll INSTANTLY so every rect below is final
+    // (smooth scrolling made the hole + popover anchor to mid-animation
+    // positions, another way the box ended up stranded).
     if (target) {
         target.classList.add('helper-tour-target');
         _helperHighlighted = target;
-        setTimeout(() => target.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50);
+        target.scrollIntoView({ behavior: 'auto', block: 'center' });
     }
+    _updateTourSpotlight(target);
 
     // Build tour popover
     const stepNum = HelperState.tourStep + 1;
@@ -2688,12 +2709,68 @@ function _renderTourStep(tour, step) {
             setTimeout(() => positionPopover(popover, target), 100);
         });
     } else {
-        // Target not found on this page — center the popover
+        // Target genuinely not on this page — center the popover
         popover.style.left = '50%';
         popover.style.top = '40%';
         popover.style.transform = 'translate(-50%, -50%)';
         requestAnimationFrame(() => popover.classList.add('visible'));
     }
+
+    // Keep the box AND the spotlight hole attached: re-anchor on resize and
+    // on any scroll while this step is up (scrollIntoView + window changes
+    // used to strand the box mid-screen with the hole elsewhere).
+    _tourRepositionHandler = () => {
+        if (_helperPopover !== popover) return;
+        _updateTourSpotlight(target && document.body.contains(target) ? target : null);
+        if (target && document.body.contains(target)) {
+            positionPopover(popover, target);
+        }
+    };
+    window.addEventListener('resize', _tourRepositionHandler);
+    document.addEventListener('scroll', _tourRepositionHandler, true);
+}
+
+let _tourRepositionHandler = null;
+
+function _removeTourReposition() {
+    if (_tourRepositionHandler) {
+        window.removeEventListener('resize', _tourRepositionHandler);
+        document.removeEventListener('scroll', _tourRepositionHandler, true);
+        _tourRepositionHandler = null;
+    }
+}
+
+// Geometry of the four scrim panels: everything EXCEPT the target's padded
+// rect is dimmed; the rect itself is a genuine hole (no covering element),
+// so no stacking context can keep the target dimmed. No target → one panel
+// covers the whole viewport.
+function _updateTourSpotlight(target) {
+    if (!_tourOverlay) return;
+    const panels = _tourOverlay.children;
+    if (panels.length < 4) return;
+    const W = window.innerWidth, H = window.innerHeight, PAD = 8;
+    let top = 0, bottom = 0, left = 0, right = 0, x1 = 0, x2 = 0;
+    if (target) {
+        const r = target.getBoundingClientRect();
+        top = Math.max(0, r.top - PAD);
+        bottom = Math.min(H, r.bottom + PAD);
+        x1 = Math.max(0, r.left - PAD);
+        x2 = Math.min(W, r.right + PAD);
+        left = x1;
+        right = W - x2;
+    } else {
+        top = H;        // "top" panel covers everything…
+        bottom = H;     // …and the other three collapse to zero
+        x1 = 0; x2 = 0; left = 0; right = 0;
+    }
+    const set = (el, t, l, w, h) => {
+        el.style.top = t + 'px'; el.style.left = l + 'px';
+        el.style.width = Math.max(0, w) + 'px'; el.style.height = Math.max(0, h) + 'px';
+    };
+    set(panels[0], 0, 0, W, top);                       // above
+    set(panels[1], bottom, 0, W, H - bottom);           // below
+    set(panels[2], top, 0, left, bottom - top);         // left of hole
+    set(panels[3], top, x2, right, bottom - top);       // right of hole
 }
 
 function nextTourStep() {
@@ -2727,6 +2804,7 @@ function dismissTour() {
 }
 
 function removeTourOverlay() {
+    _removeTourReposition();
     if (_tourOverlay) {
         _tourOverlay.remove();
         _tourOverlay = null;
@@ -3404,19 +3482,18 @@ function closeHelperSearch() {
 const WHATS_NEW = {
     // Convention: keep only the CURRENT release here, plus a single brief
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
-    '2.8.8': [
-        { date: 'July 2026 — 2.8.8' },
-        { title: 'Fixed a bug that could corrupt FLAC files on a tag write (#1000)', desc: 'writing tags to a FLAC (album consistency, the repair passes, ReplayGain) could damage the audio on some setups — the kind of skips/mutes flac -t catches. every tag write now goes to a temp copy, verifies the audio is byte-for-byte intact, and only then swaps the file in, so a bad write can never replace a good one. completing an album also adopts the album\'s existing tags instead of re-stamping every track, and the consistency pass pins one MusicBrainz release so albums stop splitting into 2-3 copies.', page: 'library' },
-        { title: 'New: Corrupt File Detector repair job', desc: 'decode-tests your FLAC library, flags any that are physically damaged, and lets you delete + re-download them in one click. opt-in, under the repair jobs.', page: 'tools' },
-        { title: 'New: Bandcamp enrichment source', desc: 'an experimental metadata/enrichment source for Bandcamp — big thanks to @shkarlsson for the contribution. off by default; turn it on in the enrichment sources.', page: 'settings' },
-        { title: 'Atomic album publishing (opt-in)', desc: 'a new toggle in Settings → Downloads: stage an album\'s tracks privately and only move the whole album into your library once it finishes downloading, so Plex/Jellyfin never shows a half-loaded album mid-download. off by default — nothing changes unless you enable it.', page: 'settings' },
-        { title: 'Downloads unjammed', desc: 'fixed a batch-slot leak and a few deadlocks that could wedge the download queue with orphaned tasks that never cleared — the "found N orphaned tasks" loop.', page: 'active-downloads' },
-        { title: 'Tidal downloads survive restarts (#1002)', desc: 'the Tidal download session now refreshes its token on restart instead of silently dropping it, so the source stays connected instead of forcing a manual re-link.', page: 'settings' },
-        { title: 'Compilations stay together (#1003)', desc: 'various-artists compilations now land under Compilations/ instead of scattering their tracks across individual artist folders.', page: 'settings' },
-        { title: 'Lossy converter + auto-scan fixes (#995)', desc: 'the lossy converter surfaces the real ffmpeg error instead of the version banner, and simple downloads now honor the "Auto-Scan After Downloads" toggle instead of always scanning.', page: 'tools' },
-        { title: 'UI + mobile polish', desc: 'a big cleanup pass across headers, buttons, filters, mobile touch targets, and general layout. thanks to @bluejorts.', page: 'dashboard' },
-        { title: 'Imports refused when your media server isn\'t connected', desc: 'a download/import can\'t land orphaned when SoulSync can\'t reach Plex/Jellyfin/Navidrome.', page: 'import' },
-        { title: 'Earlier versions', desc: '2.8.7 made the SoulSync discovery playlists first-class Auto-Sync items, fixed a settings-save that could wipe a stored API secret (#992), and added Navidrome playlist cover art (#993). 2.8.6 was a fix batch (Spotify search without an account, the Docker Import/Stats black screen #986, mirrored-playlist wipes #990, artist browse #988, iTunes singles #989, Reorganize folder pruning #985). 2.8.4 added Artist Web + named Quality Profiles (#974); 2.8.3 rebuilt Discover; 2.7.0 made multi-user real.' },
+    '3.1.9': [
+        { date: 'July 2026 · 3.1.9' },
+        { title: 'The Arcade', desc: 'the chat room gets games. chess, Connect 4, Battleship and a slot machine, played over Soulseek with NO SERVER anywhere — a match is just hidden messages in the room, and every client folds them into the same board independently. the board says so out loud: "no server · folded from 34 room messages", and you can click it to see the messages behind the position.' },
+        { title: 'Chess, properly', desc: 'full rules — castling, en passant, under-promotion, stalemate, threefold, fifty-move — with the engine checked against the standard perft positions so move generation is exactly right rather than roughly right. drag or click, legal-move dots, check and last-move highlights, algebraic move list, board flips for black. correspondence style with no clock: close the tab, come back tomorrow, the sidebar tells you whose move it is. resign, offer a draw, take over a seat idle 24h, and export a PGN that opens in Lichess like any other game.' },
+        { title: 'Connect 4, Battleship, Slots', desc: 'Connect 4 is click-a-column. Battleship is the clever one: your fleet never goes on the wire until the end, both players publish a fingerprint of their board up front, and at the reveal every client checks every answer you gave against the board you showed — lie about one miss and no board fits. your own client answers shots automatically so nobody waits on a prompt. Slots is solo with play money: 10k a day, topped back up at midnight if you are below it, and anything you win above it is yours.' },
+        { title: 'You vs the room, and a room ladder', desc: 'one seat is you and the other belongs to everybody else — they vote, and the move plays when enough of them agree. finished games feed an Elo ladder: persistent ratings with no server and no database of record.' },
+        { title: 'Games that survive real life', desc: 'a client that missed moves catches up from the position carried on the next one. if both sides are waiting on each other and nothing arrives, it asks the room where the game actually is — and the room is OUTVOTED rather than trusted, so one client claiming a fake board gets ignored. matches are archived too, so a game survives an slskd restart even when nobody is around to ask.' },
+        { title: 'Chat avatars', desc: 'pick from 100 presets in the chat settings cog. it shows on every message, in the member list and on your account strip, and it is saved to your account so it follows you to another browser.' },
+        { title: 'Mentions never actually worked', desc: 'SoulSync read your Soulseek name off an endpoint that does not carry it, so it was always blank — which meant @-pings never highlighted you and reserved avatars never appeared. it asks the endpoints that actually have it now.' },
+        { title: 'Spotify rate-limit popup, for people not using Spotify', desc: 'the ban modal appeared on installs whose metadata source is Deezer, announcing that search and enrichment were paused when neither was. it only shows when Spotify is genuinely your source now, and a 30-minute ban needs a real 429 rather than any error that happens to contain the letters "rate".' },
+        { title: 'Re-matching a TV show left the old episodes', desc: 'a show re-matched onto a different title kept the previous one\'s episode list, so "Lucky (2026)" showed two 2026 episodes stacked on six from a 2022 series. the old title\'s episodes are cleared now, while episodes you actually have files for keep their files and watch state.' },
+        { title: 'Earlier versions', desc: '3.1.8 rebuilt chat into a Discord-style app with channels + threads and made Quality Profiles govern every download. 3.1.7 turned chat into a hangout with a shared jukebox. 3.1.6 made video downloads land atomically. 3.1.5 made chat best-in-class.' },
     ],
 };
 
@@ -3447,16 +3524,221 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "2.8.8 — no more corrupted FLACs, Bandcamp, and atomic album publishing",
-        description: "the headline is a fix for a tag write that could corrupt a FLAC's audio on some setups — every tag write is atomic and audio-verified now. plus a Corrupt File Detector, a new Bandcamp source, and opt-in atomic album publishing.",
+        title: "3.1.9: the chat room gets an arcade",
+        description: "chess, connect 4, battleship and a slot machine, played over soulseek with no server anywhere. a match is nothing but hidden messages in the room, and every client folds them into the same board independently — the board tells you so, and lets you look at the messages behind the position. plus 100 preset avatars, and a fix for @-mentions that never worked.",
         features: [
-            "#1000 — a tag write (album consistency, the repair passes, ReplayGain) could damage a FLAC's audio on some setups. every tag write now writes to a temp copy, verifies the audio is byte-for-byte intact, and only then swaps the file in — so a bad write can never replace a good file. completing an album adopts the album's existing tags instead of re-stamping every track, and the consistency pass pins one MusicBrainz release so albums stop splitting into 2-3 copies",
-            "new Corrupt File Detector repair job — decode-tests your FLACs and lets you delete + re-download any that are already damaged",
-            "Bandcamp — a new experimental enrichment source (big thanks to @shkarlsson); off by default, enable it in the enrichment sources",
-            "atomic album publishing — an opt-in toggle in Settings → Downloads that stages an album privately and only moves it into your library once the whole thing finishes, so Plex/Jellyfin never shows a half-loaded album mid-download",
-            "downloads unjammed — fixed a batch-slot leak and a few deadlocks that could wedge the queue with orphaned tasks that never cleared",
-            "#1002 — Tidal downloads survive a restart: the session refreshes its token instead of silently dropping it and forcing a re-link",
-            "#1003 — various-artists compilations stay together under Compilations/ instead of scattering by artist; #995 — the lossy converter shows the real ffmpeg error and simple downloads honor the auto-scan toggle; plus a big UI + mobile polish pass (thanks @bluejorts)",
+            "the arcade: a games section in the chat sidebar with a lobby of what's on the tables. no game server exists — every board is folded out of chat messages, and yours and your opponent's clients each work it out on their own",
+            "chess done properly: castling, en passant, under-promotion, stalemate, threefold and fifty-move, with the engine verified against the standard perft positions so move generation is exactly correct. drag or click, legal-move dots, check and last-move highlights, algebraic move list, board flips for black, and a PGN export that opens in lichess",
+            "correspondence style, no clock: close the tab and come back tomorrow — the sidebar tells you whose move it is. resign, offer a draw, withdraw a table nobody joined, or take over a seat that has been idle a day",
+            "battleship with commit-reveal: your fleet never goes on the wire until the end, both sides publish a fingerprint of their board first, and at the reveal every client checks every answer against the board you showed. lie about a single miss and no board fits. your client answers shots automatically from your own board",
+            "connect 4, a slot machine with play money (10k a day, topped back up at midnight if you drop below, winnings kept), you-vs-the-room chess where everyone else votes the moves, and an elo ladder folded out of finished games",
+            "games that survive real life: a client that missed moves catches up from the next move's position, a stuck game asks the room where it actually is, and the room is outvoted rather than trusted so a client claiming a fake board gets ignored. matches are archived so they survive an slskd restart",
+            "chat avatars: 100 presets in the settings cog, shown on every message and in the member list, saved to your account so it follows you between browsers",
+            "mentions never worked: soulsync read your soulseek name off an endpoint that does not carry it, so it was always blank and @-pings never highlighted. fixed",
+            "spotify's rate-limit popup no longer interrupts people whose metadata source is deezer, and a 30-minute ban now needs a real 429 instead of any error containing the letters 'rate'",
+            "re-matching a tv show no longer leaves the previous title's episodes behind — episodes you have files for keep their files and watch state",
+        ],
+        usage_note: "the arcade is in the chat sidebar under Games. avatars are behind the chat settings cog. everything in the arcade is play-money or for fun; nothing there touches your library.",
+    },
+    {
+        title: "Earlier in 3.1.8: chat becomes discord, quality profiles start working",
+        description: "chat gets rebuilt into a real discord-style app — server rail, channels, threads, a proper member list — all riding one soulseek room, and auto-dj turns into an actual radio. and quality profiles stop being decorative: pin one to any watchlist artist or mirrored playlist and it governs every download that title triggers. plus preview + pick from your mixes, a much faster discover page, and the whole video app documented.",
+        features: [
+            "chat looks and behaves like discord: a server rail of every soulseek room you've joined (plus a DM puck with unread counts), a channel sidebar with collapsible categories and an account strip, the message column, and a member list with avatars, presence dots and an activity line showing who's listening to the jukebox",
+            "channels + threads: the room now has #general and #off-topic under Community, #help, #bugs and #ideas under Support, all with unread badges — they're tags carried inside the SoulSync envelope, so untagged messages and anything from a vanilla soulseek client always land in #general and nothing is ever invisible. 🧵 any message to start a thread; a channel's threads hang beneath it in the sidebar and open in their own view. channels are SoulSync-room only — every other soulseek room stays plain unfiltered chat",
+            "auto-dj is a real radio: when the jukebox queue runs dry it now builds a genuine radio out of what the room just played — last.fm similar-tracks, then similar-artists, then your own library's similar-artist graph — instead of requeueing the same song. if the last thing played was a mix rather than a single track it follows the genre instead of hunting for songs similar to a video title. it says why it's idle, and the room elects a single DJ so two people turning it on can't double-queue",
+            "mention ping + now-playing: an optional sound when someone @-mentions you or replies to you — off by default, throttled, and silent while a room's history is loading. plus an opt-in activity line that shows the room what you're playing in SoulSync",
+            "quality profiles everywhere (#1076, thanks nick2000713): every watchlist artist and mirrored playlist gets its own named quality profile, honored at every point a download starts — manual search/discover/library, auto-sync, playlist sync, download-missing, and retries. an explicit per-action choice beats the saved assignment beats the global default, always in that order. nothing copies the rules around, so editing a profile in Settings changes everything assigned to it at once",
+            "preview + pick from Mixes & ListenBrainz (#1079, thanks andreamassaro9): each track in a Mix or ListenBrainz recommendation gets a preview play button and a checkbox — audition the picks and Download selected instead of grabbing the whole playlist",
+            "discover loads fast: the page used to fire ~20 section requests at once and contend itself into a ~30s load; it now loads above-the-fold sections first and streams the rest, usable in a couple seconds. plus the sidebar header no longer bleeds through the artist map overlay",
+            "the video side is documented: Help & Docs now has full guide sections for the whole video app plus a video API reference, matching the music-side format (screenshots to follow)",
+            "library v2 fixes (#1055, thanks nick2000713): simple downloads only fill blank/placeholder tags instead of clobbering good ones, and a stuck usenet job gives up cleanly instead of polling for hours",
+        ],
+        usage_note: "channels + threads live on the Chat page; the mention ping is behind the chat settings cog. assign a quality profile from a watchlist artist's or a mirrored playlist's settings, or pick one per-download in the Add to Wishlist / Download Missing dialogs. the Mix preview + select controls are inside the Mix / ListenBrainz playlist modals.",
+    },
+    {
+        title: "Earlier in 3.1.7 — the chat jukebox release",
+        description: "chat turns into a place you actually hang out — a shared room jukebox you listen to together and vote on, file sharing, polls, pins, typing indicators, slash commands. plus a hifi failover fix and a version + disc aware track repair.",
+        features: [
+            "the room jukebox: listen to music together in any chat room. paste a youtube link or search, the room votes on what plays next, and everyone who tunes in hears the same track at the same spot. no server runs it — every soulsync client folds the same hidden message stream into the same queue, so it stays in sync on its own",
+            "jukebox, fully loaded: vote to skip (majority of listeners), thumbnails everywhere with a now-playing progress bar and an 'up next' highlight, recently-played with one-click requeue, pull your own submission back out, an audio-only toggle + a local volume slider, and auto-dj that keeps the queue fed with related tracks when it runs dry",
+            "chat file sharing (filepost.dev): upload a file or pick a track straight from your library, and it drops in chat as a rich card you can preview inline",
+            "polls, pins, topics, presence: ask the room a question with live vote bars, 📌 any message to a shared board, set a room topic, see who's typing, and a ♫ next to whoever's tuned into the jukebox",
+            "slash commands: /play /skip /tune /topic /poll /pin /gif /shrug with autocomplete — plus the chat modals rebuilt to match soulsync's real design instead of the old flat gray",
+            "hifi failover (#1073, thanks Lain2077): hifi requests that hit a rate limit or a blocked instance rotate to another instance instead of failing, like the monochrome instances do",
+            "track repair, version + disc aware (#1075, thanks Lain2077): repair used to strip '(Why Us? Version)'-style qualifiers before matching, so different versions of a song looked identical and it grabbed the wrong disc's copy — the full title breaks ties now. multi-disc repairs also write the disc tag so per-disc numbering can't create duplicate track numbers, and the change tells you when a number is disc-relative ('track number: 1 → 10 (disc 2 of 3)')",
+        ],
+        usage_note: "the jukebox controls live in the chat page header (open a room to see them). drop your filepost.dev API key on the chat settings cog to enable file sharing. heads up: multi-disc albums missing disc tags will show new Track Repair findings after this update — that's the fix tagging the whole album.",
+    },
+    {
+        title: "Earlier in 3.1.6 — the safe-landings + automations release",
+        description: "video downloads land atomically (the skipping-playback corruption fix), automations get custom webhook payloads + per-step conditions + new triggers under a full page redesign, discography ownership stops being source-locked, and file organization learns the '#' folder.",
+        features: [
+            "video files land safely: downloads land under a hidden temp name, get byte-verified, and appear atomically — no more half-written files indexed as skipping/corrupt, and a move never deletes its source until the destination is proven whole",
+            "automations, next level: custom webhook payload templates with {variable} tags, per-step conditions, numeric operators, a send-test button, timezone-aware schedules, and new triggers (maintenance findings/scans, video release-grabbed + request filed/approved) — all under a rebuilt uniform card + builder design",
+            "cross-source ownership (#1071, thanks QT3496): an album you own shows OWNED no matter which metadata source you view the artist through",
+            "the '#' folder (#1072, thanks QT3496) + m3u path-prefix portability (thanks wolf39us), both opt-in",
+            "video detail fixes (episode buttons never vanish, grab-season carries the poster) + music videos file under the real artist, not the fan-channel name",
+        ],
+    },
+    {
+        title: "Earlier in 3.1.5 — the chat + discography release",
+        description: "chat goes best-in-class (any public room, user shares, history search), you choose which source paints your discographies — and see what the others know — the wishlist learns artists and smarter retries, Fix All runs in the background, and multi-user gets a security hardening pass.",
+        features: [
+            "chat, best in class: join ANY public soulseek room via a rooms rail + full room browser, a real user list (roles, sorting, local mute), browse any user's shared files and download them right from chat, search your message history, copy any message, and a redesigned composer",
+            "choose your discography source (thanks ragnarlotus, #1068): a Library Discography Source setting — primary, automatic fallback, or a specific source — decides what paints library artists' discographies, and an artist a source genuinely doesn't know no longer reads as an error",
+            "see what other sources know (#1067): an 'Other sources' view option appends releases your current view is missing, slotted into the real Albums/EPs/Singles sections with their source marked — each downloadable, Download Discography includes them, off by default and purely additive",
+            "wishlist: select/download/remove a whole artist's entries at once (#1065), real attempt counts, progressive retry backoff instead of hammering every cycle, and a configurable auto-ignore TTL (thanks javiavid)",
+            "search by musicbrainz id (thanks Jordan H): paste a bare MBID and it resolves straight to the release, lidarr-style",
+            "tools: Fix All runs in the background with live progress + a Stop button so a 5000-finding retag can't time out the page (thanks pertti), Album Tag Consistency explains exactly which albums it excluded and why + warns when files weren't readable from soulsync's side (thanks clouddead89), adjustable findings page size, and Genre Tag Cleanup scans the whole library (#1066)",
+            "multi-user hardening: profile-scoped APIs verify ownership, deleting a profile sweeps every referencing table, and socket rooms derive from the session — one profile can't see or touch another's data",
+            "reported fixes: singles/EPs no longer file as Albums when the source has no type signal (#1064), the artist photo picker works on Navidrome/Jellyfin (#1069), enabling Usenet in source priority survives reload (thanks Fl3m), Retry All Failed on the music workers modal, and video's 'block release and retry' actually retries with another release",
+        ],
+        usage_note: "the discography source lives in Settings → Metadata; 'Other sources' is a toggle in the artist page's filter row. rooms + user shares are on the Chat page. wishlist artist tools appear when you group by artist.",
+    },
+    {
+        title: "Earlier in 3.1.4 — the tools + requests release",
+        description: "two new library-maintenance jobs (comma artist splitter + genre cleanup), ReplayGain loudness targets, the video Requests page grown up, seed limits your torrent client can enforce itself, every logo shipping with the app, and a big stack of reported fixes.",
+        features: [
+            "comma artist splitter (thanks jadux): a Tools job that finds fake combined artists like 'Camellia, Toby Fox' and splits their tags safely — real comma artists like 'Tyler, The Creator' are recognized via the metadata APIs and left alone, every part must be a known artist before anything is flagged, and each finding shows exactly how it will split with clickable chips to the real artists. approving re-tags the files with a proper multi-artist tag and your server dissolves the dummy on its next scan",
+            "replaygain target loudness (#1060): set the reference (default -18 LUFS) every RG write analyzes against, plus an opt-in re-run over tracks computed against a different target; genre tag cleanup (#1057): re-check genres stored before strict filtering was enabled, removal-only",
+            "fix all actually fixes all: the Tools bulk-fix silently skipped some finding types its own counter included ('fixed 0 of N') — the fixable set is now derived from the fix handlers; artist pictures on findings click through to the artist's page",
+            "video requests, best in class: approved requests show 'Acquiring…' until the title lands in your library then flip to 'In library', status tabs with counts, removable history + a Clear-resolved sweep, and no more success toast while the row still says Approve",
+            "seed limits your client enforces (thanks TheHomeGuy): an 'Enforced by' toggle (music + video) writes ratio/time goals into the torrent as native share limits so the client stops seeding on its own even if SoulSync is down — and stall-pause works on qBittorrent 5.x",
+            "the wishlist failing hub (thanks LiveLeak): a '⚠ Failing' filter chip on the video wishlist, a manual release picker on every movie/season/episode, and music's 'Search manually' now lands on the actual soulseek search prefilled",
+            "every logo ships with the app: ~86 hotlinked images from 10+ external CDNs now load from your own server — no more broken logos from rate limits, dead URLs, or LAN-only installs",
+            "reported fixes: downloads freezing mid-batch + a metadata identity guard (jadux), re-releases finally download — analysis respects release years (5BILLION), deep scan removes artists on an empty Navidrome (5BILLION), unchecking chat auto-join actually leaves (popwaffle9000), $year renders for TV renames (musicagine), a source-search timeout knob (#1056), airing shows catch up missed days",
+            "community: enrichment workers idle-backoff their polling (#1054, thegabriele97), discographies fall through the provider chain when the primary source is down (#1032, ragnarlotus)",
+        ],
+        usage_note: "the new jobs live on the Tools page (Comma Artist Splitter and Genre Tag Cleanup are report-only until you approve findings). seed enforcement and the timeout knob are under Settings → Downloads / Soulseek.",
+    },
+    {
+        title: "Earlier in 3.1.3 — follow record labels",
+        description: "follow a record label the same way you follow an artist and SoulSync watches it for new releases — plus music torrents can now seed on a leash, and two reported fixes (multi-disc display + write-tags efficiency).",
+        features: [
+            "follow record labels: search finds labels, and each label gets a real refreshable page showing its whole catalog newest-first in album cards, with an ownership overlay for what you already have, filters and sort, and every release linking through to the real artist (never the label)",
+            "the watchlist page gets a Labels tab with follow / backlog controls, and the normal watchlist scan now checks your followed artists AND labels in one pass with one live display — the scheduled watchlist automation included. follow no labels and nothing changes",
+            "seed music torrents on a leash: set a seed ratio and/or time goal in Settings → Downloads and a completed grab is removed from your torrent client once it hits the goal (the client's own copy only — your imported library file is separate and untouched). strictly opt-in, both goals default to off",
+            "multi-disc albums display right (#1051, thanks Tacobell444): an album whose tags all say disc 1 no longer drops or misplaces disc-2 tracks in the enhanced view (rows were keyed by disc+track and collided), and Disc # is now editable inline like Track # / Title so you can fix bad disc tags and write them to the file",
+            "Write Tags only touches the files that changed (#1052, thanks Tacobell444): the batch write diffs each file against the DB first (the same comparison the preview shows) and skips the ones already correct instead of rewriting every file — server sync only pushes what changed too",
+        ],
+        usage_note: "labels: search a label name, open it, and hit follow. seeding goals and torrent settings live under Settings → Downloads.",
+    },
+    {
+        title: "Earlier in 3.1.2 — SoulSync gets a chat",
+        description: "a full Soulseek chat page — the community 'SoulSync' room + private messages, Discord-class — plus the artist photo picker finally works, SoundCloud links resolve anywhere, and two long-standing reported bugs die.",
+        features: [
+            "Chat (System section, both sides): the community 'SoulSync' room and private messages, proxied through slskd. rich messages other Soulseek clients can't read (bold / code / spoilers / emoji, image + YouTube embeds, SoulSync deep links), @mentions with autocomplete, replies, reactions, GIF search, a local archive that survives slskd restarts, and an auto-responder for anti-leech bots. sending is admin-only by default",
+            "the artist photo picker actually delivers photos now (Deezer, Spotify authed OR free, iTunes, AudioDB, Discogs, plus paste-a-URL), and one transient source hiccup no longer sticks 'no photos found' for 15 minutes",
+            "SoundCloud links resolve wherever you paste them, including unlisted/private share links (#865 follow-up); deep scan removes artists after switching to an empty Navidrome library, and re-releases stop showing as owned on the library page (both from 5BILLION's reports)",
+        ],
+    },
+    {
+        title: "Earlier in 3.1.1 — continue watching + the reported-bugs sweep",
+        description: "the video detail pages learn everything your server knows about what you've watched, and a stack of reported music bugs — re-releases showing owned, playlist sync leaving tracks behind, force download not forcing — all die.",
+        features: [
+            "continue watching: per-episode watch state scanned from plex/jellyfin — checkmarks, progress bars, a Next Up highlight, the hero button becomes 'Resume S2 E4 on Plex' deep-linking the episode, shows open on the season you're actually in, and a Mark watched/unwatched toggle pushes played state back to your server",
+            "detail pages surface what soulsync already knew: the 🏆 awards line, an after-credits-scene tag, NEW badges on freshly-landed episodes, digital release dates, your file's ranked quality name, and 4K · HDR · DV · Atmos · 7.1 format badges on owned movies (real stream data on jellyfin, release-name parsing on plex)",
+            "re-releases no longer show as owned: owning the original doesn't claim the remaster/anniversary edition anymore — album matching respects the release year on both sides",
+            "playlist sync stops leaving tracks behind (#1047): matches in the 0.70–0.79 band were found then thrown away, stale plex ratingKeys failed silently, and big playlist writes partially landed unchecked — all three fixed, writes now chunked and verified against what the server stored",
+            "deep scan finally removes artists that left your library, reads the server fresh instead of a stale cache, and refuses to mass-delete on a failed server call — a plex hiccup can't wipe your artist list",
+            "repeatedly-failing wishlist downloads get an attempt counter, a failing badge, a see-only-failing filter, and a jump straight into manual search (music + video, thanks LiveLeak); force download actually replaces the file on disk (#1045)",
+            "per-show Synchronize: a deep scan scoped to one show that reconciles episodes right now, survives plex re-keys, and refreshes the airing schedule — and vanished episodes demote to 'missing' instead of being erased",
+            "the request flood is gone: duplicate api GET bursts dedupe to one wire request, enrichment status hydrates in one bundled call instead of ~28, and steady-state pollers slow down + skip hidden tabs",
+            "smaller fixes: digit-named artists (311) open again, the whole-library m3u reports itself in the scan summary (#1041), video genres/keywords/where-to-watch are real links (#1042), mass rename previews big libraries in the background with live progress, youtube episode numbering trusts the real upload date",
+        ],
+    },
+    {
+        title: "Earlier in 3.1.0 — the video side grows up",
+        description: "the video side gets a full Sonarr/Radarr-class acquisition stack, a best-in-class pass over every page, and a wave of reported bugs (storage bleeding, torrents not moving, the wrong song downloading) all die.",
+        features: [
+            "video acquisition, Sonarr/Radarr parity in eleven pieces: RSS instant grabs (a wanted release lands minutes after it hits your indexers, not at the next hourly sweep), per-title quality profiles + monitor policies, custom formats (scored release-name matchers), an in-app requests system, torrent seeding lifecycle, import lists (Trakt/TMDB/IMDb/Plex watchlist), mass rename with preview, daily/anime series types + multi-episode files, per-title history, video backups + staged restore, and Discord/Telegram/webhook notifications",
+            "every video page rebuilt best-in-class: calendar (movie lane, agenda view, iCal subscribe, moved to Find), wishlist (Search Now, honest status, far snappier poster art), downloads (live speed + ETA), library (size-on-disk, missing/quality filters, Largest sort), search (recent chips), discover (filter collapse toggle), and Letterboxd + per-episode external links on detail pages (#1039)",
+            "version glow (Kazimir): the version number glows green for a routine update, yellow for a major release, red for critical, checking real GitHub releases and naming the version, not a commit hash",
+            "notification history (Kazimir): every toast is journaled server-side so a Clear All loses nothing, with a type filter on the bell panel and a searchable History page",
+            "config migration (Kazimir): export every setting for both sides as one JSON bundle to move to a new install, or import one; secrets redacted by default, credentials export gated behind login mode",
+            "the downloads folder no longer bleeds storage (Kazimir's 10GB leak): failed youtube matches were cancelled while still landing recordless files, fixed at the source plus a reaper for the orphans",
+            "torrents move to your configured folder (TheHomeGuy): qBittorrent reports its own container path and soulsync now verifies the release is actually there before trusting it; youtube stops grabbing the wrong song (Kazimir's 'We're Shameless'); HiFi 30-second preview clips can no longer replace real library files on upgrade (sella), with a cleanup tool for ones already in a library",
+            "guided tours rebuilt against the current UI, the #1038 Library crashes fixed, and the #1040 layout bugs (sidebar bleed, artist-column clipping, orb overflow) dead",
+        ],
+    },
+    {
+        title: "Earlier in 3.0.5: the community-reports release",
+        description: "eight user requests and bug reports, all shipped: imports learn exact-ID identification, lyrics travel with tracks, and a stack of 'why is this wrong' reports turned out to be real bugs.",
+        features: [
+            "import identifies albums by exact IDs: the spotify link in a file's comment tag resolves 1:1, and ISRC tags resolve by folder consensus (the album containing most of the folder's codes wins, so a compilation can't hijack the import), fixing text-search failures on japanese releases",
+            "a track's .lrc lyrics sidecar moves with it on imports and downloads, renamed to match",
+            "fix a wrong artist photo everywhere at once from the library page, tidal playlists over ~20 all load (#1035), musicbrainz same-name artists resolve correctly (#1036), and paste-cookies.txt applies to the video side too",
+        ],
+    },
+    {
+        title: "Earlier in 3.0.4 — discover 2.0 + profile side access",
+        description: "the video discover page becomes a netflix-class browse, profiles can be scoped to one side of the app, and a stack of reported bugs die — including the tidal restart loss that survived two releases.",
+        features: [
+            "discover 2.0: a billboard hero with real title logo art, one clean header with a preferences popover, browse-by-genre tiles, live filters, and a feed that's actually endless — view more pages forever, grids respect hide-owned, and the page lazy-renders so it stays fast",
+            "profile side access: each profile can be music-only, video-only, or both (new profiles default to music-only). single-side profiles never see the music/video switcher and blocked-side page options disable automatically",
+            "wishlist state on every card: search results, discover cards, the hero button, more-like-this cards and the get modal all show wishlisted / in-library state instead of offering to re-add",
+            "tidal download source survives restarts (#1002): a startup ordering bug wiped the saved session from memory on every docker boot before verification could run — nothing failed, so nothing logged. boot network blips retry now instead of dropping a valid session. re-add tidal to your hybrid order once after updating",
+            "torrent grabs work in split-container setups: soulsync downloads the .torrent itself and hands your client the file (like sonarr/radarr) instead of passing a prowlarr url the client may not resolve — all four clients, music and video",
+            "amazon music works again (#1033): t2tunes changed their api format — search, downloads and file tags (track/disc numbers, covers, dates) all read the new format, old format still supported",
+            "owned artists respect the source you clicked (#1026), playlist sync no longer matches the wrong same-artist track with high confidence (#769), music + video share one slskd search budget instead of doubling it, and the websocket push loops idle completely when no browser is open (thanks thegabriele97, #1030)",
+        ],
+    },
+    {
+        title: "Earlier in 3.0.3 — quality of life across both sides",
+        description: "whole-show wishlisting + a match editor on video, global automation pause toggles, and four reported music bugs dead — including the corrupt file detector that scanned nothing.",
+        features: [
+            "wishlist a whole show in one click: 'Wishlist Missing' on the show detail page grabs every missing aired episode across all seasons (loading ones you never browsed), and the Get Missing modal gets a matching 'Select all missing' button",
+            "fix a wrong match without deleting anything: movie/show Manage panels get a Matches section — per-service rows (TMDB, TVDB, IMDb) with search, re-point, and clear. re-pointing wipes what the wrong match filled in and re-enriches by the new id; locked fields and art are never touched",
+            "shows stuck with no status heal themselves: an old bug could mark a show's TMDB details done even when the call failed, leaving it with no airing info and no watchlist button forever (the 90 Day Fiancé report). a one-time migration re-queues them",
+            "a global automation pause per side: one master toggle on each Automations page that gates whether anything runs without touching your individual switches. music defaults on, video defaults off — flip it on once if you use video automations",
+            "Corrupt File Detector actually finds files (#1000): the scan silently skipped every file on docker/NAS setups because the path resolver had no search directories. fixed (ReplayGain Filler had the same hole), the summary reports what was really decoded, and flac ships in the docker image for the md5-verifying check",
+            "manual match sticks now: two playlist entries matched to the same server track no longer silently lose the second pairing forever, and reorganize no longer quarantines your own files for being a different master than the metadata source's tracklist",
+            "the now-playing modal no longer clips its controls on short/zoomed windows, and unresolvable-path warnings now repeat and name the actual filesystem error — so a dead NFS/bind mount diagnoses itself instead of masquerading as missing files",
+        ],
+    },
+    {
+        title: "Earlier in 3.0.2 — the follow-up polish release",
+        description: "video downloading gets sonarr-parity round 2, the entire video side goes mobile, and three music-side bugs are dead (library reorganize works again).",
+        features: [
+            "smarter video searching: daily shows match by air date ('The Daily Show 2026.07.08' style releases), soulseek results parse their share paths the way the music matcher does, releases with no quality token get size-inferred quality, and the wishlist run log now names any source that was skipped (like prowlarr not being configured) instead of silently degrading",
+            "download history now tracks tv episodes and youtube grabs (youtube gets its own tab), and you can blacklist an uploader straight from a completed download — searches, retries and requeries all skip them from then on",
+            "the entire video side is responsive: dashboard, search, discover, library, watchlist, wishlist, downloads, calendar, detail pages, and both studios (overlay + collection) work on phones and tablets. desktop unchanged",
+            "library reorganize actually reorganizes: after a template change it reported every album as 'already organized' — the keep-albums-together folder reuse was answering with the very folder you were moving out of. destinations now come from your current template alone. thanks TheHomeGuy for the report",
+            "manual imports skip the quality profile (#1017): a hand-matched file is your call — acoustid, integrity and silence checks still run, but the profile no longer vetoes it",
+            "basic search results no longer vanish on short or zoomed-out windows (#1024), and canonical-version repair findings can actually be applied now (#1022, thanks @sam-coodu)",
+        ],
+    },
+    {
+        title: "Earlier in 3.0.1 — soulsync does video now",
+        description: "the big one: a whole video side (movies, tv, youtube) plus a tautulli-style live server activity view, with Radarr/Sonarr-parity download matching.",
+        features: [
+            "the video side is a fully isolated app (its own database, dashboard, search, calendar and download pipeline) for plex and jellyfin that never touches the music side. library scanning, tmdb/tvdb/omdb enrichment plus 10 backfill workers, source-agnostic movie/show/person/studio detail pages, and a progressive netflix-feel search",
+            "follow shows, actors, directors, studios (with family presets like disney = pixar + marvel + lucasfilm) and youtube channels/playlists, then let the wishlist-to-download pipeline grab them: soulseek + prowlarr + yt-dlp, with radarr/sonarr-class quality profiles, a download history, a recycle bin and a release blocklist",
+            "smarter download matching: the search now gates on the release TITLE (not just the year), so 'Paradox (2017)' can't grab 'The Cloverfield Paradox (2018)' anymore — and it matches TMDB alternate/original-language titles too, so an aka-named release still gets found. wrong grabs out, missed grabs out",
+            "kometa-style overlay studio (paint template overlays onto your posters) and collection manager (build plex collections / jellyfin boxsets from imdb/tmdb/trakt/mdblist ranked lists in true rank order), both with nightly automations",
+            "Server Activity: a tautulli-style live now-playing drawer for plex + jellyfin, with websocket streams, click-to-open-inside-soulsync, a history tab, a stats tab, and terminate-a-stream-with-a-message",
+            "the nightly TV refresh only re-pulls the current season now (not every season of every airing show, every night), the help/docs mobile nav works again (thanks @bluejorts), the dashboard header reads 'music dashboard', and there's a github sponsor button",
+        ],
+    },
+    {
+        title: "Earlier in 2.8.9",
+        description: "a bug-fix + quality-of-life release: box sets keep their disc folders, the Server Playlists compare view stopped taking 15 seconds, and a new matching preference for explicit versions.",
+        features: [
+            "#1009 — downloading a multi-disc album was collapsing every disc into one folder (and the Track Number Repair job mangled $disc$track filenames like 0213 into 133, flagging correct box sets as broken). both fixed: disc folders follow your template, repairs keep your naming convention, and approving a repair finding applies exactly the change it shows",
+            "#1005 — the Server Playlists compare view loads big synced playlists in a few seconds instead of 15+, the missing/matched filter actually filters after a reload, and syncing a single song updates that row in place instead of reloading everything",
+            "#923 — new 'prefer explicit versions' sub-setting under the explicit content toggle: explicit-marked soulseek files rank up, clean/censored/radio-edit files rank down, and nothing is ever skipped — a clean version still downloads when it's all that exists",
+            "the status endpoint could 500 when several tabs polled it at once (thread race, now locked), and on mobile the floating bell/help buttons no longer sit on top of the album modal's buttons (#1007)",
+            "under the hood: unified React page headers, a webui CI gate (lint, build, vitest), and a new e2e route sweep at desktop+mobile that caught the status race — all thanks to @bluejorts (#1008, #1010, #1012)",
+        ],
+    },
+    {
+        title: "Earlier in 2.8.8",
+        description: "no more corrupted FLACs, Bandcamp, and atomic album publishing.",
+        features: [
+            "#1000 — a tag write could damage a FLAC's audio on some setups. every tag write now goes to a temp copy, verifies the audio byte-for-byte, and only then swaps the file in. plus the Corrupt File Detector repair job for finding + re-downloading already-damaged files",
+            "Bandcamp — a new experimental enrichment source (thanks @shkarlsson), and opt-in atomic album publishing so Plex/Jellyfin never sees a half-loaded album mid-download",
+            "downloads unjammed (batch-slot leak + deadlocks), Tidal sessions survive restarts (#1002), compilations stay together under Compilations/ (#1003), and a big UI + mobile polish pass (thanks @bluejorts)",
         ],
     },
     {
@@ -3478,24 +3760,6 @@ const VERSION_MODAL_SECTIONS = [
             "#988 — browsing an artist could surface a completely different artist's tracks (e.g. The Outfield showing Beatles) because a Deezer name-search accepted the first result on a poor match; it requires a real name match now",
             "#989 — iTunes singles could file and tag under \"Unknown Artist\" when the album-artist came back empty; they fall back to the real track artist now",
             "#985 — Library Reorganize left the old, now-empty disc/album folders behind after moving files; it prunes them now, safely (never climbing to the artist or library root)",
-        ],
-    },
-    {
-        title: "Earlier in 2.8.51",
-        description: "a one-fix follow-up to 2.8.5.",
-        features: [
-            "#983 — on a fresh install, opening a watchlist artist's settings could fail with \"no such column: preferred_metadata_source\" (a restart worked around it). first-run setup was rebuilding the watchlist table from a column list that dropped two newer columns; they survive now, so it works from the first boot",
-        ],
-    },
-    {
-        title: "Earlier in 2.8.5",
-        description: "2.8.5 was a focused fix release across import, library, repair, and the webui.",
-        features: [
-            "#979 — Import & Stats loaded as a black screen on some setups (mostly Windows, where the OS served the app's JS bundle with the wrong MIME type and the browser refused it). we force the correct type now, so they load for everyone",
-            "#980 — iTunes singles were landing in \"Unknown Artist\" with no album tag; a single's album is its own title now, so they file and tag correctly",
-            "#981 — $disc/$discnum stamped a \"01-\" prefix on single-disc albums; they're smart now like $cdnum (empty on single-disc, shown only for real multi-disc), for both import and rename/reorganize",
-            "#976 — cleanup never deletes a folder you've set as a root, and self-heals a missing staging/import folder if a sweep removed it",
-            "#978 — repair \"Fix All\" now works for libraries outside the transfer path and stops pulling media-server files into transfer; #977 — discography backfill only touches artists you own",
         ],
     },
     {

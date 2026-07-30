@@ -49,6 +49,19 @@ function syncAcoustidRequireVerifiedVisibility() {
 }
 window.syncAcoustidRequireVerifiedVisibility = syncAcoustidRequireVerifiedVisibility;
 
+// #923: "Prefer explicit versions" only makes sense while explicit content is
+// allowed at all — grey the sub-checkbox out (keeping its saved value) when
+// the parent filter is off. Called on settings load + the parent's onchange.
+function syncPreferExplicitState() {
+    const parent = document.getElementById('allow-explicit');
+    const child = document.getElementById('prefer-explicit');
+    if (!parent || !child) return;
+    child.disabled = !parent.checked;
+    const label = child.closest('.checkbox-label');
+    if (label) label.style.opacity = parent.checked ? '' : '0.45';
+}
+window.syncPreferExplicitState = syncPreferExplicitState;
+
 // Retry Logic: the two numeric rows are only meaningful when their parent toggle
 // is on — hide them otherwise. "Retries per query" needs Exhaustive retry;
 // "Minimum matching mismatches" needs the version-mismatch fallback.
@@ -70,6 +83,12 @@ function debouncedAutoSaveSettings() {
     // fields on load — those aren't user edits and must not trigger a full
     // save (which re-initializes every backend service client).
     if (window._suppressSettingsAutoSave) return;
+    // ISOLATION: the video side reuses this shared settings page, so editing a
+    // VIDEO field (TMDB key, region, autoplay…) would otherwise fire this MUSIC
+    // auto-save — which reads the server toggle from the DOM and would persist
+    // active_media_server, letting the video side change the music server. Video
+    // settings save themselves via /api/video/*; never auto-save music here.
+    if (document.body.getAttribute('data-side') === 'video') return;
     // #879: never auto-save while the last settings load failed — the form is
     // showing defaults, not the real config, so saving would wipe it.
     if (window._settingsLoadFailed) return;
@@ -806,15 +825,15 @@ function toggleAllServiceAccordions(btn) {
 
 // ── Hybrid source priority list (drag-and-drop) ──
 const HYBRID_SOURCES = [
-    { id: 'soulseek', name: 'Soulseek', icon: 'https://raw.githubusercontent.com/slskd/slskd/master/docs/icon.png', emoji: '🎵' },
-    { id: 'youtube', name: 'YouTube', icon: 'https://www.svgrepo.com/show/13671/youtube.svg', emoji: '▶️' },
-    { id: 'tidal', name: 'Tidal', icon: 'https://www.svgrepo.com/show/519734/tidal.svg', emoji: '🌊' },
-    { id: 'qobuz', name: 'Qobuz', icon: 'https://www.svgrepo.com/show/504778/qobuz.svg', emoji: '🎧' },
+    { id: 'soulseek', name: 'Soulseek', icon: '/static/img/brands/slskd.png', emoji: '🎵' },
+    { id: 'youtube', name: 'YouTube', icon: '/static/img/brands/youtube.svg', emoji: '▶️' },
+    { id: 'tidal', name: 'Tidal', icon: '/static/img/brands/tidal.svg', emoji: '🌊' },
+    { id: 'qobuz', name: 'Qobuz', icon: '/static/img/brands/qobuz.svg', emoji: '🎧' },
     { id: 'hifi', name: 'HiFi', icon: null, emoji: '🎶' },
-    { id: 'deezer_dl', name: 'Deezer', icon: 'https://www.svgrepo.com/show/519734/deezer.svg', emoji: '🎧' },
+    { id: 'deezer_dl', name: 'Deezer', icon: '/static/img/brands/deezer.png', emoji: '🎧' },
     { id: 'amazon', name: 'Amazon Music', icon: null, emoji: '🛒' },
     { id: 'lidarr', name: 'Lidarr', icon: null, emoji: '📦' },
-    { id: 'soundcloud', name: 'SoundCloud', icon: 'https://www.svgrepo.com/show/452219/soundcloud.svg', emoji: '☁️' },
+    { id: 'soundcloud', name: 'SoundCloud', icon: '/static/img/brands/soundcloud.png', emoji: '☁️' },
     { id: 'torrent', name: 'Torrent', icon: null, emoji: '🧲' },
     { id: 'usenet', name: 'Usenet', icon: null, emoji: '📰' },
 ];
@@ -822,6 +841,9 @@ const ALBUM_LEVEL_HYBRID_SOURCES = new Set(['soulseek', 'torrent', 'usenet']);
 
 let _hybridSourceOrder = ['soulseek', 'youtube'];
 let _hybridSourceEnabled = { soulseek: true, youtube: true, tidal: false, qobuz: false, hifi: false, deezer_dl: false, amazon: false, lidarr: false, soundcloud: false, torrent: false, usenet: false };
+// Enabled-but-not-fully-configured sources (per the server's status):
+// shown with a "needs setup" chip instead of being silently unchecked.
+let _hybridSourceUnready = {};
 let _hybridVisualOrder = null; // Full visual order including disabled sources
 // In hybrid mode, only one source's config panel is shown at a time (clicked
 // open from its row), so the long per-source config blocks don't all stack up.
@@ -973,6 +995,16 @@ function buildHybridSourceList() {
             ? 'This first source can download a whole album release before per-track fallback.'
             : 'This source runs as per-track fallback in the current hybrid order.';
         const sourceLevelBadge = `<span class="hybrid-source-badge hybrid-source-badge-${sourceLevelClass}" title="${sourceLevelTitle}">${sourceLevel}</span>`;
+        // Enabled but the server says it can't run yet (e.g. usenet/torrent
+        // need Prowlarr AND a download client). Stays enabled — downloads
+        // skip unready sources — but the row says why it won't fire.
+        const unreadyHints = {
+            usenet: 'Usenet needs Prowlarr (indexers) AND a usenet client (e.g. SABnzbd) configured. Downloads skip this source until both are set up — click ⚙ to finish.',
+            torrent: 'Torrents need Prowlarr (indexers) AND a torrent client configured. Downloads skip this source until both are set up — click ⚙ to finish.',
+        };
+        const unreadyBadge = (enabled && _hybridSourceUnready[srcId])
+            ? `<span class="hybrid-source-badge hybrid-source-unready" title="${unreadyHints[srcId] || 'This source is not fully configured yet — downloads skip it until it is. Click ⚙ to configure.'}">⚠ needs setup</span>`
+            : '';
 
         const item = document.createElement('div');
         const isExpanded = enabled && _expandedHybridSource === srcId;
@@ -994,7 +1026,7 @@ function buildHybridSourceList() {
                 : `<span class="hybrid-source-icon emoji-icon">${src.emoji}</span>`
             }
             <span class="hybrid-source-name" ${clickConfig} style="${enabled ? 'cursor:pointer;' : ''}">${src.name}</span>
-            ${sourceLevelBadge}
+            ${sourceLevelBadge}${unreadyBadge}
             <span class="hybrid-source-priority">${priorityNum}</span>
             <span class="hybrid-source-status hss-${_hybridSourceStatus[srcId] || 'unknown'}" title="${({ unknown: 'Not tested yet', testing: 'Testing…', ok: 'Connected', fail: 'Connection failed', na: 'No connection test for this source' })[_hybridSourceStatus[srcId] || 'unknown']}"></span>
             ${enabled ? `<button class="hybrid-source-config-btn" ${clickConfig} title="Configure ${src.name}">⚙</button>` : ''}
@@ -1105,10 +1137,10 @@ function getHybridOrder() {
 
 // ---- Preferred album-art sources (reuses the hybrid-source-list styling) ----
 const ART_SOURCES = [
-    { id: 'caa', name: 'Cover Art Archive', icon: 'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/MusicBrainz_Logo_%282016%29.svg/500px-MusicBrainz_Logo_%282016%29.svg.png', emoji: '🎨' },
-    { id: 'deezer', name: 'Deezer', icon: 'https://cdn.brandfetch.io/idEUKgCNtu/theme/dark/symbol.svg?c=1bxid64Mup7aczewSAYMX&t=1758260798610', emoji: '🎧' },
-    { id: 'itunes', name: 'iTunes', icon: 'https://upload.wikimedia.org/wikipedia/commons/thumb/d/df/ITunes_logo.svg/960px-ITunes_logo.svg.png', emoji: '🍎' },
-    { id: 'spotify', name: 'Spotify', icon: 'https://storage.googleapis.com/pr-newsroom-wp/1/2023/05/Spotify_Primary_Logo_RGB_Green.png', emoji: '🟢' },
+    { id: 'caa', name: 'Cover Art Archive', icon: '/static/img/brands/musicbrainz.png', emoji: '🎨' },
+    { id: 'deezer', name: 'Deezer', icon: '/static/img/brands/deezer.png', emoji: '🎧' },
+    { id: 'itunes', name: 'iTunes', icon: '/static/img/brands/itunes.png', emoji: '🍎' },
+    { id: 'spotify', name: 'Spotify', icon: '/static/img/brands/spotify.png', emoji: '🟢' },
     { id: 'audiodb', name: 'TheAudioDB', icon: null, emoji: '💿' },
 ];
 let _artSourceEnabled = {};   // id -> bool
@@ -1234,16 +1266,19 @@ function loadHybridSourceOrder(settings) {
         }
     }
 
-    // Auto-disable sources that aren't configured on the server
-    let changed = false;
+    // Sources the server reports as not-fully-configured are NOT silently
+    // unchecked anymore (Fl3m: enabling Usenet "didn't save" — the save
+    // worked; THIS loader erased it on every page load, and the next save
+    // then persisted the loss). Usenet/torrent need Prowlarr on top of the
+    // download client, so a half-configured source was constantly re-disabled
+    // with zero explanation. Keep the user's saved intent and mark the row
+    // unready instead — the backend's configured_clients() already skips
+    // unready sources at download time, so an enabled toggle is harmless.
+    _hybridSourceUnready = {};
     for (const src of HYBRID_SOURCES) {
         if (_hybridSourceEnabled[src.id] && sourceStatus[src.id] === false) {
-            _hybridSourceEnabled[src.id] = false;
-            changed = true;
+            _hybridSourceUnready[src.id] = true;
         }
-    }
-    if (changed) {
-        _hybridSourceOrder = _hybridSourceOrder.filter(id => _hybridSourceEnabled[id] !== false);
     }
 
     _hybridVisualOrder = null; // Reset so buildHybridSourceList rebuilds it
@@ -1353,6 +1388,10 @@ async function loadSettingsData() {
 
         // Set active server and toggle visibility
         const activeServer = settings.active_media_server || 'plex';
+        // Remember the persisted music server so a save from the VIDEO side keeps
+        // it unchanged (the toggle there is for opening a config panel, not picking
+        // the music server).
+        window._persistedActiveServer = activeServer;
         toggleServer(activeServer);
 
         // Load Plex music libraries if Plex is the active server
@@ -1468,6 +1507,9 @@ async function loadSettingsData() {
         // Populate Download settings (right column)
         document.getElementById('download-path').value = settings.soulseek?.download_path || './downloads';
         document.getElementById('transfer-path').value = settings.soulseek?.transfer_path || './Transfer';
+        const minFree = document.getElementById('min-free-disk-gb');
+        if (minFree) minFree.value = settings.soulseek?.min_free_disk_gb ?? 5;
+        applyPathsEnvironment(settings);
         document.getElementById('staging-path').value = settings.import?.staging_path || './Staging';
         document.getElementById('music-videos-path').value = settings.library?.music_videos_path || './MusicVideos';
         document.getElementById('playlists-materialize-path').value = settings.playlists?.materialize_path || './Playlists';
@@ -1477,6 +1519,9 @@ async function loadSettingsData() {
         document.getElementById('download-source-mode').value = settings.download_source?.mode || 'soulseek';
         document.getElementById('stream-source').value = settings.download_source?.stream_source || 'youtube';
         document.getElementById('max-concurrent-downloads').value = settings.download_source?.max_concurrent || '3';
+        // #1056 — 0/blank = each source's built-in default
+        const _sst = document.getElementById('source-search-timeout');
+        if (_sst) _sst.value = settings.download_source?.source_search_timeout || '';
         loadHybridSourceOrder(settings);
         loadArtSourceOrder(settings);
         // Per-source download quality is now derived from the global Quality
@@ -1503,6 +1548,15 @@ async function loadSettingsData() {
         if (_tcPass) _tcPass.value = settings.torrent_client?.password || '';
         if (_tcCat) _tcCat.value = settings.torrent_client?.category || 'soulsync';
         if (_tcPath) _tcPath.value = settings.torrent_client?.save_path || '';
+        // Seeding goals (torrent grabs) — off (0) by default, mirrors the video side.
+        const _tcRatio = document.getElementById('music-seed-ratio');
+        const _tcHours = document.getElementById('music-seed-hours');
+        const _tcRemove = document.getElementById('music-seed-remove-data');
+        if (_tcRatio) _tcRatio.value = settings.torrent_client?.seed_ratio_goal != null ? settings.torrent_client.seed_ratio_goal : 0;
+        if (_tcHours) _tcHours.value = settings.torrent_client?.seed_time_goal_hours != null ? settings.torrent_client.seed_time_goal_hours : 0;
+        if (_tcRemove) _tcRemove.checked = settings.torrent_client?.seed_remove_data !== false;
+        const _tcSeedMode = document.getElementById('music-seed-mode');
+        if (_tcSeedMode) _tcSeedMode.value = settings.torrent_client?.seed_mode || 'soulsync';
         // Stalled-torrent knobs live under download_source but render in the
         // torrent client section. Timeout is stored in SECONDS, shown in MINUTES.
         const _tcStall = document.getElementById('torrent-stall-timeout');
@@ -1611,16 +1665,27 @@ async function loadSettingsData() {
         // Populate File Organization settings
         document.getElementById('file-organization-enabled').checked = settings.file_organization?.enabled !== false;
         document.getElementById('template-album-path').value = settings.file_organization?.templates?.album_path || '$albumartist/$albumartist - $album/$track - $title';
-        document.getElementById('template-single-path').value = settings.file_organization?.templates?.single_path || '$artist/$artist - $title/$title';
+        // $albumartist honors the Collaborative Album Artist mode; the old
+        // $artist default filed multi-artist singles under "A, B & C". A
+        // stored old-default upgrades server-side too (core/imports/paths.py).
+        {
+            const _sp = settings.file_organization?.templates?.single_path;
+            document.getElementById('template-single-path').value =
+                (!_sp || _sp === '$artist/$artist - $title/$title')
+                    ? '$albumartist/$albumartist - $title/$title' : _sp;
+        }
         document.getElementById('template-playlist-path').value = settings.file_organization?.templates?.playlist_path || '$playlist/$artist - $title';
         document.getElementById('template-playlist-item').value = settings.file_organization?.templates?.playlist_item || '';
         document.getElementById('template-video-path').value = settings.file_organization?.templates?.video_path || '$artist/$title-video';
         document.getElementById('disc-label').value = settings.file_organization?.disc_label || 'Disc';
         document.getElementById('collab-artist-mode').value = settings.file_organization?.collab_artist_mode || 'first';
+        document.getElementById('artistletter-symbol-fallback').checked = settings.file_organization?.artistletter_symbol_fallback === true;
         document.getElementById('artist-separator').value = settings.metadata_enhancement?.tags?.artist_separator || ', ';
         document.getElementById('write-multi-artist').checked = settings.metadata_enhancement?.tags?.write_multi_artist || false;
         document.getElementById('feat-in-title').checked = settings.metadata_enhancement?.tags?.feat_in_title || false;
         document.getElementById('allow-duplicate-tracks').checked = settings.wishlist?.allow_duplicate_tracks !== false;
+        const _wlTtl = document.getElementById('wishlist-ignore-ttl');
+        if (_wlTtl) _wlTtl.value = settings.wishlist?.ignore_ttl_days ?? 30;
 
         // Populate Playlist Sync settings
         document.getElementById('create-backup').checked = settings.playlist_sync?.create_backup !== false;
@@ -1656,8 +1721,14 @@ async function loadSettingsData() {
         const _musicPaths = settings.library?.music_paths || [];
         renderMusicPaths(_musicPaths);
 
+        // Library Organize: preserve the user's casing (default on)
+        const _pcEl = document.getElementById('reorganize-preserve-casing');
+        if (_pcEl) _pcEl.checked = settings.library?.reorganize_preserve_casing !== false;
+
         // Populate Content Filter settings
         document.getElementById('allow-explicit').checked = settings.content_filter?.allow_explicit !== false;
+        document.getElementById('prefer-explicit').checked = settings.content_filter?.prefer_explicit === true;
+        syncPreferExplicitState();
 
         // Populate Genre Whitelist
         const gwEnabled = settings.genre_whitelist?.enabled === true;
@@ -1679,6 +1750,8 @@ async function loadSettingsData() {
         // Populate M3U Export settings
         document.getElementById('m3u-export-enabled').checked = settings.m3u_export?.enabled === true;
         document.getElementById('m3u-entry-base-path').value = settings.m3u_export?.entry_base_path || '';
+        document.getElementById('m3u-rewrite-from').value = settings.m3u_export?.rewrite_from || '';
+        document.getElementById('m3u-rewrite-to').value = settings.m3u_export?.rewrite_to || '';
         const _libM3uEn = document.getElementById('library-m3u-enabled');
         if (_libM3uEn) _libM3uEn.checked = settings.m3u_export?.library_enabled === true;
         const _libM3uPath = document.getElementById('library-m3u-path');
@@ -2226,21 +2299,20 @@ function updateDownloadSourceUI() {
         prowlarrRedirect.style.display = showProwlarr ? 'block' : 'none';
     }
 
-    // Indexers & Downloaders section: only relevant when a torrent or usenet
-    // source is actually selected. Hide the whole intro + Prowlarr/Torrent/Usenet
-    // tiles otherwise (Soulseek/HiFi-only users never see them). The two client
-    // tiles are gated individually on their own source. Selection-based (not the
-    // hybrid expand state) — the tiles are full config sections, not accordion
-    // panels. Tab-gated so it never leaks onto another tab.
+    // Indexers & Downloaders: torrent/usenet setup (Prowlarr + the Torrent and
+    // Usenet client tiles) is shared config — keep it always reachable on the
+    // Downloads tab for BOTH the music and video sides, like the Advanced /
+    // Appearance tabs. (It used to be gated on an active torrent/usenet source,
+    // which hid it from anyone whose source was something else — and from the video
+    // side entirely, whose source lives on a separate dropdown.) Only tab-gated so
+    // it never leaks onto another tab.
     const onDownloadsTab = document.querySelector('.stg-tab.active')?.dataset.tab === 'downloads';
-    const torrentActive = activeSources.has('torrent');
-    const usenetActive = activeSources.has('usenet');
     const indSection = document.getElementById('indexers-downloaders-section');
-    if (indSection) indSection.style.display = (onDownloadsTab && (torrentActive || usenetActive)) ? '' : 'none';
+    if (indSection) indSection.style.display = onDownloadsTab ? '' : 'none';
     const torrentTile = document.getElementById('torrent-tile');
-    if (torrentTile) torrentTile.style.display = torrentActive ? '' : 'none';
+    if (torrentTile) torrentTile.style.display = '';
     const usenetTile = document.getElementById('usenet-tile');
-    if (usenetTile) usenetTile.style.display = usenetActive ? '' : 'none';
+    if (usenetTile) usenetTile.style.display = '';
 
     // Quality profile is now a GLOBAL system — the same ranked-target list
     // drives every source (Soulseek, Tidal, Qobuz, HiFi, Deezer, …), so it is
@@ -2791,6 +2863,22 @@ async function saveQualityProfile() {
 let _qpAutoImportProfileId = null; // cached so re-renders don't re-fetch
 let _qpProfileRows = [];
 
+/**
+ * Set the Settings-page profile cache AND drop the app-wide one.
+ *
+ * Every acquisition/playlist Quality Profile dropdown reads a module-level
+ * cache in shared-helpers.js that used to live for the whole page. Creating,
+ * renaming or deleting a profile here therefore left every other selector
+ * offering a stale list — a deleted id came back as a 400 and a new profile
+ * stayed invisible until a full reload (R2-11).
+ */
+function _qpSetProfileRows(rows) {
+    _qpProfileRows = rows || [];
+    if (typeof invalidatePlaylistQualityProfiles === 'function') {
+        invalidatePlaylistQualityProfiles();
+    }
+}
+
 function normalizeQualityProfileId(profileId) {
     if (profileId === null || profileId === undefined || profileId === '' || profileId === 0 || profileId === '0') {
         return null;
@@ -2811,7 +2899,7 @@ async function loadCustomQualityProfiles() {
             _qpAutoImportProfileId = normalizeQualityProfileId(aiData.quality_profile_id);
         }
         if (data.success) {
-            _qpProfileRows = data.profiles || [];
+            _qpSetProfileRows(data.profiles);
             renderCustomQualityProfiles(_qpProfileRows);
         }
     } catch (error) {
@@ -3021,7 +3109,7 @@ function qpStartRename(row, profile) {
             });
             const data = await response.json();
             if (data.success) {
-                _qpProfileRows = data.profiles || []; // keep the cache in sync — see saveCurrentAsQualityProfile
+                _qpSetProfileRows(data.profiles); // keep both caches in sync — see saveCurrentAsQualityProfile
                 renderCustomQualityProfiles(_qpProfileRows);
                 renderQualityProfileManager();
                 showToast(`Renamed to '${newName}'`, 'success');
@@ -3151,7 +3239,7 @@ async function saveCurrentAsQualityProfile(name) {
             // seeing the list from before this profile existed, which is
             // exactly what made a freshly created profile look like it
             // "vanished" / previewed as an unresolvable "this profile".
-            _qpProfileRows = data.profiles || [];
+            _qpSetProfileRows(data.profiles);
             // The tiles already show exactly what was just saved — treat the
             // new profile as the one now being previewed, same as clicking
             // its row would.
@@ -3191,7 +3279,7 @@ async function updateCustomQualityProfile(profileId, name) {
         });
         const data = await response.json();
         if (data.success) {
-            _qpProfileRows = data.profiles || []; // keep the cache in sync — see saveCurrentAsQualityProfile
+            _qpSetProfileRows(data.profiles); // keep both caches in sync — see saveCurrentAsQualityProfile
             renderCustomQualityProfiles(_qpProfileRows);
             renderQualityProfileManager();
             showToast(`Updated '${name}'`, 'success');
@@ -4222,6 +4310,14 @@ async function saveSettings(quiet = false) {
     } else if (document.getElementById('soulsync-toggle')?.classList.contains('active')) {
         activeServer = 'soulsync';
     }
+    // ISOLATION: this page is reused on the video side. Connection details (Plex/
+    // Jellyfin creds) ARE shared and save fine — but the video side must NEVER
+    // change the MUSIC active server. So when saving from the video side, keep
+    // active_media_server exactly as it was persisted (the toggle there only opens
+    // a config panel; it does not pick the music server).
+    if (document.body.getAttribute('data-side') === 'video' && window._persistedActiveServer) {
+        activeServer = window._persistedActiveServer;
+    }
 
     const metadataSourceSelect = document.getElementById('metadata-fallback-source');
     const discogsTokenInput = document.getElementById('discogs-token');
@@ -4305,6 +4401,7 @@ async function saveSettings(quiet = false) {
             api_key: document.getElementById('soulseek-api-key').value,
             download_path: document.getElementById('download-path').value,
             transfer_path: document.getElementById('transfer-path').value,
+            min_free_disk_gb: Math.max(0, parseFloat(document.getElementById('min-free-disk-gb')?.value) || 0),
             search_timeout: parseInt(document.getElementById('soulseek-search-timeout').value) || 60,
             search_timeout_buffer: parseInt(document.getElementById('soulseek-search-timeout-buffer').value) || 15,
             search_min_delay_seconds: parseInt(document.getElementById('soulseek-search-min-delay-seconds').value) || 0,
@@ -4368,6 +4465,8 @@ async function saveSettings(quiet = false) {
             hybrid_order: getHybridOrder(),
             stream_source: document.getElementById('stream-source').value,
             max_concurrent: parseInt(document.getElementById('max-concurrent-downloads').value) || 3,
+            // #1056 — streaming-source search timeout override; 0 = source defaults
+            source_search_timeout: parseInt(document.getElementById('source-search-timeout')?.value) || 0,
             // Stalled-torrent knobs (rendered in the torrent client section).
             // UI is in MINUTES; stored in SECONDS. Blank/NaN → 10 min default;
             // 0 stays 0 (disabled).
@@ -4413,6 +4512,10 @@ async function saveSettings(quiet = false) {
             password: document.getElementById('torrent-client-password')?.value || '',
             category: document.getElementById('torrent-client-category')?.value || 'soulsync',
             save_path: document.getElementById('torrent-client-save-path')?.value || '',
+            seed_ratio_goal: parseFloat(document.getElementById('music-seed-ratio')?.value) || 0,
+            seed_time_goal_hours: parseInt(document.getElementById('music-seed-hours')?.value, 10) || 0,
+            seed_remove_data: !!(document.getElementById('music-seed-remove-data') || {}).checked,
+            seed_mode: document.getElementById('music-seed-mode')?.value || 'soulsync',
         },
         usenet_client: {
             type: document.getElementById('usenet-client-type')?.value || 'sabnzbd',
@@ -4469,6 +4572,7 @@ async function saveSettings(quiet = false) {
             enabled: document.getElementById('file-organization-enabled').checked,
             disc_label: document.getElementById('disc-label').value,
             collab_artist_mode: document.getElementById('collab-artist-mode').value,
+            artistletter_symbol_fallback: document.getElementById('artistletter-symbol-fallback').checked,
             templates: {
                 album_path: document.getElementById('template-album-path').value,
                 single_path: document.getElementById('template-single-path').value,
@@ -4478,14 +4582,17 @@ async function saveSettings(quiet = false) {
             }
         },
         wishlist: {
-            allow_duplicate_tracks: document.getElementById('allow-duplicate-tracks').checked
+            allow_duplicate_tracks: document.getElementById('allow-duplicate-tracks').checked,
+            ignore_ttl_days: Math.max(1, Math.min(365,
+                parseInt(document.getElementById('wishlist-ignore-ttl')?.value, 10) || 30)),
         },
         playlist_sync: {
             create_backup: document.getElementById('create-backup').checked,
             mode: document.getElementById('playlist-sync-mode')?.value || 'replace'
         },
         content_filter: {
-            allow_explicit: document.getElementById('allow-explicit').checked
+            allow_explicit: document.getElementById('allow-explicit').checked,
+            prefer_explicit: document.getElementById('prefer-explicit').checked
         },
         genre_whitelist: {
             enabled: document.getElementById('genre-whitelist-enabled').checked,
@@ -4503,7 +4610,8 @@ async function saveSettings(quiet = false) {
         },
         library: {
             music_paths: collectMusicPaths(),
-            music_videos_path: document.getElementById('music-videos-path').value || './MusicVideos'
+            music_videos_path: document.getElementById('music-videos-path').value || './MusicVideos',
+            reorganize_preserve_casing: document.getElementById('reorganize-preserve-casing')?.checked !== false
         },
         import: {
             replace_lower_quality: document.getElementById('import-replace-lower-quality').checked,
@@ -4540,6 +4648,8 @@ async function saveSettings(quiet = false) {
         m3u_export: {
             enabled: document.getElementById('m3u-export-enabled').checked,
             entry_base_path: document.getElementById('m3u-entry-base-path').value || '',
+            rewrite_from: document.getElementById('m3u-rewrite-from').value || '',
+            rewrite_to: document.getElementById('m3u-rewrite-to').value || '',
             library_enabled: document.getElementById('library-m3u-enabled')?.checked === true,
             library_path: document.getElementById('library-m3u-path')?.value || ''
         },
@@ -6079,6 +6189,24 @@ const PATH_INPUT_IDS = {
     'playlists-materialize': 'playlists-materialize-path',
     'm3u-entry-base': 'm3u-entry-base-path'
 };
+
+// Deployment-aware folder-paths guidance (+ the fresh-install disk landmine).
+// Docker installs must NOT touch the container paths; bare-metal/LXC installs
+// MUST edit them. A non-Docker install still on the ./Transfer default is
+// silently filling the install disk (a Proxmox LXC root is typically 8GB and
+// hangs when full — reported live on Discord), so that state warns loudly.
+function applyPathsEnvironment(settings) {
+    const docker = !!(settings._environment && settings._environment.docker);
+    document.querySelectorAll('[data-paths-guide]').forEach(el => {
+        el.classList.toggle('hidden', (el.getAttribute('data-paths-guide') === 'docker') !== docker);
+    });
+    const warn = document.querySelector('[data-paths-default-warning]');
+    if (warn) {
+        const out = (settings.soulseek?.transfer_path || './Transfer').trim();
+        const isDefault = out === '' || out === '.' || out.startsWith('./') || out.startsWith('.\\');
+        warn.classList.toggle('hidden', docker || !isDefault);
+    }
+}
 
 function togglePathLock(pathType, btn) {
     const input = document.getElementById(PATH_INPUT_IDS[pathType]);

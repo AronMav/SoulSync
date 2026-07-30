@@ -2,12 +2,12 @@ import { createMemoryHistory } from '@tanstack/react-router';
 import { render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createAppQueryClient } from '@/app/query-client';
 import { AppRouterProvider, createAppRouter } from '@/app/router';
+import { createTestQueryClient } from '@/test/query-client';
 import { createShellBridge } from '@/test/shell-bridge';
 
 function renderArtistDetailRoute(initialEntries = ['/artist-detail/library/42']) {
-  const queryClient = createAppQueryClient();
+  const queryClient = createTestQueryClient();
   const history = createMemoryHistory({ initialEntries });
   const router = createAppRouter({ history, queryClient });
 
@@ -35,6 +35,24 @@ describe('artist-detail route', () => {
         '2YZyLoL8N0Wb9xBt1NhZWg',
         '',
         'spotify',
+        {
+          skipRouteChange: true,
+        },
+      );
+    });
+  });
+
+  it('survives an all-digits artist name (311) in ?name=', async () => {
+    // TanStack's search parser JSON-parses param values, so name=311 arrives
+    // as a NUMBER. A bare z.string() schema threw SearchParamError, the route
+    // died in its error boundary, and clicking the artist "did nothing".
+    renderArtistDetailRoute(['/artist-detail/deezer/2481?name=311']);
+
+    await waitFor(() => {
+      expect(window.SoulSyncWebShellBridge?.navigateToArtistDetail).toHaveBeenCalledWith(
+        '2481',
+        '311',
+        'deezer',
         {
           skipRouteChange: true,
         },

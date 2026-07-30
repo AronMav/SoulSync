@@ -412,6 +412,10 @@ function initializeWebSocket() {
         if (currentProfile) {
             socket.emit('profile:join', { profile_id: currentProfile.id });
         }
+        // Re-subscribe the Server Activity drawer if it's live (survives reconnects)
+        if (window.ServerActivity && window.ServerActivity._wantsLive && window.ServerActivity._wantsLive()) {
+            socket.emit('activity:subscribe');
+        }
     });
 
     socket.on('disconnect', (reason) => {
@@ -443,6 +447,18 @@ function initializeWebSocket() {
     socket.on('watchlist:count', handleWatchlistCountUpdate);
     socket.on('downloads:batch_update', handleDownloadBatchUpdate);
 
+    // Soulseek chat push (badges + PM toasts live in chat.js; guard: the
+    // module owns all chat state, core.js only routes the events)
+    socket.on('chat:room_message', function (d) {
+        if (window.ChatPage && ChatPage.onRoomMessages) ChatPage.onRoomMessages(d);
+    });
+    socket.on('chat:unread', function (d) {
+        if (window.ChatPage && ChatPage.onUnread) ChatPage.onUnread(d);
+    });
+    socket.on('chat:room_protocol', function (d) {
+        if (window.ChatPage && ChatPage.onRoomProtocol) ChatPage.onRoomProtocol(d);
+    });
+
     // Phase 2 event listeners (dashboard pollers)
     socket.on('rate-monitor:update', _handleRateMonitorUpdate);
     socket.on('dashboard:stats', handleDashboardStats);
@@ -471,6 +487,17 @@ function initializeWebSocket() {
     socket.on('enrichment:soulid', (data) => updateSoulIDStatusFromData(data));
     socket.on('enrichment:listening-stats', () => { }); // Status only, no UI update needed
     socket.on('repair:progress', (data) => { qaSignal('tools'); updateRepairJobProgressFromData(data); });
+    // Server Activity live push — feed the open drawer (Tautulli replacement)
+    socket.on('activity:update', (data) => {
+        if (window.ServerActivity && window.ServerActivity._onSocket) window.ServerActivity._onSocket(data);
+    });
+    // Bridge so server-activity.js can join/leave the live room without owning the
+    // socket. isConnected() lets it fall back to HTTP polling when there's no WS.
+    window.SoulSyncActivitySocket = {
+        subscribe: () => { if (socket && socketConnected) socket.emit('activity:subscribe'); },
+        unsubscribe: () => { if (socket && socketConnected) socket.emit('activity:unsubscribe'); },
+        isConnected: () => !!socketConnected
+    };
 
     // Forward enrichment status to the dashboard worker-orbs so the hub fires
     // a pulse on each real item matched / error (additional listener — does not
@@ -512,6 +539,11 @@ function initializeWebSocket() {
     socket.on('wishlist:stats', (data) => updateWishlistStatsFromData(data));
     // Phase 6: Automation progress
     socket.on('automation:progress', (data) => { qaSignal('auto'); updateAutomationProgressFromData(data); });
+    socket.on('overlay:progress', (data) => { if (typeof updateOverlayTask === 'function') updateOverlayTask(data); });
+    socket.on('collections:sync', (data) => { if (typeof updateCollectionSyncTask === 'function') updateCollectionSyncTask(data); });
+    socket.on('collections:artwork', (data) => { if (typeof updateCollectionArtTask === 'function') updateCollectionArtTask(data); });
+    socket.on('video:bulk', (data) => { if (typeof updateVideoBulkTask === 'function') updateVideoBulkTask(data); });
+    socket.on('video:repair:progress', (data) => { if (typeof updateVideoRepairProgressFromData === 'function') updateVideoRepairProgressFromData(data); });
 }
 
 // ── Quick Actions tiles: animation == gauge ──
@@ -593,9 +625,27 @@ function handleServiceStatusUpdate(data) {
     if (data.enrichment) renderEnrichmentCards(data.enrichment);
 
     // Spotify rate limit / cooldown / recovery
-    if (data.spotify?.rate_limited && data.spotify.rate_limit) {
+    //
+    // Only worth interrupting someone when the official API is actually
+    // serving their metadata. On Deezer (or any other source) a ban changes
+    // nothing they can see, so the modal announced that search and enrichment
+    // were paused when neither was — pure noise.
+    //
+    // Gate on the SOURCE, not on `authenticated`: during a ban the client
+    // deliberately reports authenticated=true (it means "you are connected,
+    // just throttled"), so an auth check would never suppress anything.
+    //
+    // The ban itself is untouched — it still suppresses calls and still
+    // protects against hammering. This only stops it interrupting people it
+    // does not apply to.
+    const _spotifyMattersHere = (data.metadata_source?.source || 'spotify') === 'spotify';
+    if (data.spotify?.rate_limited && data.spotify.rate_limit && _spotifyMattersHere) {
         handleSpotifyRateLimit(data.spotify.rate_limit);
         _spotifyInCooldown = false;
+    } else if (data.spotify?.rate_limited && !_spotifyMattersHere) {
+        // Banned but irrelevant to this install — make sure a modal raised
+        // before the account went away does not linger.
+        if (_spotifyRateLimitShown) { _spotifyRateLimitShown = false; closeRateLimitModal(); }
     } else if (data.spotify?.post_ban_cooldown > 0) {
         if (_spotifyRateLimitShown && !_spotifyInCooldown) {
             _spotifyRateLimitShown = false;
@@ -746,17 +796,17 @@ function handleDashboardWishlistCount(data) {
 // ===============================
 
 // --- Service Integration Logo Constants ---
-const MUSICBRAINZ_LOGO_URL = 'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/MusicBrainz_Logo_%282016%29.svg/500px-MusicBrainz_Logo_%282016%29.svg.png';
-const DEEZER_LOGO_URL = 'https://cdn.brandfetch.io/idEUKgCNtu/theme/dark/symbol.svg?c=1bxid64Mup7aczewSAYMX&t=1758260798610';
-const SPOTIFY_LOGO_URL = 'https://storage.googleapis.com/pr-newsroom-wp/1/2023/05/Spotify_Primary_Logo_RGB_Green.png';
-const ITUNES_LOGO_URL = 'https://upload.wikimedia.org/wikipedia/commons/thumb/d/df/ITunes_logo.svg/960px-ITunes_logo.svg.png';
-const LASTFM_LOGO_URL = 'https://www.last.fm/static/images/lastfm_avatar_twitter.52a5d69a85ac.png';
-const GENIUS_LOGO_URL = 'https://images.genius.com/8ed669cadd956443e29c70361ec4f372.1000x1000x1.png';
-const TIDAL_LOGO_URL = 'https://www.svgrepo.com/show/519734/tidal.svg';
-const QOBUZ_LOGO_URL = 'https://www.svgrepo.com/show/504778/qobuz.svg';
-const DISCOGS_LOGO_URL = 'https://www.svgrepo.com/show/305957/discogs.svg';
+const MUSICBRAINZ_LOGO_URL = '/static/img/brands/musicbrainz.png';
+const DEEZER_LOGO_URL = '/static/img/brands/deezer.png';
+const SPOTIFY_LOGO_URL = '/static/img/brands/spotify.png';
+const ITUNES_LOGO_URL = '/static/img/brands/itunes.png';
+const LASTFM_LOGO_URL = '/static/img/brands/lastfm.png';
+const GENIUS_LOGO_URL = '/static/img/brands/genius.png';
+const TIDAL_LOGO_URL = '/static/img/brands/tidal.svg';
+const QOBUZ_LOGO_URL = '/static/img/brands/qobuz.svg';
+const DISCOGS_LOGO_URL = '/static/img/brands/discogs.svg';
 const AMAZON_LOGO_URL = '/static/amazon.svg';
-const BANDCAMP_LOGO_URL = 'https://upload.wikimedia.org/wikipedia/commons/9/90/Bandcamp-polygon-aqua.svg';
+const BANDCAMP_LOGO_URL = '/static/img/brands/bandcamp.svg';
 function getAudioDBLogoURL() { const el = document.querySelector('img.audiodb-logo'); return el ? el.src : null; }
 
 // --- Wishlist Modal Persistence State Management ---

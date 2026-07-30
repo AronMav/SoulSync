@@ -179,6 +179,19 @@ class RepairWorker:
         self._force_run_queue: List[str] = []
         self._force_run_lock = threading.Lock()
 
+        # Automation-engine emit hook (set by web_server to engine.emit).
+        # Fire-and-forget: repair events power the 'Maintenance Finding
+        # Raised' / 'Maintenance Scan Done' music triggers, same as the
+        # video repair worker's publish() bridge. None = no engine, no-op.
+        self._event_emit = None
+
+        # Background bulk fix ("Fix All" at library scale runs on its own
+        # thread so the HTTP request that starts it returns immediately)
+        self._bulk_fix_thread = None
+        self._bulk_fix_lock = threading.Lock()
+        self._bulk_fix_stop_event = threading.Event()
+        self._bulk_fix_state: Dict[str, Any] = {'running': False}
+
         # Config manager (set externally after init)
         self._config_manager = None
 
@@ -451,6 +464,7 @@ class RepairWorker:
         self.should_stop = True
         self.running = False
         self._stop_event.set()
+        self._bulk_fix_stop_event.set()  # halt a background Fix All too
         if self.thread:
             self.thread.join(timeout=2)
         logger.info("Repair worker stopped")
@@ -755,6 +769,18 @@ class RepairWorker:
         # Record job completion
         self._record_job_finish(run_id, job_id, result, duration)
 
+        _emit = getattr(self, '_event_emit', None)
+        if _emit:
+            try:      # 'Maintenance Scan Done' automation trigger
+                _emit('music_repair_scan_completed', {
+                    'job_id': job_id, 'job_name': job.display_name,
+                    'status': 'error' if result.errors > 0 and result.auto_fixed == 0 else 'finished',
+                    'scanned': result.scanned,
+                    'findings_created': result.findings_created,
+                    'errors': result.errors})
+            except Exception:   # noqa: BLE001 - events never disturb the scan
+                logger.debug("repair scan event emit failed", exc_info=True)
+
         # Notify rich progress system of completion
         if self._on_job_finish:
             try:
@@ -854,6 +880,16 @@ class RepairWorker:
                 json.dumps(details) if details else '{}'
             ))
             conn.commit()
+            # getattr, not attribute access: tests build workers via __new__
+            # (no __init__), and the emit must NEVER break a finding write.
+            _emit = getattr(self, '_event_emit', None)
+            if _emit:
+                try:      # 'Maintenance Finding Raised' automation trigger
+                    _emit('music_repair_finding_created', {
+                        'job_id': job_id, 'finding_type': finding_type,
+                        'severity': severity or 'info', 'title': title or ''})
+                except Exception:   # noqa: BLE001 - events never disturb the scan
+                    logger.debug("repair finding event emit failed", exc_info=True)
             return True
         except Exception as e:
             logger.debug("Error creating finding: %s", e)
@@ -1000,16 +1036,22 @@ class RepairWorker:
             if conn:
                 conn.close()
 
-    def _execute_fix(self, finding_type: str, entity_type: str, entity_id: str,
-                     file_path: str, details: dict) -> dict:
-        """Route a fix to the correct handler based on finding_type."""
-        handlers = {
+    def _fix_handlers(self) -> dict:
+        """Single source of truth for finding_type → fix handler.
+
+        ``bulk_fix_findings`` derives its fixable-type set from these keys —
+        it used to keep a second hardcoded tuple that silently fell behind
+        (genre_cleanup / replaygain_retag findings matched Fix All's count
+        but were skipped by the fix loop, so "Fixed 0 of N").
+        """
+        return {
             'dead_file': self._fix_dead_file,
             'orphan_file': self._fix_orphan_file,
             'track_number_mismatch': self._fix_track_number,
             'missing_cover_art': self._fix_missing_cover_art,
             'missing_lyrics': self._fix_missing_lyrics,
             'missing_replaygain': self._fix_missing_replaygain,
+            'replaygain_retag': self._fix_missing_replaygain,   # #1060 — same analyze+write
             'empty_folder': self._fix_empty_folder,
             'expired_download': self._fix_expired_download,
             'metadata_gap': self._fix_metadata_gap,
@@ -1029,11 +1071,241 @@ class RepairWorker:
             'library_retag': self._fix_library_retag,
             'short_preview_track': self._fix_short_preview_track,
             'corrupt_audio': self._fix_corrupt_audio,
+            'canonical_version': self._fix_canonical_version,
+            'genre_cleanup': self._fix_genre_cleanup,
+            'comma_artist_split': self._fix_comma_artist_split,
         }
-        handler = handlers.get(finding_type)
+
+    def _execute_fix(self, finding_type: str, entity_type: str, entity_id: str,
+                     file_path: str, details: dict) -> dict:
+        """Route a fix to the correct handler based on finding_type."""
+        handler = self._fix_handlers().get(finding_type)
         if not handler:
             return {'success': False, 'error': f'No fix available for finding type: {finding_type}'}
         return handler(entity_type, entity_id, file_path, details)
+
+    def _fix_genre_cleanup(self, entity_type, entity_id, file_path, details):
+        """#1057 — rewrite a stored genre list to only its whitelisted genres.
+
+        Removal-only: stores exactly the ``kept_genres`` the finding showed the
+        user; never invents or substitutes. An all-off-whitelist entity ends up
+        with NULL (no genres) — strict means strict, and the finding said so."""
+        kept = details.get('kept_genres')
+        if not isinstance(kept, list):
+            return {'success': False, 'error': 'Finding has no kept_genres list'}
+        table = {'artist': 'artists', 'album': 'albums'}.get(entity_type)
+        if table is None:
+            return {'success': False, 'error': f'Unsupported entity type: {entity_type}'}
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            value = json.dumps(kept) if kept else None
+            cursor.execute(f"UPDATE {table} SET genres = ? WHERE id = ?", (value, entity_id))  # noqa: S608 - table from fixed map
+            if cursor.rowcount == 0:
+                conn.commit()
+                return {'success': False, 'error': f'{entity_type} {entity_id} no longer exists'}
+            conn.commit()
+            removed = details.get('removed_genres') or []
+            logger.info("Genre cleanup: %s %s — removed %d off-whitelist genre(s)",
+                        entity_type, entity_id, len(removed))
+            return {'success': True, 'action': 'genres_cleaned'}
+        except Exception as e:
+            logger.error("Genre cleanup fix failed for %s %s: %s", entity_type, entity_id, e)
+            return {'success': False, 'error': str(e)}
+        finally:
+            if conn:
+                conn.close()
+
+    def _fix_comma_artist_split(self, entity_type, entity_id, file_path, details):
+        """Split a comma-joined artist tag into properly separated artists (jadux).
+
+        Re-tags every file still under the combined artist: display artist
+        becomes "A; B", the per-artist list goes into the multi-value Artists
+        tag (same frames as issue #587's writer — TXXX:Artists for ID3,
+        `artists` for Vorbis, a real list for MP4), and an album-artist equal
+        to the combined string becomes the primary artist. The list is written
+        unconditionally — the user explicitly approved this split, so the
+        global write_multi_artist opt-in doesn't gate it.
+
+        Stale-finding guard: a file whose CURRENT artist tag no longer matches
+        the combined string (user edited it, or it's already split) is left
+        untouched. The file list comes fresh from the DB, not from the
+        finding's display-capped sample.
+        """
+        parts = details.get('split_artists')
+        combined = details.get('combined_name') or details.get('artist_name')
+        if not isinstance(parts, list) or len(parts) < 2 or not combined:
+            return {'success': False, 'error': 'Finding has no split_artists list'}
+        parts = [str(p).strip() for p in parts if str(p).strip()]
+        if len(parts) < 2:
+            return {'success': False, 'error': 'Finding has no split_artists list'}
+        display = details.get('new_display_artist') or '; '.join(parts)
+        primary = details.get('primary_artist') or parts[0]
+
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT file_path FROM tracks WHERE artist_id = ? "
+                "AND file_path IS NOT NULL AND file_path != ''", (entity_id,))
+            files = [r[0] for r in cursor.fetchall()]
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+        finally:
+            if conn:
+                conn.close()
+        if not files:
+            return {'success': True, 'action': 'already_gone',
+                    'message': 'No files under this artist anymore'}
+
+        from mutagen import File as MutagenFile
+        from mutagen.id3 import ID3, TPE1, TPE2, TXXX
+        from mutagen.mp4 import MP4
+        from core.library.path_resolver import resolve_library_file_path
+        from core.metadata.common import save_audio_file, get_mutagen_symbols
+
+        def _norm(v):
+            return ' '.join(str(v or '').casefold().split())
+
+        def _single_value(raw):
+            """Current tag value IF it is a single string; None for multi-value
+            (already split) or missing."""
+            if raw is None:
+                return None
+            if isinstance(raw, (list, tuple)):
+                if len(raw) != 1:
+                    return None
+                raw = raw[0]
+            return str(raw)
+
+        combined_norm = _norm(combined)
+        fixed = stale = missing = errors = 0
+
+        for fp in files:
+            resolved = resolve_library_file_path(
+                fp, transfer_folder=self.transfer_folder,
+                config_manager=self._config_manager)
+            if not resolved or not os.path.exists(resolved):
+                missing += 1
+                continue
+            try:
+                audio = MutagenFile(resolved)
+                if audio is None:
+                    errors += 1
+                    continue
+                if audio.tags is None:
+                    audio.add_tags()
+
+                changed = False
+                if isinstance(audio.tags, ID3):
+                    tpe1 = audio.tags.get('TPE1')
+                    current = _single_value(tpe1.text if tpe1 else None)
+                    if current is None or _norm(current) != combined_norm:
+                        stale += 1
+                        continue
+                    audio.tags.delall('TPE1')
+                    audio.tags.add(TPE1(encoding=3, text=[display]))
+                    audio.tags.delall('TXXX:Artists')
+                    audio.tags.add(TXXX(encoding=3, desc='Artists', text=list(parts)))
+                    tpe2 = audio.tags.get('TPE2')
+                    if tpe2 and _norm(_single_value(tpe2.text)) == combined_norm:
+                        audio.tags.delall('TPE2')
+                        audio.tags.add(TPE2(encoding=3, text=[primary]))
+                    changed = True
+                elif isinstance(audio, MP4):
+                    current = _single_value(audio.tags.get('\xa9ART'))
+                    if current is None or _norm(current) != combined_norm:
+                        stale += 1
+                        continue
+                    # MP4 artist carries the list directly (#587 convention).
+                    audio.tags['\xa9ART'] = list(parts)
+                    if _norm(_single_value(audio.tags.get('aART'))) == combined_norm:
+                        audio.tags['aART'] = [primary]
+                    changed = True
+                elif hasattr(audio, 'get'):  # Vorbis family (FLAC/Ogg/Opus)
+                    current = _single_value(audio.get('artist'))
+                    if current is None or _norm(current) != combined_norm:
+                        stale += 1
+                        continue
+                    audio['artist'] = [display]
+                    audio['artists'] = list(parts)
+                    if _norm(_single_value(audio.get('albumartist'))) == combined_norm:
+                        audio['albumartist'] = [primary]
+                    changed = True
+                else:
+                    errors += 1
+                    continue
+
+                if changed:
+                    # Atomic + audio-integrity-verified save (#819/#1000).
+                    save_audio_file(audio, get_mutagen_symbols())
+                    fixed += 1
+            except Exception as e:
+                logger.error("Comma-artist split failed for %s: %s", resolved, e)
+                errors += 1
+
+        if fixed > 0:
+            msg = f'Re-tagged {fixed} file(s) as "{display}"'
+            extras = []
+            if stale:
+                extras.append(f'{stale} skipped (tag changed since scan)')
+            if missing:
+                extras.append(f'{missing} not found on disk')
+            if errors:
+                extras.append(f'{errors} failed')
+            if extras:
+                msg += f' ({", ".join(extras)})'
+            logger.info("Comma-artist split: %s → %s — %s", combined, parts, msg)
+            return {'success': True, 'action': 'artists_split', 'message': msg}
+        if stale and not errors and not missing:
+            return {'success': False,
+                    'error': f'All {stale} file(s) no longer carry "{combined}" — '
+                             f'tags changed since the scan; re-run the job'}
+        if missing == len(files):
+            return {'success': True, 'action': 'already_gone',
+                    'message': 'No files found on disk for this artist'}
+        return {'success': False,
+                'error': f'No files re-tagged ({stale} stale, {missing} missing, {errors} errors)'}
+
+    def _fix_canonical_version(self, entity_type, entity_id, file_path, details):
+        """Apply a canonical-version finding — pin the release the resolver chose
+        (source, release id and score, straight from the finding) onto the album
+        so the Reorganizer and Track Number Repair resolve the same edition (#765).
+
+        Writes an AUTO pin (``locked=False``), like the resolve job's dry-run-OFF
+        path and the Reorganizer — a later resolve can still self-heal it. A
+        LOCKED manual pin is a deliberate album-view edition choice (#758), so
+        accepting the resolver's suggestion here stays unlocked.
+        """
+        source = details.get('source')
+        canonical_album_id = details.get('album_id')
+        if not source or not canonical_album_id:
+            return {'success': False,
+                    'error': 'Finding is missing the canonical source/release id'}
+        try:
+            score = float(details.get('score') or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        try:
+            updated = self.db.set_album_canonical(
+                entity_id, source, str(canonical_album_id), score,
+            )
+        except Exception as e:
+            return {'success': False, 'error': f'Failed to store canonical pin: {e}'}
+        if not updated:
+            return {
+                'success': False,
+                'error': ('Album not updated — it may be manually locked to a '
+                          'different edition, or the album row is missing'),
+            }
+        label = details.get('album_title') or details.get('artist_name') or entity_id
+        return {
+            'success': True,
+            'action': 'pinned_canonical',
+            'message': f'Pinned {source} release {canonical_album_id} as canonical for "{label}"',
+        }
 
     def _fix_discography_backfill(self, entity_type, entity_id, file_path, details):
         """Add missing discography track to wishlist."""
@@ -1647,26 +1919,63 @@ class RepairWorker:
             return {'success': False, 'error': f'File not found: {os.path.basename(file_path)}'}
 
         try:
-            from core.repair_jobs.track_number_repair import _fix_track_number_tag, _fix_filename_track_number
+            from core.repair_jobs.track_number_repair import (
+                _fix_track_number_tag,
+                _planned_prefix,
+                _rename_to_basename,
+            )
 
-            # Write corrected track number to file tags
-            total_tracks = details.get('total_tracks')
-            if not total_tracks:
-                # Fallback: read current total from file to preserve it
-                try:
-                    from core.repair_jobs.track_number_repair import _read_track_number_tag
-                    from mutagen import File as MutagenFile
-                    audio = MutagenFile(resolved)
-                    if audio:
-                        _, total_tracks = _read_track_number_tag(audio)
-                except Exception as e:
-                    logger.debug("Failed to read total_tracks tag from file: %s", e)
-            total_tracks = int(total_tracks or 0)
-            _fix_track_number_tag(resolved, int(correct_num), total_tracks)
+            # Write corrected track number to file tags — skipped when the scan
+            # already judged the tag fine (#1009: a filename-only finding must
+            # not rewrite a correct tag with a different total).
+            if not details.get('tag_ok', False):
+                total_tracks = details.get('total_tracks')
+                if not total_tracks:
+                    # Fallback: read current total from file to preserve it
+                    try:
+                        from core.repair_jobs.track_number_repair import _read_track_number_tag
+                        from mutagen import File as MutagenFile
+                        audio = MutagenFile(resolved)
+                        if audio:
+                            _, total_tracks = _read_track_number_tag(audio)
+                    except Exception as e:
+                        logger.debug("Failed to read total_tracks tag from file: %s", e)
+                total_tracks = int(total_tracks or 0)
+                _fix_track_number_tag(resolved, int(correct_num), total_tracks)
 
-            # Rename file if it has a track number prefix
+            # #1075: per-disc numbering needs the disc tag written too — the
+            # scan rode disc_ok/disc_number/total_discs in the finding, so
+            # approve applies exactly the promised disc change. Legacy
+            # findings lack disc_ok (defaults True) → no disc write, exactly
+            # the old behavior.
+            if not details.get('disc_ok', True) and details.get('disc_number'):
+                from core.repair_jobs.track_number_repair import _fix_disc_number_tag
+                _fix_disc_number_tag(resolved, int(details['disc_number']),
+                                     int(details.get('total_discs') or 0))
+
+            # Rename to EXACTLY what the finding promised (#1009 — the old code
+            # recomputed the prefix here and mangled 4-digit disc+track names:
+            # '0213 - X' became '133 - X'). Findings created before the plan
+            # rode along rebuild it conservatively: plain 1-3 digit prefixes
+            # get the 2-digit track; 4+ digit prefixes are left untouched
+            # (without the album's disc list we can't know DDTT's disc half).
             fname = os.path.basename(resolved)
-            new_path = _fix_filename_track_number(resolved, fname, int(correct_num))
+            new_filename = details.get('new_filename')
+            if new_filename is None and 'tag_ok' not in details:   # legacy finding
+                base, ext = os.path.splitext(fname)
+                m = re.match(r'^(\d+)', base.strip())
+                prefix = m.group(1) if m else ''
+                planned = _planned_prefix(prefix, int(correct_num),
+                                          int(details.get('disc_number') or 1),
+                                          multi_disc=False)
+                if planned is not None and prefix:
+                    candidate = re.sub(r'^\d+', planned, base, count=1)
+                    if candidate != base:
+                        new_filename = candidate + ext
+            new_path = None
+            if new_filename:
+                new_path = _rename_to_basename(resolved, fname,
+                                               os.path.splitext(new_filename)[0])
 
             # Update DB file path if renamed
             if new_path:
@@ -1905,11 +2214,12 @@ class RepairWorker:
             return {'success': False, 'error': f'File not found on disk: {os.path.basename(raw_path)}'}
         try:
             from core.replaygain import (analyze_track, write_replaygain_tags,
-                                         is_ffmpeg_available, RG_REFERENCE_LUFS)
+                                         is_ffmpeg_available, get_target_lufs)
             if not is_ffmpeg_available():
                 return {'success': False, 'error': 'ffmpeg not available — cannot analyze ReplayGain'}
             lufs, peak_dbfs = analyze_track(resolved)
-            gain_db = RG_REFERENCE_LUFS - lufs   # same formula as the import pipeline
+            # same formula as the import pipeline; target honours #1060's setting
+            gain_db = get_target_lufs(self._config_manager) - lufs
             ok = write_replaygain_tags(resolved, gain_db, peak_dbfs)
         except Exception as e:
             logger.error("ReplayGain fix failed for %s: %s", os.path.basename(raw_path), e)
@@ -3839,28 +4149,18 @@ class RepairWorker:
             if conn:
                 conn.close()
 
-    def bulk_fix_findings(self, job_id: str = None, severity: str = None,
-                          finding_ids: List[int] = None, fix_action: str = None) -> dict:
-        """Fix all pending fixable findings matching filters. Returns {fixed, failed, skipped}.
+    def _pending_fixable_ids(self, job_id: str = None, severity: str = None,
+                             finding_ids: List[int] = None) -> List[int]:
+        """IDs of pending findings the fix loop can actually fix.
 
-        Args:
-            fix_action: Optional action for findings that need user choice (e.g. orphan files)
-        """
+        Fixable = has a fix handler — derived from the dispatch map so the
+        two can never drift apart again (a stale copy of this list silently
+        skipped genre_cleanup / replaygain_retag findings in Fix All)."""
         conn = None
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
-
-            # Build query for pending fixable findings
-            fixable_types = ('dead_file', 'orphan_file', 'track_number_mismatch',
-                             'missing_cover_art', 'missing_lyrics', 'expired_download', 'metadata_gap', 'duplicate_tracks',
-                             'single_album_redundant', 'mbid_mismatch',
-                             'album_mbid_mismatch',
-                             'album_tag_inconsistency',
-                             'incomplete_album', 'path_mismatch',
-                             'missing_lossy_copy', 'missing_replaygain', 'empty_folder',
-                             'missing_discography_track', 'acoustid_mismatch',
-                             'quality_upgrade', 'short_preview_track')
+            fixable_types = tuple(self._fix_handlers().keys())
             placeholders = ','.join(['?'] * len(fixable_types))
             where_parts = [f"finding_type IN ({placeholders})", "status = 'pending'"]
             params = list(fixable_types)
@@ -3878,9 +4178,21 @@ class RepairWorker:
 
             where = f"WHERE {' AND '.join(where_parts)}"
             cursor.execute(f"SELECT id FROM repair_findings {where}", params)
-            ids_to_fix = [row[0] for row in cursor.fetchall()]
-            conn.close()
-            conn = None
+            return [row[0] for row in cursor.fetchall()]
+        finally:
+            if conn:
+                conn.close()
+
+    def bulk_fix_findings(self, job_id: str = None, severity: str = None,
+                          finding_ids: List[int] = None, fix_action: str = None) -> dict:
+        """Fix all pending fixable findings matching filters. Returns {fixed, failed, skipped}.
+
+        Args:
+            fix_action: Optional action for findings that need user choice (e.g. orphan files)
+        """
+        try:
+            ids_to_fix = self._pending_fixable_ids(
+                job_id=job_id, severity=severity, finding_ids=finding_ids)
 
             fixed = 0
             failed = 0
@@ -3899,9 +4211,101 @@ class RepairWorker:
         except Exception as e:
             logger.error("Error bulk fixing findings: %s", e, exc_info=True)
             return {'fixed': 0, 'failed': 0, 'total': 0, 'error': str(e)}
+
+    # ------------------------------------------------------------------
+    # Background bulk fix — "Fix All" at library scale
+    # ------------------------------------------------------------------
+    # bulk_fix_findings() runs its whole loop inside the caller's thread,
+    # which is fine for a page of selected findings but not for "Fix All
+    # 5000" — inside an HTTP request that means the browser gives up long
+    # before the loop ends while the server quietly keeps fixing, so the
+    # user is told it failed while it's actually still working. These run
+    # the same loop on a worker thread instead; the UI polls for progress.
+
+    def start_bulk_fix(self, job_id: str = None, severity: str = None,
+                       finding_ids: List[int] = None, fix_action: str = None) -> dict:
+        """Start a background bulk-fix run. Only one runs at a time.
+
+        Returns ``{'started': True, 'total': N}`` or
+        ``{'started': False, 'error': ..., 'already_running': bool}``."""
+        with self._bulk_fix_lock:
+            if self._bulk_fix_thread is not None and self._bulk_fix_thread.is_alive():
+                return {'started': False, 'already_running': True,
+                        'error': 'A bulk fix is already running'}
+            try:
+                ids = self._pending_fixable_ids(
+                    job_id=job_id, severity=severity, finding_ids=finding_ids)
+            except Exception as e:
+                logger.error("Error starting bulk fix: %s", e, exc_info=True)
+                return {'started': False, 'error': str(e)}
+            if not ids:
+                return {'started': False, 'error': 'No pending fixable findings match'}
+
+            self._bulk_fix_stop_event.clear()
+            # Every key the runner will ever touch is seeded here so later
+            # writes are value updates, never key insertions — get_bulk_fix_status
+            # copies this dict from another thread, and a concurrent key insert
+            # could make that copy raise mid-iteration.
+            self._bulk_fix_state = {
+                'running': True,
+                'total': len(ids),
+                'done': 0,
+                'fixed': 0,
+                'failed': 0,
+                'stopped': False,
+                'job_id': job_id,
+                'errors': [],
+                'error': None,
+            }
+            self._bulk_fix_thread = threading.Thread(
+                target=self._run_bulk_fix, args=(list(ids), fix_action),
+                daemon=True, name='repair-bulk-fix')
+            self._bulk_fix_thread.start()
+            logger.info("Background bulk fix started: %d finding(s)%s",
+                        len(ids), f" for {job_id}" if job_id else "")
+            return {'started': True, 'total': len(ids)}
+
+    def _run_bulk_fix(self, ids: List[int], fix_action: str = None):
+        state = self._bulk_fix_state
+        try:
+            for fid in ids:
+                if self._bulk_fix_stop_event.is_set() or self.should_stop:
+                    state['stopped'] = True
+                    logger.info("Background bulk fix stopped at %d/%d",
+                                state['done'], state['total'])
+                    break
+                try:
+                    result = self.fix_finding(fid, fix_action=fix_action)
+                except Exception as e:  # fix_finding shouldn't raise, but never kill the run
+                    result = {'success': False, 'error': str(e)}
+                state['done'] += 1
+                if result.get('success'):
+                    state['fixed'] += 1
+                else:
+                    state['failed'] += 1
+                    error_msg = result.get('error', 'unknown error')
+                    logger.warning("Bulk fix failed for finding #%s: %s", fid, error_msg)
+                    if len(state['errors']) < 20:
+                        state['errors'].append({'id': fid, 'error': error_msg})
+        except Exception as e:
+            logger.error("Background bulk fix crashed: %s", e, exc_info=True)
+            state['error'] = str(e)
         finally:
-            if conn:
-                conn.close()
+            state['running'] = False
+            logger.info("Background bulk fix finished: %d fixed, %d failed of %d",
+                        state['fixed'], state['failed'], state['total'])
+
+    def get_bulk_fix_status(self) -> dict:
+        """Progress of the current (or most recent) background bulk fix."""
+        with self._bulk_fix_lock:
+            state = dict(self._bulk_fix_state)
+            state['errors'] = list(state.get('errors', []))
+            return state
+
+    def stop_bulk_fix(self) -> bool:
+        """Ask a running background bulk fix to stop after its current fix."""
+        self._bulk_fix_stop_event.set()
+        return True
 
     def bulk_update_findings(self, finding_ids: List[int], action: str) -> int:
         """Bulk resolve or dismiss findings. Returns count updated."""

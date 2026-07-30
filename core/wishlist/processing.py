@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -343,6 +344,28 @@ def add_cancelled_tracks_to_failed_tracks(
         )
 
     return processed_count
+
+
+def record_failed_attempt(wishlist_service, track_data, failure_reason, profile_id,
+                          *, logger=logger) -> bool:
+    """Stamp one failed cycle attempt on the track's wishlist row
+    (retry_count + 1, last_attempted = now).
+
+    Runs for fresh adds AND duplicate-skips — the duplicate-skip IS the
+    repeat-failure signal (javiavid: retry_count stayed 0 forever because the
+    only increment path, mark_track_download_result, had no callers; that also
+    left the 3.1.1 failing badge/filter dead on the music side). Best-effort:
+    a stamp failure never disturbs wishlist processing."""
+    sp_id = track_data.get('id') if isinstance(track_data, dict) else None
+    if not sp_id or str(sp_id).startswith('wing_it_'):
+        return False
+    try:
+        return bool(wishlist_service.mark_track_download_result(
+            str(sp_id), False, error_message=str(failure_reason or '') or None,
+            profile_id=profile_id))
+    except Exception as e:
+        logger.debug("wishlist attempt stamp failed for %s: %s", sp_id, e)
+        return False
 
 
 def recover_uncaptured_failed_tracks(
@@ -855,7 +878,8 @@ def cleanup_wishlist_against_library(
         return {"success": False, "error": str(e)}, 500
 
 
-def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, automation_id=None):
+def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, automation_id=None,
+                                   apply_backoff=None):
     """Run automatic wishlist processing outside the controller."""
     logger = runtime.logger
     logger.info("[Auto-Wishlist] Timer triggered - starting automatic wishlist processing...")
@@ -946,6 +970,33 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
                         f"[Auto-Wishlist] Skipping {len(_unreleased)} unreleased track(s) "
                         f"(future release date) — they'll be searched once released")
 
+                # Progressive retry backoff (javiavid): repeatedly-failing tracks
+                # earn a growing cooldown (4h → 24h → 7d) instead of burning a
+                # search every hourly cycle forever. SCHEDULED work only — the
+                # manual "Process Wishlist Now" button retries everything (the
+                # click is the override, like Sonarr's manual search). Callers
+                # may state intent via apply_backoff; otherwise a present
+                # automation_id marks the run as scheduled.
+                _backoff = apply_backoff if apply_backoff is not None else (automation_id is not None)
+                if _backoff:
+                    from datetime import datetime as _dt, timezone as _tz
+
+                    from core.wishlist.retry_backoff import split_due_for_retry
+                    # NAIVE UTC on purpose: last_attempted is SQLite's naive-UTC
+                    # CURRENT_TIMESTAMP and the parser yields naive datetimes —
+                    # an aware 'now' would TypeError on comparison.
+                    wishlist_tracks, _cooling = split_due_for_retry(
+                        wishlist_tracks, _dt.now(_tz.utc).replace(tzinfo=None))
+                    if _cooling:
+                        logger.info(
+                            f"[Auto-Wishlist] {len(_cooling)} track(s) cooling down after "
+                            f"repeated failures (retry backoff) — skipped this cycle")
+                        runtime.update_automation_progress(
+                            automation_id, log_line=(
+                                f'{len(_cooling)} repeatedly-failing track(s) on backoff '
+                                f'cooldown — retried later automatically'),
+                            log_type='info')
+
                 # CYCLE FILTERING: Get current cycle and filter tracks by category
                 current_cycle = get_wishlist_cycle(lambda: music_database)
 
@@ -1007,6 +1058,16 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
         raise
 
 
+# jadux's stall: every DB-update completion fires a cleanup, and on a big
+# wishlist (3450 tracks) one pass takes HOURS (per-track fuzzy matching), so
+# they stacked until every worker of the shared pool was grinding cleanups and
+# completed downloads queued behind them forever. One cleanup at a time —
+# a request that arrives while one is running is SKIPPED (the next DB update
+# will fire another against fresher state; nothing is lost by not stacking).
+_auto_cleanup_lock = threading.Lock()
+_auto_cleanup_running = False
+
+
 def automatic_wishlist_cleanup_after_db_update(
     *,
     wishlist_service=None,
@@ -1015,7 +1076,37 @@ def automatic_wishlist_cleanup_after_db_update(
     active_server: str | None = None,
     logger=logger,
 ) -> int:
-    """Remove wishlist entries that already exist in the library after a DB update."""
+    """Remove wishlist entries that already exist in the library after a DB update.
+
+    Overlap-guarded: only one cleanup runs at a time; concurrent requests are
+    skipped (returning 0), never queued."""
+    global _auto_cleanup_running
+    with _auto_cleanup_lock:
+        if _auto_cleanup_running:
+            logger.info("[Auto Cleanup] Previous cleanup still running — skipping this one")
+            return 0
+        _auto_cleanup_running = True
+    try:
+        return _automatic_wishlist_cleanup_inner(
+            wishlist_service=wishlist_service,
+            profiles_database=profiles_database,
+            music_database=music_database,
+            active_server=active_server,
+            logger=logger,
+        )
+    finally:
+        with _auto_cleanup_lock:
+            _auto_cleanup_running = False
+
+
+def _automatic_wishlist_cleanup_inner(
+    *,
+    wishlist_service=None,
+    profiles_database=None,
+    music_database=None,
+    active_server: str | None = None,
+    logger=logger,
+) -> int:
     try:
         from config.settings import config_manager
         from database.music_database import MusicDatabase, get_database

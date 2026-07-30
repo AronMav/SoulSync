@@ -4,6 +4,11 @@
 // shared-helpers.js so the Search page and the global widget share the same
 // implementations.
 
+// A bare MusicBrainz UUID — the one bare ID whose FORMAT pins its source
+// (no other provider uses UUIDs). The main search bar routes these to the
+// direct by-id resolver instead of fuzzy search (Jordan H, Lidarr parity).
+const MBID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function initializeSearch() {
     // --- FIX: Corrected the element IDs to match the HTML ---
     const searchInput = document.getElementById('downloads-search-input');
@@ -166,8 +171,12 @@ function initializeSearchModeToggle() {
         resultsContainer.classList.remove('hidden');
         showDropdown();
 
+        // Record labels are searched independently (separate endpoint) and
+        // rendered alongside the source results — purely additive.
+        _maybeFetchLabels(state.query);
+
         if (src === 'youtube_videos') {
-            ['enh-db-artists-section', 'enh-spotify-artists-section', 'enh-albums-section', 'enh-singles-section', 'enh-tracks-section'].forEach(id => {
+            ['enh-db-artists-section', 'enh-spotify-artists-section', 'enh-albums-section', 'enh-singles-section', 'enh-tracks-section', 'enh-labels-section'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.classList.add('hidden');
             });
@@ -248,6 +257,9 @@ function initializeSearchModeToggle() {
             // external-API search per letter (#751). Enter still triggers an
             // immediate search via the keypress handler below.
             debounceTimer = setTimeout(() => {
+                // A pasted MusicBrainz UUID is an exact identifier, not a name —
+                // route it to the direct by-id resolver (Jordan H, Lidarr parity).
+                if (MBID_RE.test(query)) { submitIdLookup(query); return; }
                 searchController.submitQuery(query);
             }, 600);
         });
@@ -257,6 +269,7 @@ function initializeSearchModeToggle() {
                 const query = e.target.value.trim();
                 if (query.length >= 2) {
                     clearTimeout(debounceTimer);
+                    if (MBID_RE.test(query)) { submitIdLookup(query); return; }
                     searchController.submitQuery(query);
                 }
             }
@@ -280,9 +293,10 @@ function initializeSearchModeToggle() {
     const idInput = document.getElementById('enh-id-input');
     const idBtn = document.getElementById('enh-id-btn');
 
-    async function submitIdLookup() {
-        if (!idInput) return;
-        const raw = idInput.value.trim();
+    async function submitIdLookup(rawOverride) {
+        // rawOverride: the MAIN search bar routes bare MusicBrainz UUIDs here
+        // (they're exact identifiers, not names); otherwise read the Link/ID box.
+        const raw = (typeof rawOverride === 'string' ? rawOverride : (idInput ? idInput.value : '')).trim();
         if (!raw) return;
 
         // Show the controller's loading UI while resolving.
@@ -374,6 +388,73 @@ function initializeSearchModeToggle() {
             }
         }
     });
+
+    // ---- Record labels (searched separately, rendered alongside results) ----
+    // Labels aren't part of the per-source enhanced-search payload; they come
+    // from /api/labels/search. We fetch once per query (deduped) and re-render
+    // the Labels section when results land. Purely additive: nothing here
+    // touches the existing source/section flow.
+    let _labelSearchQuery = null;
+    let _labelResults = [];
+
+    function _maybeFetchLabels(query) {
+        const q = (query || '').trim();
+        if (!q) {
+            _labelSearchQuery = null;
+            _labelResults = [];
+            const sec = document.getElementById('enh-labels-section');
+            if (sec) sec.classList.add('hidden');
+            return;
+        }
+        if (q === _labelSearchQuery) {
+            _renderLabelsSection();      // already fetched — just (re)render
+            return;
+        }
+        _labelSearchQuery = q;
+        _labelResults = [];
+        fetch('/api/labels/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: q }),
+        })
+            .then(r => (r.ok ? r.json() : { labels: [] }))
+            .then(d => {
+                if (_labelSearchQuery !== q) return;   // a newer query superseded us
+                _labelResults = (d && d.labels) || [];
+                _renderLabelsSection();
+            })
+            .catch(() => { /* label search is best-effort; never break the page */ });
+    }
+
+    function _renderLabelsSection() {
+        const src = searchController.state.activeSource;
+        if (src === 'youtube_videos' || src === 'soulseek') {
+            const sec = document.getElementById('enh-labels-section');
+            if (sec) sec.classList.add('hidden');
+            return;
+        }
+        renderCompactSection(
+            'enh-labels-section',
+            'enh-labels-list',
+            'enh-labels-count',
+            _labelResults,
+            (lab) => ({
+                image: null,
+                placeholder: '🏷️',
+                name: lab.name,
+                meta: [lab.type, lab.area].filter(Boolean).join(' • ') || 'Record label',
+                href: (typeof buildLabelDetailPath === 'function')
+                    ? buildLabelDetailPath(lab.id, lab.name)
+                    : `/label-detail/${encodeURIComponent(lab.id)}`,
+                onClick: (e) => {
+                    if (e && e.preventDefault) e.preventDefault();
+                    if (typeof navigateToLabelDetail === 'function') {
+                        navigateToLabelDetail(lab.id, lab.name);
+                    }
+                },
+            })
+        );
+    }
 
     function renderDropdownResults(data) {
         const activeSource = searchController.state.activeSource;
@@ -472,6 +553,10 @@ function initializeSearchModeToggle() {
                 };
             }
         );
+
+        // Record labels — rendered from the independently-fetched results
+        // (may already be populated, or fill in when the fetch settles).
+        _renderLabelsSection();
 
         // Lazy load artist images that are missing
         lazyLoadEnhancedSearchArtistImages();

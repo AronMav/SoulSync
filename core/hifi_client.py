@@ -368,7 +368,13 @@ class HiFiClient(DownloadSourcePlugin):
                 time.sleep(self._min_interval - elapsed)
             self._last_api_call = time.time()
 
-    def _api_get(self, path: str, params: dict = None, timeout: int = 15) -> Optional[dict]:
+    def _api_get(self, path: str, params: dict = None, timeout: int = None) -> Optional[dict]:
+        # #1056: default timeout honours the user's source-search-timeout
+        # override (Settings → Downloads); unset keeps the historical 15s.
+        # Callers that pass an explicit timeout (e.g. the 20s manifest/track
+        # fetches) are unaffected.
+        if timeout is None:
+            timeout = config_manager.get_source_search_timeout() or 15
         tried = set()
 
         while True:
@@ -400,8 +406,15 @@ class HiFiClient(DownloadSourcePlugin):
                 self._rotate_instance(instance)
             except http_requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 0
-                if status >= 500:
-                    logger.warning(f"HiFi API server error ({status}): {instance}")
+                # Rotate on statuses that depend on WHICH instance you ask:
+                # 5xx (broken), 429 (rate-limited — instances throttle hard,
+                # another may serve immediately), 403 (geo/auth-blocked per
+                # instance). 400/404/422 describe the REQUEST — no instance
+                # will answer differently, so fail fast without burning the
+                # pool. This is the monochrome-parity gap from #1073: same
+                # instances, but monochrome moves on where we gave up.
+                if status >= 500 or status in (403, 429):
+                    logger.warning(f"HiFi API error ({status}) — rotating: {instance}")
                     self._rotate_instance(instance)
                 else:
                     logger.error(f"HiFi API HTTP error ({status}): {e}")

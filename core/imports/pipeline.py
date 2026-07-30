@@ -32,7 +32,12 @@ from core.imports.context import (
     get_import_track_info,
     normalize_import_context,
 )
-from core.imports.file_integrity import check_audio_integrity, expected_duration_for_check, resolve_duration_tolerance
+from core.imports.file_integrity import (
+    check_audio_integrity,
+    expected_duration_for_check,
+    probe_decoded_duration,
+    resolve_duration_tolerance,
+)
 from core.imports.filename import extract_track_number_from_filename
 from core.imports.guards import check_flac_bit_depth, check_quality_target, move_to_quarantine
 from core.imports.silence import detect_broken_audio
@@ -74,6 +79,7 @@ from core.imports.paths import (
 from core.imports.album_naming import resolve_album_group
 from core.metadata.lyrics import generate_lrc_file
 from database.music_database import get_database
+from core.tag_writer import is_placeholder_meta, read_file_tags, write_tags_to_file
 from utils.logging_config import get_logger
 
 
@@ -87,6 +93,56 @@ __all__ = [
 ]
 
 
+def _audio_length_seconds(path: str) -> float:
+    """Best-effort real length of an audio file: mutagen's header first, then
+    an ffmpeg decode when the header reads 0 (HiFi's fragmented FLAC does).
+    0.0 when it genuinely can't be determined."""
+    try:
+        from mutagen import File as MutagenFile
+        info = getattr(MutagenFile(path), 'info', None)
+        length = float(getattr(info, 'length', 0) or 0)
+        if length > 0:
+            return length
+    except Exception:   # noqa: BLE001,S110 - fall through to the ffmpeg decode
+        logger.debug("mutagen length read failed for %s, decoding instead", path, exc_info=True)
+    return probe_decoded_duration(path)
+
+
+def _replacement_length_is_safe(existing_path: str, incoming_path: str,
+                                min_ratio: float = 0.8) -> bool:
+    """Guard a library-file replacement: True unless the incoming file plays
+    materially shorter than the file it would replace (a preview/truncated
+    clip). Conservative — if EITHER length can't be determined we allow the
+    replace (the other gates own that case), so this never blocks a legit
+    upgrade, only a clear shrink."""
+    existing_s = _audio_length_seconds(existing_path)
+    incoming_s = _audio_length_seconds(incoming_path)
+    if existing_s <= 0 or incoming_s <= 0:
+        return True
+    return incoming_s >= existing_s * min_ratio
+
+
+def _batch_force_replace(context: dict) -> bool:
+    """True when the USER explicitly forced this download (the 'Force
+    download' toggle on the download modal). An explicit re-download of a
+    track they already own is replace-intent — the metadata-protection skip
+    must not silently discard it (#1045).
+
+    Reads the batch's ``force_replace`` key, which web_server sets ONLY for a
+    user-checked toggle (wing_it excluded). Deliberately NOT
+    ``force_download_all``: the wishlist sets that on every background batch
+    (it means "skip ownership checks" there) and Wing It auto-enables it —
+    neither may ever overwrite library files. Anything missing or unreadable
+    → False, i.e. the protective default."""
+    try:
+        batch_id = (context or {}).get('batch_id')
+        if not batch_id:
+            return False
+        return bool((download_batches.get(batch_id) or {}).get('force_replace'))
+    except Exception:   # noqa: BLE001 - protection is the safe default
+        return False
+
+
 def _should_skip_quarantine_check(context: dict, check_name: str) -> bool:
     bypass = context.get('_skip_quarantine_check')
     if bypass == 'all':
@@ -94,6 +150,61 @@ def _should_skip_quarantine_check(context: dict, check_name: str) -> bool:
     if isinstance(bypass, (list, tuple, set)):
         return 'all' in bypass or check_name in bypass
     return bypass == check_name
+
+
+def _build_simple_download_tag_data(
+    search_result: dict, album_name: str | None,
+) -> dict[str, str]:
+    """Return only trustworthy metadata known by a direct/simple grab.
+
+    Simple downloads deliberately skip provider enhancement, but their request
+    still carries a title, artist and sometimes an album. Persist those values
+    without ever stamping placeholder text over useful source tags.
+    """
+    values = {
+        "title": search_result.get("title"),
+        "artist_name": search_result.get("artist"),
+        "album_title": album_name,
+    }
+    return {
+        key: str(value).strip()
+        for key, value in values.items()
+        if not is_placeholder_meta(value)
+    }
+
+
+# Maps _build_simple_download_tag_data's db_data keys to the matching
+# read_file_tags() key, so a field can be checked against the file's
+# CURRENT value before deciding to write it.
+_SIMPLE_DOWNLOAD_TAG_TO_FILE_FIELD = {
+    'title': 'title',
+    'artist_name': 'artist',
+    'album_title': 'album',
+}
+
+
+def _fill_only_simple_download_tags(destination: str, simple_tags: dict[str, str]) -> dict[str, str]:
+    """Restrict ``simple_tags`` to fields the file doesn't already have.
+
+    A simple/direct download skips provider enhancement, so its title/artist/
+    album come straight from the user's search request rather than verified
+    metadata — and Soulseek search titles are often parsed from a messy
+    filename. Unlike the enhanced-import path (which trusts DB metadata over
+    file tags), a simple download must never stamp a real existing tag with
+    a value that's merely "not a placeholder" — only fill in what's actually
+    blank or placeholder in the file today. When the file's current tags
+    can't be read at all, skip writing entirely rather than guessing.
+    """
+    if not simple_tags:
+        return {}
+    current = read_file_tags(destination)
+    if current.get('error'):
+        return {}
+    return {
+        key: value
+        for key, value in simple_tags.items()
+        if is_placeholder_meta(current.get(_SIMPLE_DOWNLOAD_TAG_TO_FILE_FIELD.get(key)))
+    }
 
 
 def _resolve_context_quality_profile(context: dict) -> dict:
@@ -690,7 +801,33 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
 
             safe_move_file(file_path, destination)
             logger.info(f"Moved simple download to: {destination}")
+            from core.imports.file_ops import move_companion_sidecars
+            move_companion_sidecars(file_path, destination)
             cleanup_slskd_dedup_siblings(file_path)
+
+            simple_tags = _build_simple_download_tag_data(
+                search_result, album_name)
+            simple_tags = _fill_only_simple_download_tags(destination, simple_tags)
+            if simple_tags:
+                try:
+                    tag_result = write_tags_to_file(
+                        destination, simple_tags, embed_cover=False)
+                    if tag_result.get('success'):
+                        logger.info(
+                            "Embedded direct-download metadata: %s",
+                            ', '.join(simple_tags),
+                        )
+                    else:
+                        logger.warning(
+                            "[Simple Download] Could not embed metadata: %s",
+                            tag_result.get('error', 'unknown error'),
+                        )
+                except Exception as tag_error:
+                    # The file is already safely moved. Tagging is enrichment,
+                    # so a malformed/unsupported source file remains a
+                    # successful direct download with a visible warning.
+                    logger.warning(
+                        "[Simple Download] Metadata write failed: %s", tag_error)
 
             with matched_context_lock:
                 if context_key in matched_downloads_context:
@@ -832,7 +969,11 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         # See ``core/imports/track_number.py`` for the resolution
         # chain — pure function, unit-tested in isolation, single
         # place to fix the rule.
-        from core.imports.track_number import resolve_track_number, read_embedded_track_number
+        from core.imports.track_number import (
+            resolve_track_number,
+            read_embedded_track_number,
+            track_number_from_directory_order,
+        )
         track_info_for_resolve = context.get('track_info') if isinstance(context, dict) else None
         # "Track 01" bug: a single Deezer track is matched via an endpoint
         # that omits track_position, so the context never carried the real
@@ -850,8 +991,34 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
             track_number,
         )
         if not isinstance(track_number, int) or track_number < 1:
-            logger.error(f"Invalid track number ({track_number}), defaulting to 1")
-            track_number = 1
+            # §16.3(a): before collapsing the WHOLE album onto track 1, fall back
+            # to this file's sorted position among its audio siblings on disk
+            # (album bundles stage all files into one directory together). This
+            # only ever replaces the constant-1 default, so it can never override
+            # a number a real source produced — it just stops every un-numbered
+            # track claiming position 1 and all-but-one showing as "missing".
+            #
+            # Restricted to genuine album-bundle downloads: a plain
+            # (non-bundle) download lands in a SHARED flat directory (e.g.
+            # Soulseek's download_path) that can hold other, unrelated
+            # in-flight downloads at the same time — applying the fallback
+            # there would compute this file's position among files from a
+            # completely different download, not a real position within
+            # its own album.
+            scan_order = (
+                track_number_from_directory_order(file_path)
+                if is_album_download else None
+            )
+            if scan_order is not None:
+                logger.warning(
+                    "No per-track number from any source; using scan-order "
+                    "position %s from directory siblings (avoids album collapse "
+                    "onto track 1)", scan_order,
+                )
+                track_number = scan_order
+            else:
+                logger.error(f"Invalid track number ({track_number}), defaulting to 1")
+                track_number = 1
 
         logger.debug(f"FINAL track_number used for filename: {track_number}")
         album_info['track_number'] = track_number
@@ -909,17 +1076,58 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
             except (json.JSONDecodeError, TypeError):
                 _enhance_source_info = {}
         is_enhance_download = _enhance_source_info.get('enhance', False)
+        # "Force download" is replace-intent: the user explicitly re-downloaded
+        # something they already own, so the metadata-protection skip must not
+        # discard it (#1045). Rides the same replace path as enhance — the
+        # short-file replacement guard above still applies.
+        force_replace = _batch_force_replace(context)
 
         logger.info(f"Moving '{os.path.basename(file_path)}' to '{final_path}'")
         if os.path.exists(final_path):
             if not os.path.exists(file_path):
                 logger.info(f"[Protection] Destination exists and source already gone - file already transferred: {os.path.basename(final_path)}")
                 return
+            # THE backstop for sella's incident: an upgrade/replace must NEVER
+            # swap a good library file for a materially shorter one. Every path
+            # below can os.remove(final_path) and move the incoming file in — so
+            # before any of them, compare the REAL decoded lengths. A 30s HiFi
+            # preview replacing a 220s track is caught here even if every header
+            # (and AcoustID) was faked, and even for files no other gate saw.
+            if not _replacement_length_is_safe(final_path, file_path):
+                logger.error(
+                    "[Protection] Refusing to replace %s — the incoming file is "
+                    "far shorter (likely a preview/truncated clip). Quarantining it.",
+                    os.path.basename(final_path))
+                try:
+                    qpath = move_to_quarantine(
+                        file_path, context,
+                        "Replacement guard: incoming file is far shorter than the "
+                        "library file it would replace (preview/truncated clip)",
+                        automation_engine, trigger='integrity')
+                    _mark_task_quarantined(context, qpath)
+                except Exception as _qe:   # noqa: BLE001
+                    logger.error("[Protection] Could not quarantine the short replacement "
+                                 "(leaving in place, NOT replacing): %s", _qe)
+                task_id = context.get('task_id')
+                batch_id = context.get('batch_id')
+                if task_id:
+                    with tasks_lock:
+                        if task_id in download_tasks:
+                            download_tasks[task_id]['status'] = 'failed'
+                            download_tasks[task_id]['error_message'] = (
+                                "Replacement rejected: incoming file is far shorter "
+                                "than the existing library file")
+                    if batch_id:
+                        _notify_download_completed(batch_id, task_id, success=False)
+                with matched_context_lock:
+                    if context_key in matched_downloads_context:
+                        del matched_downloads_context[context_key]
+                return
             try:
                 from mutagen import File as MutagenFile
                 existing_file = MutagenFile(final_path)
                 has_metadata = existing_file is not None and len(existing_file.tags or {}) > 2
-                if has_metadata and not is_enhance_download:
+                if has_metadata and not is_enhance_download and not force_replace:
                     _replace_lower = _resolve_context_quality_profile(context).get(
                         'replace_lower_quality',
                         config_manager.get('import.replace_lower_quality', False))
@@ -954,8 +1162,11 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                         except Exception as e:
                             logger.error(f"[Protection] Error removing redundant file: {e}")
                         return
-                elif is_enhance_download:
-                    logger.info(f"[Enhance] Quality enhance mode — replacing existing file: {os.path.basename(final_path)}")
+                elif is_enhance_download or force_replace:
+                    if is_enhance_download:
+                        logger.info(f"[Enhance] Quality enhance mode — replacing existing file: {os.path.basename(final_path)}")
+                    else:
+                        logger.info(f"[Force] User-forced re-download — replacing existing file: {os.path.basename(final_path)}")
                     try:
                         os.remove(final_path)
                     except Exception as e:
@@ -1008,6 +1219,8 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
             raise FileNotFoundError(f"Source file vanished before move and destination does not exist: {file_path}")
 
         safe_move_file(file_path, final_path)
+        from core.imports.file_ops import move_companion_sidecars
+        move_companion_sidecars(file_path, final_path)
         cleanup_slskd_dedup_siblings(file_path)
 
         if is_enhance_download and _enhance_source_info.get('original_file_path'):
@@ -1030,10 +1243,10 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
 
         if config_manager.get('post_processing.replaygain_enabled', False):
             try:
-                from core.replaygain import analyze_track as _rg_analyze, write_replaygain_tags as _rg_write, is_ffmpeg_available as _rg_ffmpeg_ok, RG_REFERENCE_LUFS as _RG_REF
+                from core.replaygain import analyze_track as _rg_analyze, write_replaygain_tags as _rg_write, is_ffmpeg_available as _rg_ffmpeg_ok, get_target_lufs as _rg_target
                 if _rg_ffmpeg_ok():
                     lufs, peak_dbfs = _rg_analyze(final_path)
-                    gain_db = _RG_REF - lufs
+                    gain_db = _rg_target(config_manager) - lufs   # #1060 target setting
                     _rg_write(final_path, gain_db, peak_dbfs)
                     pp_logger.info(f"ReplayGain: {gain_db:+.2f} dB, peak {peak_dbfs:.2f} dBFS — {os.path.basename(final_path)}")
             except Exception as rg_err:
