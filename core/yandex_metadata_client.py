@@ -120,6 +120,8 @@ class YandexMetadataClient:
 
     # --- artist resolution -------------------------------------------------
     def search_artists(self, query: str, limit: int = 10, **kwargs) -> List[YArtist]:
+        from core.api_call_tracker import api_call_tracker
+        api_call_tracker.record_call('yandex')
         try:
             res = self.client.search(query, type_="artist")
             results = res.artists.results if (res and res.artists) else []
@@ -135,6 +137,8 @@ class YandexMetadataClient:
         return exact[:limit]
 
     def get_artist(self, artist_id: str, **kwargs) -> Optional[Dict[str, Any]]:
+        from core.api_call_tracker import api_call_tracker
+        api_call_tracker.record_call('yandex')
         try:
             info = self.client.artists_brief_info(artist_id)
             a = info.artist
@@ -152,6 +156,8 @@ class YandexMetadataClient:
     # --- discography -------------------------------------------------------
     def get_artist_albums(self, artist_id: str, album_type: str = "album,single",
                           limit: int = 50, **kwargs) -> Optional[List[YAlbum]]:
+        from core.api_call_tracker import api_call_tracker
+        api_call_tracker.record_call('yandex')
         try:
             artists = self.client.artists(artist_id)
             if not artists:
@@ -182,6 +188,8 @@ class YandexMetadataClient:
         return out[:limit] if limit else out
 
     def get_album(self, album_id: str, **kwargs) -> Optional[Dict[str, Any]]:
+        from core.api_call_tracker import api_call_tracker
+        api_call_tracker.record_call('yandex')
         try:
             full = self.client.albums_with_tracks(album_id)
         except Exception as e:
