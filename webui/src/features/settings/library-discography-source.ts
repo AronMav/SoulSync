@@ -5,6 +5,7 @@ export const LIBRARY_DISCOGRAPHY_SOURCE_OPTIONS = [
   { value: 'deezer', label: 'Deezer' },
   { value: 'musicbrainz', label: 'MusicBrainz' },
   { value: 'spotify', label: 'Spotify' },
+  { value: 'yandex', label: 'Yandex Music' },
 ] as const;
 
 export type LibraryDiscographySource = (typeof LIBRARY_DISCOGRAPHY_SOURCE_OPTIONS)[number]['value'];

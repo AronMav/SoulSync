@@ -58,6 +58,7 @@ export interface StatsEnrichmentCoverage {
   spotify?: number;
   musicbrainz?: number;
   deezer?: number;
+  yandex?: number;
   jiosaavn?: number;
   lastfm?: number;
   itunes?: number;

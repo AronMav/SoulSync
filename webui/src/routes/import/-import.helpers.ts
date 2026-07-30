@@ -23,6 +23,7 @@ const IMPORT_SOURCE_LABELS: Record<string, string> = {
   playlist: 'Playlist',
   soulseek: 'Basic Search',
   spotify: 'Spotify',
+  yandex: 'Yandex Music',
   youtube_videos: 'Music Videos',
 };
 
