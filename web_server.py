@@ -41493,7 +41493,8 @@ def _emit_rate_monitor_loop():
     # Map rate monitor service keys to enrichment status keys
     _enrichment_key_map = {
         'spotify': 'spotify_enrichment', 'itunes': 'itunes_enrichment',
-        'deezer': 'deezer_enrichment', 'lastfm': 'lastfm', 'genius': 'genius',
+        'deezer': 'deezer_enrichment', 'yandex': 'yandex_enrichment',
+        'lastfm': 'lastfm', 'genius': 'genius',
         'musicbrainz': 'musicbrainz', 'audiodb': 'audiodb', 'discogs': 'discogs',
         'tidal': 'tidal_enrichment', 'qobuz': 'qobuz_enrichment', 'amazon': 'amazon_enrichment',
         'jiosaavn': 'jiosaavn_enrichment',

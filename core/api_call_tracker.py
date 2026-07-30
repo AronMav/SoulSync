@@ -23,6 +23,7 @@ RATE_LIMITS = {
     'spotify': 171,       # MIN_API_INTERVAL=0.35s → ~171/min
     'itunes': 20,         # MIN_API_INTERVAL=3.0s → ~20/min
     'deezer': 60,         # MIN_API_INTERVAL=1.0s → ~60/min
+    'yandex': 60,         # MIN_API_INTERVAL=1.0s → ~60/min
     'lastfm': 300,        # MIN_API_INTERVAL=0.2s → ~300/min
     'genius': 30,         # MIN_API_INTERVAL=2.0s → ~30/min
     'musicbrainz': 60,    # MIN_API_INTERVAL=1.0s → ~60/min
@@ -40,6 +41,7 @@ SERVICE_LABELS = {
     'spotify': 'Spotify',
     'itunes': 'Apple Music',
     'deezer': 'Deezer',
+    'yandex': 'Yandex Music',
     'lastfm': 'Last.fm',
     'genius': 'Genius',
     'musicbrainz': 'MusicBrainz',
@@ -54,7 +56,7 @@ SERVICE_LABELS = {
 
 # Display order
 SERVICE_ORDER = [
-    'spotify', 'itunes', 'deezer', 'lastfm', 'genius',
+    'spotify', 'itunes', 'deezer', 'yandex', 'lastfm', 'genius',
     'musicbrainz', 'audiodb', 'tidal', 'qobuz', 'discogs', 'amazon', 'jiosaavn', 'bandcamp',
 ]
 

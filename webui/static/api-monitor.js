@@ -28,6 +28,7 @@ const _RATE_GAUGE_LOGOS = {
     spotify:    '/static/img/brands/spotify.png',
     itunes:     '/static/img/brands/itunes.png',
     deezer:     '/static/img/brands/deezer.png',
+    yandex:     '/static/img/brands/yandex.svg',
     jiosaavn:   '/static/img/brands/jiosaavn.webp',
     lastfm:     '/static/img/brands/lastfm.png',
     genius:     '/static/img/brands/genius.png',
