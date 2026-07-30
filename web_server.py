@@ -2589,6 +2589,7 @@ def _get_enrichment_status():
                 'idle': is_alive and not worker.paused and is_idle,
                 'calls_1h': calls_1h,
                 'calls_24h': calls_24h,
+                'total_processed': total_processed,
             }
 
             # Spotify-specific: include daily budget info

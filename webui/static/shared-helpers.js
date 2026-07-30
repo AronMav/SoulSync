@@ -4355,6 +4355,9 @@ function renderEnrichmentCards(enrichment) {
             } else if (c24h > 0) {
                 // Other services: show 24h count
                 activityHtml = `<span class="enrichment-chip-activity">${c24h.toLocaleString()} / 24h</span>`;
+            } else if (svc.total_processed > 0) {
+                // Idle/completed: show lifetime total
+                activityHtml = `<span class="enrichment-chip-activity">${svc.total_processed.toLocaleString()} total</span>`;
             }
         }
 

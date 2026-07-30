@@ -257,6 +257,8 @@ class YandexMetadataClient:
         )
 
     def search_tracks(self, query, limit=20, **k):
+        from core.api_call_tracker import api_call_tracker
+        api_call_tracker.record_call('yandex')
         try:
             res = self.client.search(query, type_="track")
             results = res.tracks.results if (res and res.tracks) else []
@@ -269,6 +271,8 @@ class YandexMetadataClient:
         return self.search_tracks(query, limit=limit)
 
     def search_albums(self, query, limit=20, **k):
+        from core.api_call_tracker import api_call_tracker
+        api_call_tracker.record_call('yandex')
         try:
             res = self.client.search(query, type_="album")
             results = res.albums.results if (res and res.albums) else []
