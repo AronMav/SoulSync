@@ -92,6 +92,7 @@ class WatchlistArtist:
     deezer_artist_id: Optional[str] = None  # Cross-provider support
     discogs_artist_id: Optional[str] = None  # Cross-provider support
     musicbrainz_artist_id: Optional[str] = None  # Cross-provider support
+    yandex_artist_id: Optional[str] = None  # Cross-provider support
     include_albums: bool = True
     include_eps: bool = True
     include_singles: bool = True
@@ -498,6 +499,7 @@ class MusicDatabase:
                     discogs_artist_id TEXT,
                     musicbrainz_artist_id TEXT,
                     amazon_artist_id TEXT,
+                    yandex_artist_id TEXT,
                     artist_name TEXT NOT NULL,
                     quality_profile_id INTEGER DEFAULT NULL,
                     date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -2760,6 +2762,10 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE watchlist_artists ADD COLUMN musicbrainz_artist_id TEXT")
                 logger.info("Added musicbrainz_artist_id column to watchlist_artists table for MusicBrainz support")
 
+            if 'yandex_artist_id' not in columns:
+                cursor.execute("ALTER TABLE watchlist_artists ADD COLUMN yandex_artist_id TEXT")
+                logger.info("Added yandex_artist_id column to watchlist_artists table for Yandex Music support")
+
         except Exception as e:
             logger.error(f"Error adding itunes_artist_id column to watchlist_artists: {e}")
             # Don't raise - this is a migration, database can still function
@@ -2883,6 +2889,7 @@ class MusicDatabase:
                             discogs_artist_id TEXT,
                             musicbrainz_artist_id TEXT,
                             amazon_artist_id TEXT,
+                            yandex_artist_id TEXT,
                             preferred_metadata_source TEXT DEFAULT NULL,
                             auto_download INTEGER NOT NULL DEFAULT 1,
                             profile_id INTEGER DEFAULT 1,
@@ -2915,6 +2922,7 @@ class MusicDatabase:
                             discogs_artist_id TEXT,
                             musicbrainz_artist_id TEXT,
                             amazon_artist_id TEXT,
+                            yandex_artist_id TEXT,
                             preferred_metadata_source TEXT DEFAULT NULL,
                             auto_download INTEGER NOT NULL DEFAULT 1
                         )
@@ -2929,7 +2937,7 @@ class MusicDatabase:
                             'include_remixes', 'include_acoustic', 'include_compilations',
                             'include_instrumentals', 'lookback_days',
                             'itunes_artist_id', 'deezer_artist_id', 'discogs_artist_id',
-                            'musicbrainz_artist_id', 'amazon_artist_id',
+                            'musicbrainz_artist_id', 'amazon_artist_id', 'yandex_artist_id',
                             'preferred_metadata_source', 'auto_download', 'profile_id']
                 shared_cols = [c for c in new_cols if c in old_cols]
                 cols_str = ', '.join(shared_cols)
@@ -3948,6 +3956,7 @@ class MusicDatabase:
                             discogs_artist_id TEXT,
                             musicbrainz_artist_id TEXT,
                             amazon_artist_id TEXT,
+                            yandex_artist_id TEXT,
                             preferred_metadata_source TEXT DEFAULT NULL,
                             auto_download INTEGER NOT NULL DEFAULT 1,
                             profile_id INTEGER DEFAULT 1,
@@ -3963,7 +3972,7 @@ class MusicDatabase:
                                 'include_remixes', 'include_acoustic', 'include_compilations',
                                 'include_instrumentals', 'lookback_days',
                                 'itunes_artist_id', 'deezer_artist_id', 'discogs_artist_id',
-                                'musicbrainz_artist_id', 'amazon_artist_id',
+                                'musicbrainz_artist_id', 'amazon_artist_id', 'yandex_artist_id',
                             'preferred_metadata_source', 'auto_download', 'profile_id']
                     shared_cols = [c for c in new_cols if c in col_names]
                     cols_str = ', '.join(shared_cols)
@@ -11813,7 +11822,7 @@ class MusicDatabase:
                 # Build SELECT query based on existing columns
                 base_columns = ['id', 'spotify_artist_id', 'artist_name', 'date_added',
                                'last_scan_timestamp', 'created_at', 'updated_at']
-                optional_columns = ['image_url', 'itunes_artist_id', 'deezer_artist_id', 'discogs_artist_id', 'musicbrainz_artist_id', 'include_albums', 'include_eps', 'include_singles',
+                optional_columns = ['image_url', 'itunes_artist_id', 'deezer_artist_id', 'discogs_artist_id', 'musicbrainz_artist_id', 'yandex_artist_id', 'include_albums', 'include_eps', 'include_singles',
                                    'include_live', 'include_remixes', 'include_acoustic', 'include_compilations',
                                    'include_instrumentals', 'lookback_days', 'preferred_metadata_source',
                                    'auto_download', 'quality_profile_id']
@@ -11844,6 +11853,7 @@ class MusicDatabase:
                     deezer_artist_id = row['deezer_artist_id'] if 'deezer_artist_id' in existing_columns else None
                     discogs_artist_id = row['discogs_artist_id'] if 'discogs_artist_id' in existing_columns else None
                     musicbrainz_artist_id = row['musicbrainz_artist_id'] if 'musicbrainz_artist_id' in existing_columns else None
+                    yandex_artist_id = row['yandex_artist_id'] if 'yandex_artist_id' in existing_columns else None
                     include_albums = bool(row['include_albums']) if 'include_albums' in existing_columns else True
                     include_eps = bool(row['include_eps']) if 'include_eps' in existing_columns else True
                     include_singles = bool(row['include_singles']) if 'include_singles' in existing_columns else True
@@ -11875,6 +11885,7 @@ class MusicDatabase:
                         deezer_artist_id=deezer_artist_id,
                         discogs_artist_id=discogs_artist_id,
                         musicbrainz_artist_id=musicbrainz_artist_id,
+                        yandex_artist_id=yandex_artist_id,
                         include_albums=include_albums,
                         include_eps=include_eps,
                         include_singles=include_singles,
@@ -12180,6 +12191,87 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error updating watchlist MusicBrainz ID: {e}")
             return False
+
+    def update_watchlist_yandex_id(self, watchlist_id: int, yandex_id: str) -> bool:
+        """Update the Yandex Music artist ID for a watchlist artist (cross-provider support)"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE watchlist_artists
+                    SET yandex_artist_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (yandex_id, watchlist_id))
+                conn.commit()
+                logger.info(f"Updated Yandex ID for watchlist artist {watchlist_id}: {yandex_id}")
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error updating watchlist Yandex ID: {e}")
+            return False
+
+    def backfill_watchlist_yandex_ids_from_library(self, profile_id: int = 1) -> int:
+        """Copy existing library Yandex artist IDs onto matching watchlist rows.
+
+        The Yandex enrichment worker writes IDs to ``artists.yandex_id``. The
+        watchlist scan reads ``watchlist_artists.yandex_artist_id``, so this
+        bridge lets already-enriched library matches serve the scan instead of
+        making it re-resolve every artist by name over the network.
+        """
+        match_sql = """
+            LOWER(a.name) = LOWER(watchlist_artists.artist_name)
+            OR (
+                watchlist_artists.spotify_artist_id IS NOT NULL
+                AND watchlist_artists.spotify_artist_id != ''
+                AND a.spotify_artist_id = watchlist_artists.spotify_artist_id
+            )
+            OR (
+                watchlist_artists.itunes_artist_id IS NOT NULL
+                AND watchlist_artists.itunes_artist_id != ''
+                AND a.itunes_artist_id = watchlist_artists.itunes_artist_id
+            )
+            OR (
+                watchlist_artists.deezer_artist_id IS NOT NULL
+                AND watchlist_artists.deezer_artist_id != ''
+                AND a.deezer_id = watchlist_artists.deezer_artist_id
+            )
+            OR (
+                watchlist_artists.musicbrainz_artist_id IS NOT NULL
+                AND watchlist_artists.musicbrainz_artist_id != ''
+                AND a.musicbrainz_id = watchlist_artists.musicbrainz_artist_id
+            )
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"""
+                    UPDATE watchlist_artists
+                    SET yandex_artist_id = (
+                            SELECT a.yandex_id
+                            FROM artists a
+                            WHERE a.yandex_id IS NOT NULL
+                              AND a.yandex_id != ''
+                              AND ({match_sql})
+                            LIMIT 1
+                        ),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE profile_id = ?
+                      AND (yandex_artist_id IS NULL OR yandex_artist_id = '')
+                      AND EXISTS (
+                          SELECT 1
+                          FROM artists a
+                          WHERE a.yandex_id IS NOT NULL
+                            AND a.yandex_id != ''
+                            AND ({match_sql})
+                      )
+                """, (profile_id,))
+                updated = cursor.rowcount
+                conn.commit()
+                if updated:
+                    logger.info(f"Backfilled Yandex IDs onto {updated} watchlist artists from the library")
+                return updated
+        except Exception as e:
+            logger.error(f"Error backfilling watchlist Yandex IDs: {e}")
+            return 0
 
     def backfill_watchlist_musicbrainz_ids_from_library(self, profile_id: int = 1) -> int:
         """Copy existing library MusicBrainz artist IDs onto matching watchlist rows.

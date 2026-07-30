@@ -24,6 +24,7 @@ SOURCE_COLUMNS: Dict[str, str] = {
     "discogs": "discogs_artist_id",
     "musicbrainz": "musicbrainz_artist_id",
     "amazon": "amazon_artist_id",
+    "yandex": "yandex_artist_id",
 }
 
 #: Spellings the UI, the metadata registry and older payloads actually send.
@@ -36,6 +37,9 @@ SOURCE_ALIASES: Dict[str, str] = {
     "musicbrainz_ng": "musicbrainz",
     "mb": "musicbrainz",
     "amazon_music": "amazon",
+    "yandex_music": "yandex",
+    "yandexmusic": "yandex",
+    "ya": "yandex",
 }
 
 ARTIST_ID_COLUMNS = tuple(SOURCE_COLUMNS.values())
