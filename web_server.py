@@ -40775,7 +40775,49 @@ def nd_delete_song():
 
     if not deleted:
         return jsonify({'success': False, 'error': 'File not found in library'}), 404
-    return jsonify({'success': True})
+
+    # Deleting is also an instruction: never fetch this track again. Recorded by
+    # name because Navidrome reports artist/title, not a provider id. Best
+    # effort — a blacklist failure must not turn a successful delete into an
+    # error response, since the file is already gone.
+    blacklisted = False
+    try:
+        artist = (data.get('artist') or '').strip()
+        title = (data.get('title') or '').strip()
+        if title:
+            blacklisted = MusicDatabase().add_deleted_blacklist(
+                artist, title, profile_id=get_current_profile_id())
+    except Exception as e:
+        logger.error(f"[nd-delete] Could not blacklist deleted track: {e}")
+
+    return jsonify({'success': True, 'blacklisted': blacklisted})
+
+
+@app.route('/api/nd/blacklist', methods=['GET'])
+def nd_blacklist_list():
+    """Every track blocked by a deletion, newest first."""
+    try:
+        entries = MusicDatabase().get_deleted_blacklist(profile_id=get_current_profile_id())
+        return jsonify({'success': True, 'entries': entries, 'count': len(entries)})
+    except Exception as e:
+        logger.error(f"[nd-delete] Could not read the blacklist: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/nd/blacklist/remove', methods=['POST'])
+def nd_blacklist_remove():
+    """Lift the ban so automation may fetch the track again."""
+    data = request.get_json(silent=True) or {}
+    title = (data.get('title') or '').strip()
+    if not title:
+        return jsonify({'success': False, 'error': 'No title provided'}), 400
+    try:
+        removed = MusicDatabase().remove_deleted_blacklist(
+            (data.get('artist') or '').strip(), title, profile_id=get_current_profile_id())
+        return jsonify({'success': removed})
+    except Exception as e:
+        logger.error(f"[nd-delete] Could not lift a blacklist entry: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/nd/delete-album', methods=['POST'])
@@ -40808,7 +40850,25 @@ def nd_delete_album():
 
     if not deleted:
         return jsonify({'success': False, 'error': 'Directory not found in library'}), 404
-    return jsonify({'success': True})
+
+    # The client collects the track list before the directory is removed —
+    # afterwards there is nothing left to read the names from.
+    blacklisted = 0
+    try:
+        db = MusicDatabase()
+        for track in (data.get('tracks') or []):
+            if not isinstance(track, dict):
+                continue
+            title = (track.get('title') or '').strip()
+            if not title:
+                continue
+            if db.add_deleted_blacklist((track.get('artist') or '').strip(), title,
+                                        profile_id=get_current_profile_id()):
+                blacklisted += 1
+    except Exception as e:
+        logger.error(f"[nd-delete] Could not blacklist deleted album tracks: {e}")
+
+    return jsonify({'success': True, 'blacklisted': blacklisted})
 
 
 # ================================================================================================

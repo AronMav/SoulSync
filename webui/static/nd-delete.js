@@ -29,11 +29,13 @@
     async function deleteSong(songId) {
         const song = await getSongInfo(songId);
         if (!song) { alert('Could not resolve song. Are you logged in?'); return; }
-        if (!confirm(`Delete from disk?\n\n"${song.title}"\nby ${song.artist}\nfrom "${song.album}"\n\nFile: ${song.path}`)) return;
+        if (!confirm(`Delete from disk?\n\n"${song.title}"\nby ${song.artist}\nfrom "${song.album}"\n\nFile: ${song.path}\n\nIt will also be blacklisted so automation never re-downloads it.`)) return;
         try {
             const resp = await fetch(`${API_BASE}/delete`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path: song.path })
+                // artist/title travel with the path: the blacklist matches by
+                // name, since Navidrome knows no provider id for the track.
+                body: JSON.stringify({ path: song.path, artist: song.artist, title: song.title })
             });
             const result = await resp.json();
             if (result.success) {
@@ -181,12 +183,17 @@
                 const album = data['subsonic-response']?.album;
                 if (!album) return;
                 const songs = album.song || [];
-                if (!songs.length || !confirm(`Delete entire album from disk?\n\n"${album.name}"\nby ${album.artist}\n${songs.length} track(s)`)) return;
+                if (!songs.length || !confirm(`Delete entire album from disk?\n\n"${album.name}"\nby ${album.artist}\n${songs.length} track(s)\n\nEvery track will also be blacklisted so automation never re-downloads them.`)) return;
                 const firstPath = songs[0].path;
                 const dir = firstPath.substring(0, firstPath.lastIndexOf('/'));
                 const delResp = await fetch(`${API_BASE}/delete-album`, {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ dir })
+                    // Collected BEFORE the directory goes away — afterwards there
+                    // is nothing left to read the track names from.
+                    body: JSON.stringify({
+                        dir,
+                        tracks: songs.map(sg => ({ artist: sg.artist, title: sg.title }))
+                    })
                 });
                 const result = await delResp.json();
                 if (result.success) {

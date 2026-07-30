@@ -391,6 +391,26 @@ class MusicDatabase:
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_wishlist_ignore_profile ON wishlist_ignore (profile_id, track_id)")
 
+            # Deleted-track blacklist: the user removed a track from the library
+            # with the Navidrome trash button and asked that automation never
+            # fetch it again. Matched by NAME because that button knows a track's
+            # artist and title, not a provider id — the native blocklist matches
+            # tracks by id only (its name fallback covers artists alone), and the
+            # ignore-list expires, which contradicts "never again".
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS deleted_blacklist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id INTEGER NOT NULL DEFAULT 1,
+                    artist_norm TEXT NOT NULL DEFAULT '',
+                    title_norm TEXT NOT NULL,
+                    artist TEXT DEFAULT '',
+                    title TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(profile_id, artist_norm, title_norm)
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_deleted_blacklist_lookup ON deleted_blacklist (profile_id, title_norm)")
+
             # Notification history (Kazimir): every toast the UI raises is
             # journaled here so a reflexive "Clear All" in the bell panel
             # loses nothing — the History modal reads this, filterable +
@@ -10502,6 +10522,32 @@ class MusicDatabase:
                 except Exception as _ignore_exc:
                     logger.debug("Wishlist ignore-list check skipped (fail-open): %s", _ignore_exc)
 
+                # Deleted-track blacklist: the user removed this track from the
+                # library with the Navidrome trash button and asked that it never
+                # come back. Every automatic re-add funnels through here — the
+                # watchlist scan, repair_worker, discography backfill and the
+                # label scan all call this method — so one check covers them all;
+                # a check in the scanner alone would leave the others open.
+                # Matched by NAME because the trash button reports artist/title,
+                # not a provider id. Manual intent bypasses AND clears the entry,
+                # exactly as it does for the ignore-list above. Fail-open.
+                try:
+                    _dbl_artist = ', '.join(
+                        a.get('name', '') for a in (spotify_track_data.get('artists') or [])
+                        if isinstance(a, dict) and a.get('name')
+                    ) or spotify_track_data.get('artist') or ''
+                    _dbl_title = spotify_track_data.get('name') or ''
+                    if source_type == 'manual' or user_initiated:
+                        self.remove_deleted_blacklist(_dbl_artist, _dbl_title, profile_id=profile_id)
+                    elif self.is_deleted_blacklisted(_dbl_artist, _dbl_title, profile_id=profile_id):
+                        logger.info(
+                            "Skipping wishlist add — track was deleted and blacklisted: '%s - %s'",
+                            _dbl_artist, _dbl_title,
+                        )
+                        return self._wishlist_outcome("skipped", track_id, reason="deleted-blacklist")
+                except Exception as _dbl_exc:
+                    logger.debug("Deleted-blacklist check skipped (fail-open): %s", _dbl_exc)
+
                 from core.library import manual_library_match as _mlm
                 if _mlm.get_match_for_track(self, profile_id, spotify_track_data):
                     logger.info(
@@ -10713,6 +10759,122 @@ class MusicDatabase:
 
         except Exception as e:
             logger.error(f"Error removing track from wishlist: {e}")
+            return False
+
+    # ── Deleted-track blacklist ──────────────────────────────────────────
+    #
+    # Name matching, not id matching: the Navidrome trash button reports an
+    # artist and a title. Collaborators arrive spelled three different ways —
+    # Navidrome joins them with a bullet, metadata sources use a comma or a
+    # semicolon — so a lookup also compares the FIRST artist on both sides.
+    # "&" and "/" are deliberately not separators: "Blank & Jones" and "AC/DC"
+    # are single names, and splitting them would ban unrelated artists.
+
+    @staticmethod
+    def _dbl_norm(value) -> str:
+        return (value or '').strip().lower()
+
+    @staticmethod
+    def _dbl_first_artist(value) -> str:
+        return re.split(r'[\u2022;,]', value or '')[0].strip().lower()
+
+    def add_deleted_blacklist(self, artist: str, title: str, profile_id: int = 1) -> bool:
+        """Record "deleted — never fetch again" for a track. Idempotent."""
+        title_norm = self._dbl_norm(title)
+        if not title_norm:
+            logger.warning("Refusing to blacklist a track with no title (artist=%r)", artist)
+            return False
+        try:
+            with self._get_connection() as conn:
+                conn.execute("""
+                    INSERT OR IGNORE INTO deleted_blacklist
+                        (profile_id, artist_norm, title_norm, artist, title)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (profile_id, self._dbl_norm(artist), title_norm, artist or '', title or ''))
+                conn.commit()
+            logger.info("Blacklisted deleted track: %s - %s", artist, title)
+            return True
+        except Exception as e:
+            logger.error("Error adding to deleted blacklist: %s", e)
+            return False
+
+    def is_deleted_blacklisted(self, artist: str, title: str, profile_id: int = 1) -> bool:
+        """True when this artist/title was deleted and must not be re-fetched.
+
+        Fail-open: any error answers False. The blacklist is a convenience, and
+        a broken lookup must never wedge every download.
+        """
+        title_norm = self._dbl_norm(title)
+        if not title_norm:
+            return False
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute("""
+                    SELECT artist_norm FROM deleted_blacklist
+                    WHERE profile_id = ? AND title_norm = ?
+                """, (profile_id, title_norm)).fetchall()
+            if not rows:
+                return False
+            incoming_full = self._dbl_norm(artist)
+            incoming_first = self._dbl_first_artist(artist)
+            for row in rows:
+                stored_full = row[0] or ''
+                # An entry stored without an artist bans the title outright.
+                if not stored_full:
+                    return True
+                if stored_full == incoming_full:
+                    return True
+                if incoming_first and self._dbl_first_artist(stored_full) == incoming_first:
+                    return True
+            return False
+        except Exception as e:
+            logger.debug("Deleted-blacklist lookup failed (fail-open): %s", e)
+            return False
+
+    def get_deleted_blacklist(self, profile_id: int = 1):
+        """Every blacklist entry for the profile, newest first."""
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT id, artist, title, artist_norm, title_norm, created_at
+                    FROM deleted_blacklist WHERE profile_id = ?
+                    ORDER BY created_at DESC, id DESC
+                """, (profile_id,)).fetchall()
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error("Error reading deleted blacklist: %s", e)
+            return []
+
+    def remove_deleted_blacklist(self, artist: str, title: str, profile_id: int = 1) -> bool:
+        """Lift the ban for a track. Uses the same matching as the lookup, so an
+        entry stored under one collaborator spelling can be cleared by another."""
+        title_norm = self._dbl_norm(title)
+        if not title_norm:
+            return False
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute("""
+                    SELECT id, artist_norm FROM deleted_blacklist
+                    WHERE profile_id = ? AND title_norm = ?
+                """, (profile_id, title_norm)).fetchall()
+                incoming_full = self._dbl_norm(artist)
+                incoming_first = self._dbl_first_artist(artist)
+                doomed = []
+                for row_id, stored_full in rows:
+                    stored_full = stored_full or ''
+                    if (not stored_full
+                            or stored_full == incoming_full
+                            or (incoming_first and self._dbl_first_artist(stored_full) == incoming_first)):
+                        doomed.append(row_id)
+                if not doomed:
+                    return False
+                conn.executemany("DELETE FROM deleted_blacklist WHERE id = ?", [(i,) for i in doomed])
+                conn.commit()
+            logger.info("Removed %d deleted-blacklist entries for %s - %s", len(doomed), artist, title)
+            return True
+        except Exception as e:
+            logger.error("Error removing from deleted blacklist: %s", e)
             return False
 
     # ── Wishlist ignore-list (#874) ──────────────────────────────────────
