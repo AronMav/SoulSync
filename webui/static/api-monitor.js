@@ -3,17 +3,17 @@
 
 const _rateMonitorState = {};
 const _RATE_GAUGE_SERVICES = [
-    'spotify', 'itunes', 'deezer', 'jiosaavn', 'lastfm', 'genius',
+    'spotify', 'itunes', 'deezer', 'yandex', 'jiosaavn', 'lastfm', 'genius',
     'musicbrainz', 'audiodb', 'tidal', 'qobuz', 'discogs', 'amazon',
 ];
 const _RATE_GAUGE_LABELS = {
-    spotify: 'Spotify', itunes: 'Apple Music', deezer: 'Deezer', jiosaavn: 'JioSaavn',
+    spotify: 'Spotify', itunes: 'Apple Music', deezer: 'Deezer', yandex: 'Yandex Music', jiosaavn: 'JioSaavn',
     lastfm: 'Last.fm', genius: 'Genius', musicbrainz: 'MusicBrainz',
     audiodb: 'AudioDB', tidal: 'Tidal', qobuz: 'Qobuz', discogs: 'Discogs',
     amazon: 'Amazon Music',
 };
 const _RATE_GAUGE_COLORS = {
-    spotify: '#1DB954', itunes: '#FC3C44', deezer: '#A238FF', jiosaavn: '#2BC5B4',
+    spotify: '#1DB954', itunes: '#FC3C44', deezer: '#A238FF', yandex: '#FFCC00', jiosaavn: '#2BC5B4',
     lastfm: '#D51007', genius: '#FFFF64', musicbrainz: '#BA478F',
     audiodb: '#00BCD4', tidal: '#00FFFF', qobuz: '#FF6B35', discogs: '#D4A574',
     amazon: '#FF9900',

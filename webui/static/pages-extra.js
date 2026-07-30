@@ -71,7 +71,7 @@ function _explorerLoadPlaylists() {
             // Render source tabs
             const tabsEl = document.getElementById('explorer-picker-tabs');
             if (tabsEl) {
-                const sourceNames = { spotify: 'Spotify', tidal: 'Tidal', deezer: 'Deezer', youtube: 'YouTube', beatport: 'Beatport', file: 'File', other: 'Other' };
+                const sourceNames = { spotify: 'Spotify', tidal: 'Tidal', deezer: 'Deezer', yandex: 'Yandex Music', youtube: 'YouTube', beatport: 'Beatport', file: 'File', other: 'Other' };
                 const sources = Object.keys(groups);
                 if (sources.length <= 1) {
                     tabsEl.style.display = 'none';
@@ -1326,7 +1326,7 @@ function _showServerDisambig(playlistId, playlistName, candidates) {
 
     if (subtitle) subtitle.textContent = `"${playlistName}" was found on ${candidates.length} sources. Which one do you want to compare against?`;
 
-    const sourceIcons = { spotify: '🟢', tidal: '🌊', youtube: '▶️', beatport: '🎛️', deezer: '🟣', file: '📄' };
+    const sourceIcons = { spotify: '🟢', tidal: '🌊', youtube: '▶️', beatport: '🎛️', deezer: '🟣', yandex: '🟡', file: '📄' };
 
     list.innerHTML = candidates.map((p, i) => {
         const icon = sourceIcons[p.source] || '📋';
@@ -1446,7 +1446,7 @@ async function _openServerCompareView(playlistId, playlistName, mirroredPlaylist
 
         // Column headers
         const sourceLabel = mirroredPlaylist ? (mirroredPlaylist.source || 'source').charAt(0).toUpperCase() + (mirroredPlaylist.source || 'source').slice(1) : 'Source';
-        const sourceIconMap = { spotify: '🟢', tidal: '🌊', youtube: '▶️', beatport: '🎛️', deezer: '🟣', file: '📄' };
+        const sourceIconMap = { spotify: '🟢', tidal: '🌊', youtube: '▶️', beatport: '🎛️', deezer: '🟣', yandex: '🟡', file: '📄' };
         const serverIconMap = { plex: '🟠', jellyfin: '🟣', navidrome: '🔵' };
 
         const srcIconEl = document.getElementById('server-col-source-icon');

@@ -31,7 +31,7 @@ const _SS_META_FALLBACK = {
 };
 // Brand colors drive each card's logo ring + active glow (the Manage-Workers feel).
 const _SS_BRAND = {
-    spotify: '#1db954', spotify_free: '#1db954', itunes: '#fc5c7d', deezer: '#a238ff',
+    spotify: '#1db954', spotify_free: '#1db954', itunes: '#fc5c7d', deezer: '#a238ff', yandex: '#ffcc00',
     discogs: '#ff5500', musicbrainz: '#ba478f', amazon: '#ff9900', jiosaavn: '#2bc5b4',
     plex: '#e5a00d', jellyfin: '#aa5cc3', navidrome: '#3b6cf6', soulsync: '#7c5cff',
     soulseek: '#22a7f0', youtube: '#ff0000', tidal: '#00cfe8', qobuz: '#0a6e9e',

@@ -226,6 +226,7 @@ async function searchDiscoveryFix() {
     const allSources = [
         { key: 'spotify', endpoint: '/api/spotify/search_tracks', label: 'Spotify' },
         { key: 'deezer', endpoint: '/api/deezer/search_tracks', label: 'Deezer' },
+        { key: 'yandex', endpoint: '/api/yandex/search_tracks', label: 'Yandex Music' },
         { key: 'itunes', endpoint: '/api/itunes/search_tracks', label: 'iTunes' },
         { key: 'musicbrainz', endpoint: '/api/musicbrainz/search_tracks', label: 'MusicBrainz' },
     ];
