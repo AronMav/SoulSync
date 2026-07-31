@@ -85,6 +85,15 @@
         });
     }
 
+    function ndToast(message) {
+        const el = document.createElement('div');
+        el.className = 'nd-del-toast';
+        el.textContent = message;
+        document.body.appendChild(el);
+        setTimeout(() => { el.classList.add('nd-del-toast-out'); }, 2600);
+        setTimeout(() => { el.remove(); }, 3100);
+    }
+
     // Navidrome's own API returns the REAL file path. The Subsonic `path` is
     // synthesised from tags (artist/album/NN - title), so deleting by it fails
     // with "File not found in library" whenever the file does not happen to sit
@@ -112,7 +121,7 @@
         return data['subsonic-response']?.song || null;
     }
 
-    async function deleteSong(songId) {
+    async function deleteSong(songId, row) {
         const song = await fetchRealSong(songId);
         if (!song) { alert('Could not resolve song. Are you logged in?'); return; }
         const okToDelete = await ndConfirm({
@@ -136,7 +145,8 @@
             const result = await resp.json();
             if (result.success) {
                 triggerRescan();
-                setTimeout(() => location.reload(), 1500);
+                if (row && row.parentNode) row.remove();
+                ndToast('Deleted — blacklisted so it will not come back.');
             } else {
                 alert('Delete failed: ' + (result.error || 'unknown error'));
             }
@@ -203,6 +213,15 @@
         .nd-del-btn:hover { background: rgba(255,255,255,0.08); }
         .nd-del-btn-danger { color: #f44336; }
         .nd-del-btn-danger:hover { background: rgba(244,67,54,0.12); }
+        .nd-del-toast {
+            position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%);
+            z-index: 20001; background: #323232; color: #fff; border-radius: 4px;
+            padding: 12px 18px; font-size: .875rem; max-width: 92vw;
+            font-family: Roboto, Helvetica, Arial, sans-serif;
+            box-shadow: 0 3px 5px -1px rgba(0,0,0,.2), 0 6px 10px 0 rgba(0,0,0,.14);
+            opacity: 1; transition: opacity .4s ease;
+        }
+        .nd-del-toast-out { opacity: 0; }
     `;
     document.head.appendChild(css);
 
@@ -302,7 +321,7 @@
         return null;
     }
 
-    async function deleteRecord(rec) {
+    async function deleteRecord(rec, row) {
         const okToDelete = await ndConfirm({
             title: 'Delete from disk?',
             lines: [
@@ -322,7 +341,11 @@
             const result = await resp.json();
             if (result.success) {
                 triggerRescan();
-                setTimeout(() => location.reload(), 1500);
+                // Take the row out here instead of reloading: Navidrome will
+                // catch up on its own scan, and a reload would restart playback
+                // and lose the queue over a one-row change.
+                if (row && row.parentNode) row.remove();
+                ndToast('Deleted — blacklisted so it will not come back.');
             } else {
                 alert('Delete failed: ' + (result.error || 'unknown error'));
             }
@@ -349,7 +372,7 @@
         btn.innerHTML = TRASH;
         btn.onclick = (e) => {
             e.preventDefault(); e.stopPropagation();
-            if (rec && rec.path) deleteRecord(rec); else deleteSong(songId);
+            if (rec && rec.path) deleteRecord(rec, row); else deleteSong(songId, row);
         };
         container.appendChild(btn);
     }
@@ -406,7 +429,10 @@
                 const result = await delResp.json();
                 if (result.success) {
                     triggerRescan();
-                    setTimeout(() => location.href = '/app/album/all', 1500);
+                    ndToast('Album deleted — every track blacklisted.');
+                    // The album page has nothing left to show, so step back to
+                    // the list — via the hash router, not a full reload.
+                    setTimeout(() => { location.hash = '#/album/all'; }, 900);
                 } else {
                     alert('Delete failed: ' + (result.error || 'unknown error'));
                 }
