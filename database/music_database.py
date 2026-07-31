@@ -10761,6 +10761,53 @@ class MusicDatabase:
             logger.error(f"Error removing track from wishlist: {e}")
             return False
 
+    def get_exhausted_wishlist_tracks(self, max_retries: int, profile_id: int = 1) -> list:
+        """Return wishlist tracks whose retry_count >= max_retries.
+
+        Used by the auto-abandon pass to identify tracks that have been
+        searched enough times without success and should be retired.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT wt.id, wt.spotify_track_id, wt.retry_count,
+                           wt.failure_reason, wt.date_added, wt.last_attempted,
+                           wt.spotify_data
+                    FROM wishlist_tracks wt
+                    WHERE wt.profile_id = ? AND wt.retry_count >= ?
+                    ORDER BY wt.retry_count DESC
+                """, (profile_id, max_retries))
+                rows = cursor.fetchall()
+
+                import json as _json
+                results = []
+                for row in rows:
+                    track_data = {}
+                    raw = row["spotify_data"] if "spotify_data" in row.keys() else None
+                    if raw:
+                        try:
+                            track_data = _json.loads(raw)
+                        except Exception:
+                            pass
+                    artists = track_data.get("artists", [])
+                    artist_name = (
+                        artists[0].get("name", "") if artists and isinstance(artists[0], dict)
+                        else str(artists[0]) if artists else ""
+                    )
+                    results.append({
+                        "id": row["id"],
+                        "spotify_track_id": row["spotify_track_id"],
+                        "retry_count": row["retry_count"],
+                        "failure_reason": row["failure_reason"],
+                        "track_name": track_data.get("name", ""),
+                        "artist_name": artist_name,
+                    })
+                return results
+        except Exception as e:
+            logger.error("Error fetching exhausted wishlist tracks: %s", e)
+            return []
+
     # ── Deleted-track blacklist ──────────────────────────────────────────
     #
     # Name matching, not id matching: the Navidrome trash button reports an

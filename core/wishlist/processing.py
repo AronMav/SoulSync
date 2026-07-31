@@ -30,6 +30,81 @@ logger = module_logger
 # for users who want different behaviour.
 _DEFAULT_ALBUM_BUNDLE_MIN_TRACKS = 2
 
+# Tracks that fail this many times are abandoned: removed from the wishlist
+# and placed on the ignore-list so watchlist scans don't re-queue them.
+# Configurable via ``wishlist.max_retry_count``.  The backoff ladder already
+# spaces retries to 7 days at attempt 4+, so by the time a track hits the
+# default cap it has been searched ~5 times over ~2 weeks with zero results.
+_DEFAULT_MAX_RETRY_COUNT = 5
+
+
+def _resolve_max_retry_count() -> int:
+    """Return the configured retry-count cap for wishlist abandonment."""
+    try:
+        from config.settings import config_manager
+        raw = config_manager.get('wishlist.max_retry_count',
+                                 _DEFAULT_MAX_RETRY_COUNT)
+        value = int(raw)
+        if value >= 1:
+            return value
+    except Exception:  # noqa: S110
+        pass
+    return _DEFAULT_MAX_RETRY_COUNT
+
+
+def abandon_exhausted_tracks(
+    music_database,
+    *,
+    profile_id: int = 1,
+    max_retries: int | None = None,
+    logger=logger,
+) -> int:
+    """Remove wishlist tracks that exceeded the retry-count cap.
+
+    Each abandoned track is added to the ignore-list (reason
+    ``'exhausted'``) so automatic re-queuing (watchlist scan, repair
+    worker, etc.) won't bring it back.  A manual "Process Wishlist Now"
+    or explicit user re-add clears the ignore entry as usual.
+
+    Returns the number of tracks removed.
+    """
+    cap = max_retries if max_retries is not None else _resolve_max_retry_count()
+    try:
+        exhausted = music_database.get_exhausted_wishlist_tracks(
+            cap, profile_id=profile_id)
+    except Exception as e:
+        logger.debug("abandon_exhausted_tracks query failed: %s", e)
+        return 0
+
+    if not exhausted:
+        return 0
+
+    removed = 0
+    for track in exhausted:
+        track_id = track.get('spotify_track_id') or ''
+        track_name = track.get('track_name', '')
+        artist_name = track.get('artist_name', '')
+        retry_count = track.get('retry_count', 0)
+        try:
+            music_database.remove_from_wishlist(track_id, profile_id=profile_id)
+            music_database.add_to_wishlist_ignore(
+                track_id, track_name=track_name, artist_name=artist_name,
+                reason='exhausted', profile_id=profile_id)
+            removed += 1
+            logger.info(
+                "[Wishlist] Abandoned '%s' by '%s' after %d failed attempts "
+                "(cap %d) — moved to ignore-list",
+                track_name, artist_name, retry_count, cap)
+        except Exception as e:
+            logger.warning(
+                "[Wishlist] Failed to abandon track %s: %s", track_id, e)
+
+    if removed:
+        logger.info(
+            "[Wishlist] Abandoned %d exhausted track(s) for profile %d",
+            removed, profile_id)
+    return removed
+
 
 def _resolve_album_bundle_threshold() -> int:
     """Return the configured min-tracks-per-album threshold for the
@@ -932,6 +1007,17 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
                     duplicates_removed = music_database.remove_wishlist_duplicates(profile_id=profile['id'])
                     if duplicates_removed > 0:
                         logger.warning(f"[Auto-Wishlist] Removed {duplicates_removed} duplicate tracks from profile {profile['id']}")
+
+                # Abandon tracks that exhausted their retry budget — they
+                # just burn a search slot every cycle forever otherwise.
+                for profile in all_profiles:
+                    abandoned = abandon_exhausted_tracks(
+                        music_database, profile_id=profile['id'])
+                    if abandoned:
+                        runtime.update_automation_progress(
+                            automation_id,
+                            log_line=f'Abandoned {abandoned} exhausted track(s) in profile {profile["id"]}',
+                            log_type='info')
 
                 # NOTE: We deliberately do NOT call remove_tracks_already_in_library here.
                 # The batch sets force_download_all=True (see comment a few lines below),
