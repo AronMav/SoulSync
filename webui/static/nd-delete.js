@@ -1,5 +1,5 @@
 /**
- * nd-delete.js — Adds "Delete from disk" buttons to Navidrome UI.
+ * nd-delete.js — Adds a "Delete from disk" button to the Navidrome player.
  * Injected via nginx sub_filter. Talks to SoulSync API at /nd-del/.
  */
 (function () {
@@ -121,9 +121,12 @@
         return data['subsonic-response']?.song || null;
     }
 
-    async function deleteSong(songId, row) {
+    async function deleteSong(songId) {
         const song = await fetchRealSong(songId);
-        if (!song) { alert('Could not resolve song. Are you logged in?'); return; }
+        if (!song) {
+            alert('Could not find that track in Navidrome — it may have been removed already, or the session expired. Try reloading the page.');
+            return;
+        }
         const okToDelete = await ndConfirm({
             title: 'Delete from disk?',
             lines: [
@@ -145,7 +148,6 @@
             const result = await resp.json();
             if (result.success) {
                 triggerRescan();
-                if (row && row.parentNode) row.remove();
                 ndToast('Deleted — blacklisted so it will not come back.');
             } else {
                 alert('Delete failed: ' + (result.error || 'unknown error'));
@@ -160,13 +162,6 @@
     // ---- CSS ----
     const css = document.createElement('style');
     css.textContent = `
-        .nd-del-icon {
-            cursor: pointer; color: #f44336; background: transparent; border: none;
-            padding: 4px; display: inline-flex; align-items: center; opacity: 0.5;
-            transition: opacity 0.15s; vertical-align: middle;
-        }
-        .nd-del-icon:hover { opacity: 1; }
-        .nd-del-icon svg { width: 16px; height: 16px; pointer-events: none; }
         .nd-del-player {
             cursor: pointer; color: #f44336; background: transparent !important; border: none !important;
             padding: 6px; display: inline-flex; align-items: center; opacity: 0.6;
@@ -174,15 +169,6 @@
         }
         .nd-del-player:hover { opacity: 1; }
         .nd-del-player svg { width: 20px; height: 20px; pointer-events: none; }
-        .nd-del-album {
-            cursor: pointer; color: #f44336; background: rgba(244,67,54,0.1);
-            border: 1px solid rgba(244,67,54,0.3); border-radius: 4px;
-            padding: 6px 14px; font-size: 0.8rem; font-weight: 500;
-            display: inline-flex; align-items: center; gap: 6px;
-            transition: background 0.15s;
-        }
-        .nd-del-album:hover { background: rgba(244,67,54,0.2); }
-        .nd-del-album svg { width: 16px; height: 16px; }
         .nd-del-overlay {
             position: fixed; inset: 0; z-index: 20000; display: flex;
             align-items: center; justify-content: center;
@@ -245,15 +231,15 @@
         return null;
     }
 
-    function getSongId(row) {
-        const d = row.querySelector('[data-id]');
-        if (d) return d.getAttribute('data-id');
-        const links = row.querySelectorAll('a[href*="stream"], a[href*="download"]');
-        for (const a of links) {
-            const m = (a.getAttribute('href') || '').match(/[?&]id=([^&]+)/);
-            if (m) return m[1];
+    function currentPlayingId() {
+        const audio = document.querySelector('.music-player-audio, audio');
+        if (audio) {
+            const src = audio.getAttribute('src') || audio.currentSrc || '';
+            const m = src.match(/[?&](?:mediaId|id)=([^&]+)/);
+            if (m) return decodeURIComponent(m[1]);
         }
-        return getSongIdFromFiber(row);
+        const playerEl = document.querySelector('.music-player, [class*="music-player"], [class*="NDAudioPlayer"]');
+        return playerEl ? getSongIdFromFiber(playerEl) : null;
     }
 
     // ---- Player delete button ----
@@ -271,21 +257,9 @@
             || document.querySelector('.music-player-panel');
         if (!player || player.querySelector('.nd-del-player')) return;
 
-        // Get current song ID from the audio element's src. 0.63 streams carry
-        // `mediaId=<id>`; older builds used `id=<id>`. Accept either.
-        const audio = document.querySelector('.music-player-audio, audio');
-        let songId = null;
-        if (audio) {
-            const src = audio.getAttribute('src') || audio.currentSrc || '';
-            const m = src.match(/[?&](?:mediaId|id)=([^&]+)/);
-            if (m) songId = decodeURIComponent(m[1]);
-        }
-        if (!songId) {
-            // Walk the player DOM to find the song id via React fiber
-            const playerEl = document.querySelector('.music-player, [class*="music-player"], [class*="NDAudioPlayer"]');
-            if (playerEl) songId = getSongIdFromFiber(playerEl);
-        }
-        if (!songId) return;
+        // Only show the button once something is actually playing. The id itself
+        // is deliberately NOT captured here — see currentPlayingId().
+        if (!currentPlayingId()) return;
 
         // The row is a flat list of `span.group` slots (volume, loop, lyrics,
         // queue, destroy), so match that shape instead of dropping a bare
@@ -294,7 +268,12 @@
         btn.className = 'group nd-del-player';
         btn.title = 'Delete current song from disk';
         btn.innerHTML = TRASH;
-        btn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); deleteSong(songId); };
+        btn.onclick = (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const playingNow = currentPlayingId();
+            if (!playingNow) { ndToast('Nothing is playing right now.'); return; }
+            deleteSong(playingNow);
+        };
 
         // Sit immediately to the right of the lyrics toggle; fall back to the
         // end of the row if that control is absent (older player, or lyrics
@@ -307,153 +286,9 @@
         }
     }
 
-    // The row's React fiber carries the whole record — id, title, artist and
-    // path — so a row delete needs no API round-trip at all.
-    function getRecordFromFiber(el) {
-        const rk = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
-        if (!rk) return null;
-        let fiber = el[rk];
-        for (let i = 0; i < 30 && fiber; i++) {
-            const p = fiber.memoizedProps;
-            if (p && p.record && p.record.id && p.record.path) return p.record;
-            fiber = fiber.return;
-        }
-        return null;
-    }
-
-    async function deleteRecord(rec, row) {
-        const okToDelete = await ndConfirm({
-            title: 'Delete from disk?',
-            lines: [
-                { text: rec.title || '' },
-                { text: rec.artist || '', muted: true },
-                { text: rec.path || '', muted: true },
-                { text: 'It will also be blacklisted so automation never re-downloads it.', muted: true },
-            ],
-            confirmText: 'Delete',
-        });
-        if (!okToDelete) return;
-        try {
-            const resp = await fetch(`${API_BASE}/delete`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path: rec.path, artist: rec.artist, title: rec.title })
-            });
-            const result = await resp.json();
-            if (result.success) {
-                triggerRescan();
-                // Take the row out here instead of reloading: Navidrome will
-                // catch up on its own scan, and a reload would restart playback
-                // and lose the queue over a one-row change.
-                if (row && row.parentNode) row.remove();
-                ndToast('Deleted — blacklisted so it will not come back.');
-            } else {
-                alert('Delete failed: ' + (result.error || 'unknown error'));
-            }
-        } catch (e) { alert('Delete failed: ' + e.message); }
-    }
-
-    // ---- Song row delete button ----
-    function addDeleteToRow(row) {
-        if (row.querySelector('.nd-del-icon')) return;
-        const rec = getRecordFromFiber(row);
-        const songId = rec ? rec.id : getSongId(row);
-        if (!songId) return;
-
-        let container = row.querySelector('[class*="contextMenu"]');
-        if (!container) {
-            const cells = row.querySelectorAll('td');
-            if (cells.length > 0) container = cells[cells.length - 1];
-        }
-        if (!container) return;
-
-        const btn = document.createElement('button');
-        btn.className = 'nd-del-icon';
-        btn.title = 'Delete from disk';
-        btn.innerHTML = TRASH;
-        btn.onclick = (e) => {
-            e.preventDefault(); e.stopPropagation();
-            if (rec && rec.path) deleteRecord(rec, row); else deleteSong(songId, row);
-        };
-        container.appendChild(btn);
-    }
-
-    // ---- Album page delete button ----
-    function addDeleteToAlbumPage() {
-        // Navidrome routes through the hash (#/album/<id>/show), so the album id
-        // is never in location.pathname — which is always /app/.
-        const match = (location.hash || location.pathname).match(/\/album\/([^/?#]+)/);
-        if (!match) return;
-        const albumId = decodeURIComponent(match[1]);
-        // MUI emits hashed jss class names now, so the old class-based lookup
-        // matches nothing. Anchor on the album's own Shuffle/Play control and
-        // use its toolbar; fall back to the card holding the album heading.
-        const anchor = document.querySelector('button[aria-label*="huffle"], button[aria-label*="lay"]');
-        const actionsArea = (anchor && anchor.parentElement)
-            || document.querySelector('[class*="MuiCardContent-root"]');
-        if (!actionsArea || actionsArea.querySelector('.nd-del-album')) return;
-
-        const btn = document.createElement('button');
-        btn.className = 'nd-del-album';
-        btn.innerHTML = TRASH + '<span>Delete album</span>';
-        btn.onclick = async (e) => {
-            e.preventDefault(); e.stopPropagation();
-            const params = authParams({ id: albumId });
-            try {
-                const resp = await fetch(`${ND_API}/getAlbum?${params}`);
-                const data = await resp.json();
-                const album = data['subsonic-response']?.album;
-                if (!album) return;
-                const songs = album.song || [];
-                if (!songs.length) return;
-                const okAlbum = await ndConfirm({
-                    title: 'Delete entire album from disk?',
-                    lines: [
-                        { text: album.name || '' },
-                        { text: (album.artist || '') + ' · ' + songs.length + ' track(s)', muted: true },
-                        { text: 'Every track will also be blacklisted so automation never re-downloads them.', muted: true },
-                    ],
-                    confirmText: 'Delete album',
-                });
-                if (!okAlbum) return;
-                const firstPath = songs[0].path;
-                const dir = firstPath.substring(0, firstPath.lastIndexOf('/'));
-                const delResp = await fetch(`${API_BASE}/delete-album`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    // Collected BEFORE the directory goes away — afterwards there
-                    // is nothing left to read the track names from.
-                    body: JSON.stringify({
-                        dir,
-                        tracks: songs.map(sg => ({ artist: sg.artist, title: sg.title }))
-                    })
-                });
-                const result = await delResp.json();
-                if (result.success) {
-                    triggerRescan();
-                    ndToast('Album deleted — every track blacklisted.');
-                    // The album page has nothing left to show, so step back to
-                    // the list — via the hash router, not a full reload.
-                    setTimeout(() => { location.hash = '#/album/all'; }, 900);
-                } else {
-                    alert('Delete failed: ' + (result.error || 'unknown error'));
-                }
-            } catch (e) { alert('Delete failed: ' + e.message); }
-        };
-        actionsArea.appendChild(btn);
-    }
-
     // ---- Main scan ----
-    function processRows() {
-        document.querySelectorAll('tbody tr').forEach(row => {
-            if (row.querySelector('.songTitle, [class*="songTitle"]') || row.textContent.trim().length > 10) {
-                addDeleteToRow(row);
-            }
-        });
-    }
-
     function scan() {
-        processRows();
         addDeleteToPlayer();
-        if ((location.hash || location.pathname).includes('/album/')) addDeleteToAlbumPage();
     }
 
     // ---- MutationObserver ----
