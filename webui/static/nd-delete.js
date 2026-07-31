@@ -29,6 +29,82 @@
         return params;
     }
 
+    // ---- Confirmation dialog (styled like Navidrome, not a browser popup) ----
+    function ndConfirm({ title, lines, confirmText }) {
+        return new Promise(resolve => {
+            const overlay = document.createElement('div');
+            overlay.className = 'nd-del-overlay';
+
+            const paper = document.createElement('div');
+            paper.className = 'nd-del-dialog';
+
+            const h = document.createElement('h2');
+            h.className = 'nd-del-dialog-title';
+            h.textContent = title;
+            paper.appendChild(h);
+
+            const body = document.createElement('div');
+            body.className = 'nd-del-dialog-body';
+            lines.forEach(line => {
+                const row = document.createElement('div');
+                row.className = line.muted ? 'nd-del-line nd-del-line-muted' : 'nd-del-line';
+                row.textContent = line.text;   // textContent: titles are arbitrary
+                body.appendChild(row);
+            });
+            paper.appendChild(body);
+
+            const actions = document.createElement('div');
+            actions.className = 'nd-del-dialog-actions';
+            const cancel = document.createElement('button');
+            cancel.className = 'nd-del-btn';
+            cancel.textContent = 'Cancel';
+            const ok = document.createElement('button');
+            ok.className = 'nd-del-btn nd-del-btn-danger';
+            ok.textContent = confirmText || 'Delete';
+            actions.appendChild(cancel);
+            actions.appendChild(ok);
+            paper.appendChild(actions);
+
+            overlay.appendChild(paper);
+            document.body.appendChild(overlay);
+
+            const close = (answer) => {
+                document.removeEventListener('keydown', onKey);
+                overlay.remove();
+                resolve(answer);
+            };
+            const onKey = (e) => {
+                if (e.key === 'Escape') close(false);
+                if (e.key === 'Enter') close(true);
+            };
+            cancel.onclick = () => close(false);
+            ok.onclick = () => close(true);
+            overlay.onclick = (e) => { if (e.target === overlay) close(false); };
+            document.addEventListener('keydown', onKey);
+            ok.focus();
+        });
+    }
+
+    // Navidrome's own API returns the REAL file path. The Subsonic `path` is
+    // synthesised from tags (artist/album/NN - title), so deleting by it fails
+    // with "File not found in library" whenever the file does not happen to sit
+    // where the tags imply — which is most of the library.
+    async function fetchRealSong(songId) {
+        const jwt = localStorage.getItem('token');
+        if (jwt) {
+            try {
+                const resp = await fetch(`/api/song/${encodeURIComponent(songId)}`, {
+                    headers: { 'x-nd-authorization': 'Bearer ' + jwt }
+                });
+                if (resp.ok) {
+                    const song = await resp.json();
+                    if (song && song.path) return song;
+                }
+            } catch (e) { /* fall through to Subsonic */ }
+        }
+        return await getSongInfo(songId);
+    }
+
     async function getSongInfo(songId) {
         const params = authParams({ id: songId });
         const resp = await fetch(`${ND_API}/getSong?${params}`);
@@ -37,9 +113,19 @@
     }
 
     async function deleteSong(songId) {
-        const song = await getSongInfo(songId);
+        const song = await fetchRealSong(songId);
         if (!song) { alert('Could not resolve song. Are you logged in?'); return; }
-        if (!confirm(`Delete from disk?\n\n"${song.title}"\nby ${song.artist}\nfrom "${song.album}"\n\nFile: ${song.path}\n\nIt will also be blacklisted so automation never re-downloads it.`)) return;
+        const okToDelete = await ndConfirm({
+            title: 'Delete from disk?',
+            lines: [
+                { text: song.title || '' },
+                { text: (song.artist || '') + (song.album ? ' — ' + song.album : ''), muted: true },
+                { text: song.path || '', muted: true },
+                { text: 'It will also be blacklisted so automation never re-downloads it.', muted: true },
+            ],
+            confirmText: 'Delete',
+        });
+        if (!okToDelete) return;
         try {
             const resp = await fetch(`${API_BASE}/delete`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -87,6 +173,36 @@
         }
         .nd-del-album:hover { background: rgba(244,67,54,0.2); }
         .nd-del-album svg { width: 16px; height: 16px; }
+        .nd-del-overlay {
+            position: fixed; inset: 0; z-index: 20000; display: flex;
+            align-items: center; justify-content: center;
+            background: rgba(0,0,0,0.6);
+        }
+        .nd-del-dialog {
+            background: #303030; color: #fff; border-radius: 4px;
+            box-shadow: 0 11px 15px -7px rgba(0,0,0,.2), 0 24px 38px 3px rgba(0,0,0,.14);
+            min-width: 320px; max-width: min(560px, 92vw); padding: 0 0 8px;
+            font-family: Roboto, Helvetica, Arial, sans-serif;
+        }
+        .nd-del-dialog-title {
+            margin: 0; padding: 16px 24px 8px; font-size: 1.25rem; font-weight: 500;
+        }
+        .nd-del-dialog-body { padding: 0 24px 12px; }
+        .nd-del-line {
+            font-size: 1rem; margin: 2px 0; word-break: break-word;
+        }
+        .nd-del-line-muted { font-size: .82rem; opacity: .65; }
+        .nd-del-dialog-actions {
+            display: flex; justify-content: flex-end; gap: 8px; padding: 8px 16px 8px;
+        }
+        .nd-del-btn {
+            background: transparent; border: none; border-radius: 4px; cursor: pointer;
+            color: #fff; font-size: .875rem; font-weight: 500; letter-spacing: .02em;
+            text-transform: uppercase; padding: 8px 12px;
+        }
+        .nd-del-btn:hover { background: rgba(255,255,255,0.08); }
+        .nd-del-btn-danger { color: #f44336; }
+        .nd-del-btn-danger:hover { background: rgba(244,67,54,0.12); }
     `;
     document.head.appendChild(css);
 
@@ -187,7 +303,17 @@
     }
 
     async function deleteRecord(rec) {
-        if (!confirm(`Delete from disk?\n\n"${rec.title}"\nby ${rec.artist}\n\nFile: ${rec.path}\n\nIt will also be blacklisted so automation never re-downloads it.`)) return;
+        const okToDelete = await ndConfirm({
+            title: 'Delete from disk?',
+            lines: [
+                { text: rec.title || '' },
+                { text: rec.artist || '', muted: true },
+                { text: rec.path || '', muted: true },
+                { text: 'It will also be blacklisted so automation never re-downloads it.', muted: true },
+            ],
+            confirmText: 'Delete',
+        });
+        if (!okToDelete) return;
         try {
             const resp = await fetch(`${API_BASE}/delete`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -255,7 +381,17 @@
                 const album = data['subsonic-response']?.album;
                 if (!album) return;
                 const songs = album.song || [];
-                if (!songs.length || !confirm(`Delete entire album from disk?\n\n"${album.name}"\nby ${album.artist}\n${songs.length} track(s)\n\nEvery track will also be blacklisted so automation never re-downloads them.`)) return;
+                if (!songs.length) return;
+                const okAlbum = await ndConfirm({
+                    title: 'Delete entire album from disk?',
+                    lines: [
+                        { text: album.name || '' },
+                        { text: (album.artist || '') + ' · ' + songs.length + ' track(s)', muted: true },
+                        { text: 'Every track will also be blacklisted so automation never re-downloads them.', muted: true },
+                    ],
+                    confirmText: 'Delete album',
+                });
+                if (!okAlbum) return;
                 const firstPath = songs[0].path;
                 const dir = firstPath.substring(0, firstPath.lastIndexOf('/'));
                 const delResp = await fetch(`${API_BASE}/delete-album`, {
