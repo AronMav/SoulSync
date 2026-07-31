@@ -3441,6 +3441,27 @@ class MusicDatabase:
             logger.error(f"Error adding Deezer columns: {e}")
             # Don't raise - this is a migration, database can still function
 
+        # --- Repair worker columns ---
+        # Kept in their OWN try block: a failure in the Deezer ALTERs above must not
+        # prevent these from being created, or the repair worker errors on every run
+        # querying a missing repair_status column. (#964 folded this into the Deezer
+        # block; restored here.) Re-read tracks_columns so a partial failure above
+        # doesn't leave us with a stale snapshot.
+        try:
+            cursor.execute("PRAGMA table_info(tracks)")
+            tracks_columns = [column[1] for column in cursor.fetchall()]
+
+            if 'repair_status' not in tracks_columns:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN repair_status TEXT")
+            if 'repair_last_checked' not in tracks_columns:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN repair_last_checked TIMESTAMP")
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_repair_status ON tracks (repair_status)")
+
+        except Exception as e:
+            logger.error(f"Error adding repair worker columns: {e}")
+            # Don't raise - this is a migration, database can still function
+
     def _add_yandex_columns(self, cursor):
         """Add Yandex Music tracking columns for enrichment (artists, albums, tracks).
 
@@ -3490,27 +3511,6 @@ class MusicDatabase:
 
         except Exception as e:
             logger.error(f"Error adding Yandex columns: {e}")
-            # Don't raise - this is a migration, database can still function
-
-        # --- Repair worker columns ---
-        # Kept in their OWN try block: a failure in the Deezer ALTERs above must not
-        # prevent these from being created, or the repair worker errors on every run
-        # querying a missing repair_status column. (#964 folded this into the Deezer
-        # block; restored here.) Re-read tracks_columns so a partial failure above
-        # doesn't leave us with a stale snapshot.
-        try:
-            cursor.execute("PRAGMA table_info(tracks)")
-            tracks_columns = [column[1] for column in cursor.fetchall()]
-
-            if 'repair_status' not in tracks_columns:
-                cursor.execute("ALTER TABLE tracks ADD COLUMN repair_status TEXT")
-            if 'repair_last_checked' not in tracks_columns:
-                cursor.execute("ALTER TABLE tracks ADD COLUMN repair_last_checked TIMESTAMP")
-
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_repair_status ON tracks (repair_status)")
-
-        except Exception as e:
-            logger.error(f"Error adding repair worker columns: {e}")
             # Don't raise - this is a migration, database can still function
 
     def _add_jiosaavn_columns(self, cursor):
