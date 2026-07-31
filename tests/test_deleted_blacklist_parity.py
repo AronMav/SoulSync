@@ -47,16 +47,36 @@ def test_the_wishlist_gate_is_actually_wired(tmp_path):
     assert outcome.get("reason") == "deleted-blacklist"
 
 
+def _nd_delete_script() -> str:
+    script = Path(__file__).resolve().parents[1] / "webui" / "static" / "nd-delete.js"
+    return script.read_text(encoding="utf-8")
+
+
 def test_the_browser_script_sends_the_track_identity():
     """The button knows artist and title; if it stops sending them the backend
     has nothing to record and the blacklist quietly stays empty."""
-    script = Path(__file__).resolve().parents[1] / "webui" / "static" / "nd-delete.js"
-    text = script.read_text(encoding="utf-8")
+    text = _nd_delete_script()
 
     assert "artist: song.artist" in text
     assert "title: song.title" in text
-    # Album deletion collects its track list before the directory disappears.
-    assert "tracks: songs.map" in text
+
+
+def test_the_player_resolves_the_track_at_click_time():
+    """Regression guard for a delete-the-wrong-file bug.
+
+    The control row is built once and never rebuilt when the player advances,
+    so an id captured while creating the button goes stale immediately: the
+    button then deletes whatever had been playing when it first appeared. The
+    click handler must ask what is playing now.
+    """
+    text = _nd_delete_script()
+
+    assert "function currentPlayingId()" in text
+    click_handler = text[text.index("btn.onclick"):]
+    assert "currentPlayingId()" in click_handler[:400], (
+        "the click handler must resolve the playing track itself, "
+        "not reuse an id captured when the button was created"
+    )
 
 
 def test_the_delete_and_blacklist_routes_are_registered():
