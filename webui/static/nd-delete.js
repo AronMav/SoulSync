@@ -152,12 +152,24 @@
         }
         if (!songId) return;
 
-        const btn = document.createElement('button');
-        btn.className = 'nd-del-player';
+        // The row is a flat list of `span.group` slots (volume, loop, lyrics,
+        // queue, destroy), so match that shape instead of dropping a bare
+        // <button> in — otherwise it does not line up with its neighbours.
+        const btn = document.createElement('span');
+        btn.className = 'group nd-del-player';
         btn.title = 'Delete current song from disk';
         btn.innerHTML = TRASH;
         btn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); deleteSong(songId); };
-        player.appendChild(btn);
+
+        // Sit immediately to the right of the lyrics toggle; fall back to the
+        // end of the row if that control is absent (older player, or lyrics
+        // disabled in settings).
+        const lyric = player.querySelector('.lyric-btn, [title*="yric"], [title*="екст"]');
+        if (lyric && lyric.parentElement === player) {
+            lyric.insertAdjacentElement('afterend', btn);
+        } else {
+            player.appendChild(btn);
+        }
     }
 
     // The row's React fiber carries the whole record — id, title, artist and
