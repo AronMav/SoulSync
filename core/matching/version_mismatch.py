@@ -40,6 +40,15 @@ _BARE_VERSION = 'original'
 # be bare-titled even though the audio is genuinely live.
 _LIVE_AWARE_VERSIONS = frozenset({'live'})
 
+# Versions where AcoustID / MusicBrainz annotation is unreliable even
+# though the fingerprint matched.  When the fingerprint score is very
+# high (>= 0.90) AND the bare title + artist agree, a one-sided
+# annotation difference for these versions is more likely a metadata
+# error than a genuinely different recording.  The classic case:
+# Qobuz serves the correct vocal track but AcoustID's recording entry
+# carries an "instrumental" or "remix" annotation from a linked release.
+_HIGH_CONFIDENCE_LOOSE_VERSIONS = frozenset({'instrumental', 'remix'})
+
 
 def is_acceptable_version_mismatch(
     expected_version: str,
@@ -81,35 +90,56 @@ def is_acceptable_version_mismatch(
       #607 example 2).
     - expected=``'original'``, matched=``'live'`` — same case in the
       other direction.
+    - expected=``'original'``, matched=``'instrumental'``, fp=0.95,
+      title=0.95, artist=1.0 — AcoustID annotation error; the
+      fingerprint matched the correct vocal track but the linked MB
+      recording carries an instrumental annotation.
 
     Examples that REJECT (return False):
 
-    - expected=``'instrumental'``, matched=``'original'`` — fingerprint
-      matched the instrumental recording; if user asked for vocal, the
-      file is genuinely wrong. Stays strict regardless of confidence.
-    - expected=``'remix'``, matched=``'original'`` — same logic.
+    - expected=``'instrumental'``, matched=``'original'`` — user
+      explicitly wanted the instrumental; a vocal file is wrong.
     - expected=``'live'``, matched=``'remix'`` — both versioned,
       both different. Real mismatch.
     - expected=``'live'``, matched=``'original'``, fp=0.50 — one-sided
       live but low confidence. Fall through to FAIL.
     - expected=``'live'``, matched=``'original'``, fp=0.95 but title
       sim 0.30 — bare titles don't agree. Different song.
+    - expected=``'original'``, matched=``'instrumental'``, fp=0.70 —
+      high-confidence loose versions still require fp >= 0.90.
     """
     if expected_version == matched_version:
         return True
 
+    # --- one-sided live (original <-> live) ---
     one_sided_live = (
         (expected_version in _LIVE_AWARE_VERSIONS and matched_version == _BARE_VERSION)
         or (expected_version == _BARE_VERSION and matched_version in _LIVE_AWARE_VERSIONS)
     )
-    if not one_sided_live:
-        return False
+    if one_sided_live:
+        return (
+            fingerprint_score >= score_threshold
+            and title_similarity >= title_threshold
+            and artist_similarity >= artist_threshold
+        )
 
-    return (
-        fingerprint_score >= score_threshold
-        and title_similarity >= title_threshold
-        and artist_similarity >= artist_threshold
+    # --- one-sided instrumental/remix with very high confidence ---
+    # Only when the USER wanted the original (bare) and AcoustID tagged
+    # the matched recording as instrumental/remix.  The reverse direction
+    # (user wanted instrumental, got original) stays strict — the user
+    # explicitly asked for a non-vocal cut.
+    one_sided_loose = (
+        expected_version == _BARE_VERSION
+        and matched_version in _HIGH_CONFIDENCE_LOOSE_VERSIONS
     )
+    if one_sided_loose:
+        return (
+            fingerprint_score >= 0.90
+            and title_similarity >= title_threshold
+            and artist_similarity >= artist_threshold
+        )
+
+    return False
 
 
 __all__ = ['is_acceptable_version_mismatch']

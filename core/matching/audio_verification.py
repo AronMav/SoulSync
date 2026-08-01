@@ -57,7 +57,10 @@ def normalize(text: str) -> str:
     s = text.lower().strip()
     # Annotations that are metadata, not core identity.
     s = re.sub(r'\s*\([^)]*\)', '', s)
-    s = re.sub(r'\s*\[[^\]]*\]', '', s)
+    # Strip [annotations] only when preceded by title content.  A title
+    # that IS entirely bracketed (e.g. "[Chali]", "[Riff Raff]", "[Stef]")
+    # keeps its brackets — they are the name, not a version/credit tag.
+    s = re.sub(r'(?<=\S)\s*\[[^\]]*\]', '', s)
     s = re.sub(r'\s*<[^>]*>', '', s)
     # Trailing featuring / version tags.
     s = re.sub(r'\s+(?:feat\.?|ft\.?|featuring)\s+.*$', '', s, flags=re.IGNORECASE)
