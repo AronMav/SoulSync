@@ -81,3 +81,48 @@ def test_empty_expected_artist_does_not_fail():
     out = evaluate("Some Track", "", [_rec("Some Track", "Whoever")],
                    fingerprint_score=0.95)
     assert out.decision == Decision.PASS
+
+
+# ---------------------------------------------------------------------------
+# Advisory labels — "(Explicit)"/"(Clean)" are lyrics-treatment labels on the
+# same recording, not version cuts. Live case (2026-09-16): Qobuz served
+# "Welcome 2 Detroit (Album Version (Explicit))" (full FLAC) but MusicBrainz'
+# recording is bare-titled -> the version gate quarantined the correct file
+# with "Version mismatch: expected (explicit) but file is (original)".
+# ---------------------------------------------------------------------------
+
+# Real AcoustID lookup for Trick Trick - Welcome 2 Detroit, fp 0.98.
+_W2D_RECORDINGS = [
+    _rec("Welcome 2 Detroit", "Trick-Trick feat. Eminem"),
+    _rec("Welcome 2 Detroit (instrumental)", "Trick-Trick"),
+    _rec("Welcome to Detroit City", "Eminem feat. Trick-Trick"),
+    _rec("Instrumental Track #1", "[unknown]"),
+    _rec("Welcome 2 Detroit (main)", "Trick-Trick featuring Eminem"),
+    _rec("6 Minutes", "Tricky"),
+    _rec("Welcome 2 Detroit (clean)", "Trick-Trick"),
+]
+
+
+def test_explicit_label_vs_bare_mb_title_passes():
+    # The reporter's exact file: expected carries "(Explicit)", the best
+    # AcoustID/MB recording is bare-titled. Same recording — PASS.
+    out = evaluate(
+        "Welcome 2 Detroit (Album Version (Explicit))", "Trick Trick",
+        _W2D_RECORDINGS, fingerprint_score=0.98,
+    )
+    assert out.decision == Decision.PASS
+
+
+def test_advisory_labeled_candidate_accepted():
+    # An "(Explicit)"-labeled recording is the same cut as the bare
+    # expected title — it must stay eligible in the version gate (and
+    # the result is a PASS, not a version quarantine).
+    out = evaluate(
+        "In My Feelings", "Drake",
+        [
+            _rec("Some Other Song", "Drake"),
+            _rec("In My Feelings (Explicit)", "Drake"),
+        ],
+        fingerprint_score=0.95,
+    )
+    assert out.decision == Decision.PASS

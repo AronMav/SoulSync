@@ -179,7 +179,10 @@ def evaluate(expected_title: str, expected_artist: str,
     so the decision here stays purely about title/artist/version identity.
     """
     from core.matching.script_compat import is_cross_script_mismatch
-    from core.matching.version_mismatch import is_acceptable_version_mismatch
+    from core.matching.version_mismatch import (
+        is_acceptable_version_mismatch,
+        versions_agree,
+    )
 
     # No expected artist on record (legacy/compilation rows): compare on title
     # only — the old scanner treated this as artist-match=1.0 and a missing DB
@@ -238,8 +241,12 @@ def evaluate(expected_title: str, expected_artist: str,
         return _alias_aware_artist_sim(ea, aa, aliases_provider)
 
     candidate = None
+    # Keep candidates whose version agrees under the advisory fold
+    # (versions_agree): advisory labels (explicit/clean) are not version
+    # cuts, so a bare-titled candidate must stay eligible for an
+    # explicitly-labeled expected title (and vice versa).
     for rec in recordings:
-        if _detect_title_version(rec.get('title') or '') != expected_version:
+        if not versions_agree(expected_version, _detect_title_version(rec.get('title') or '')):
             continue
         if (similarity(expected_title, rec.get('title') or '') >= TITLE_MATCH_THRESHOLD
                 and _alias_aware_artist_sim(
