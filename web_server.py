@@ -18657,7 +18657,7 @@ def process_wishlist_api():
     """Trigger wishlist processing via API. Processes pending wishlist tracks in the background."""
     try:
         runtime = _build_wishlist_route_runtime(
-            is_auto_processing_flag=lambda: wishlist_auto_processing,
+            is_actually_processing_fn=lambda: wishlist_auto_processing,
         )
         payload, status_code = _wishlist_process_api(
             runtime,
