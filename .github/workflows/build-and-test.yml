@@ -5,6 +5,9 @@ on:
     branches-ignore:
       - main
       - dev
+  # Manual run: forks do not always schedule push-triggered runs, so the
+  # owner can start this pipeline explicitly from the Actions tab or gh.
+  workflow_dispatch:
 
 # A newer push to the same branch supersedes the running check; without this
 # every follow-up push stacks another 19-29 minute test job behind the first.
