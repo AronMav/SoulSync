@@ -25,7 +25,7 @@
  * doesn't match the current version, so old entries don't accumulate.
  */
 
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
 const URL_BASE = new URL(self.registration.scope).pathname.replace(/\/$/, '');
 const CACHE_NAMESPACE = `soulsync-${encodeURIComponent(URL_BASE || 'root')}-`;
 const IMAGE_CACHE = `${CACHE_NAMESPACE}images-${CACHE_VERSION}`;
