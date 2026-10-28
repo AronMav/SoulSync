@@ -2283,6 +2283,8 @@ class RepairWorker:
             'genre_cleanup': self._fix_genre_cleanup,
             'genre_enrichment': self._fix_genre_enrichment,
             'comma_artist_split': self._fix_comma_artist_split,
+            'preview_mismatch': self._fix_acoustid_mismatch,
+            'preview_ambiguous': self._fix_acoustid_mismatch,
             'suspect_album_tag': self._fix_suspect_album_tag,
             'fake_lossless': self._fix_fake_lossless,
             'album_release_year_mismatch': self._fix_album_release_year_mismatch,
