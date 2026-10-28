@@ -19,7 +19,7 @@ REJECTED_ROW_CAP = 50
 _DISPLAY_FORMATS = ('FLAC', 'MP3', 'OPUS', 'OGG', 'M4A', 'WAV')
 # Sources whose username IS the service; Soulseek usernames are peers.
 _SERVICE_USERNAMES = frozenset({
-    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon',
+    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex',
 })
 
 

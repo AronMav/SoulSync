@@ -11,8 +11,8 @@ fingerprint), but the title-text comparison flagged it as the wrong
 version.
 
 Strict version mismatching stays for genuinely-different recordings
-(instrumental vs vocal, remix vs original, acoustic vs studio) —
-those have distinct fingerprints AND MB always annotates them in the
+(instrumental vs vocal, remix vs original, acoustic vs studio) — those
+have distinct fingerprints AND MB always annotates them in the
 recording title. We only loosen for the **live** direction
 specifically, since that's the asymmetry users actually hit:
 
@@ -26,7 +26,21 @@ specifically, since that's the asymmetry users actually hit:
   audio, which IS the wrong file.
 
 Two-sided version mismatches stay strict — "live" vs "remix" really
-are different recordings even if MB titled them similarly."""
+are different recordings even if MB titled them similarly.
+
+ADVISORY LABELS: "(Explicit)" / "(Clean)" are NOT version cuts — they
+describe the lyrics treatment of the SAME recording, and MusicBrainz
+carries them inconsistently (the same fingerprint resolves to a
+bare-titled recording on one release and an annotated one on another).
+Comparing them as versions quarantined correctly-downloaded tracks
+(live case: Qobuz "Trick Trick - Welcome 2 Detroit (Album Version
+(Explicit))" vs a bare MusicBrainz title, fingerprint 0.98 /
+title 1.00 / artist 0.95 -> false "Version mismatch: expected
+(explicit) but file is (original)"). `versions_agree` therefore folds
+a difference confined to advisory labels into agreement; a difference
+that involves a genuine version marker (live / instrumental / remix /
+...) is untouched and stays with the caller's version gate.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +53,41 @@ _BARE_VERSION = 'original'
 # release-track entity, not the recording entity, so the recording can
 # be bare-titled even though the audio is genuinely live.
 _LIVE_AWARE_VERSIONS = frozenset({'live'})
+
+# Versions where AcoustID / MusicBrainz annotation is unreliable even
+# though the fingerprint matched.  When the fingerprint score is very
+# high (>= 0.90) AND the bare title + artist agree, a one-sided
+# annotation difference for these versions is more likely a metadata
+# error than a genuinely different recording.  The classic case:
+# Qobuz serves the correct vocal track but AcoustID's recording entry
+# carries an "instrumental" or "remix" annotation from a linked release.
+_HIGH_CONFIDENCE_LOOSE_VERSIONS = frozenset({'instrumental', 'remix'})
+
+# Advisory content labels: they describe the lyrics treatment of the
+# same recording (uncensored vs censored), not a different cut.  See
+# the module docstring for the case that motivated this set.
+_ADVISORY_VERSIONS = frozenset({'explicit', 'clean'})
+
+
+def _is_bare_or_advisory(version: str) -> bool:
+    return version == _BARE_VERSION or version in _ADVISORY_VERSIONS
+
+
+def versions_agree(expected_version: str, matched_version: str) -> bool:
+    """True when the two labels describe the same cut as far as the
+    advisory labels go: equal labels, or a difference confined to
+    "(Explicit)"/"(Clean)" vs a bare title (or vs each other).
+
+    Advisory labels are lyrics-treatment metadata on the same
+    recording, and MusicBrainz carries them inconsistently — treating
+    them as versions quarantined correctly-downloaded tracks (see the
+    module docstring).  Differences that involve a genuine version
+    marker (live / instrumental / remix / acoustic / demo / ...) are
+    NOT folded here — those go through the caller's full version gate.
+    """
+    if expected_version == matched_version:
+        return True
+    return _is_bare_or_advisory(expected_version) and _is_bare_or_advisory(matched_version)
 
 
 def is_acceptable_version_mismatch(
@@ -56,23 +105,27 @@ def is_acceptable_version_mismatch(
     difference is likely a MusicBrainz metadata gap rather than a
     genuinely different recording.
 
-    Conditions (all must hold):
+    Acceptance paths (any one suffices):
 
-    1. The mismatch is **one-sided AND involves a live-aware version**
-       — exactly one side is ``'live'`` and the other is bare
-       ``'original'``. Other version markers (instrumental, remix,
-       acoustic, etc) carry distinct fingerprints AND are always
-       annotated in MB's recording title — we don't loosen for them.
-    2. Fingerprint score ``>= score_threshold`` (default 0.85). The
-       AcoustID fingerprint is high-confidence — we trust it.
-    3. Bare title similarity ``>= title_threshold`` (default 0.70).
-       After the version annotation is stripped, the underlying titles
-       agree.
-    4. Artist similarity ``>= artist_threshold`` (default 0.60). Same
-       artist credit.
+    1. ``versions_agree`` — equal labels, or a difference confined to
+       the advisory explicit/clean labels: the same recording under a
+       different lyrics-treatment label, accepted outright.
+    2. One-sided live (``'live'`` vs bare ``'original'``) with
+       fingerprint ``>= score_threshold`` (default 0.85). The AcoustID
+       fingerprint is high-confidence and MB often stores live
+       recordings with bare titles — we trust it.
+    3. One-sided bare -> instrumental/remix (fork valve, 83a7fe56) with
+       fingerprint >= 0.90: AcoustID/MB annotation errors on the
+       linked recording, accepted as such.
 
-    When ``expected_version == matched_version`` returns ``True``
-    trivially — no mismatch to decide.
+    All accept paths keep the title/artist requirements
+    (``title_threshold`` 0.70 / ``artist_threshold`` 0.60) except the
+    equality/advisory path, which still goes through the caller's
+    normal PASS/FAIL comparison afterwards.
+
+    When ``versions_agree`` holds (equal labels, or a difference
+    confined to advisory explicit/clean labels) returns ``True``
+    trivially — the same recording, no mismatch to decide.
 
     Examples that ACCEPT (return True):
 
@@ -81,35 +134,67 @@ def is_acceptable_version_mismatch(
       #607 example 2).
     - expected=``'original'``, matched=``'live'`` — same case in the
       other direction.
+    - expected=``'original'``, matched=``'instrumental'``, fp=0.95,
+      title=0.95, artist=1.0 — AcoustID annotation error; the
+      fingerprint matched the correct vocal track but the linked MB
+      recording carries an instrumental annotation.
+    - expected=``'explicit'``, matched=``'original'`` (or ``'clean'``,
+      in any direction) — advisory lyrics label vs a bare title: the
+      same recording.
 
     Examples that REJECT (return False):
 
-    - expected=``'instrumental'``, matched=``'original'`` — fingerprint
-      matched the instrumental recording; if user asked for vocal, the
-      file is genuinely wrong. Stays strict regardless of confidence.
-    - expected=``'remix'``, matched=``'original'`` — same logic.
+    - expected=``'instrumental'``, matched=``'original'`` — user
+      explicitly wanted the instrumental; a vocal file is wrong.
     - expected=``'live'``, matched=``'remix'`` — both versioned,
       both different. Real mismatch.
+    - expected=``'explicit'``, matched=``'live'`` (or any advisory vs
+      genuine version pair) — a genuine version marker on one side
+      means the cuts differ; the advisory fold does not apply.
     - expected=``'live'``, matched=``'original'``, fp=0.50 — one-sided
       live but low confidence. Fall through to FAIL.
     - expected=``'live'``, matched=``'original'``, fp=0.95 but title
       sim 0.30 — bare titles don't agree. Different song.
+    - expected=``'original'``, matched=``'instrumental'``, fp=0.70 —
+      high-confidence loose versions still require fp >= 0.90.
     """
-    if expected_version == matched_version:
+    # Advisory-only difference: "(Explicit)" / "(Clean)" vs a bare title
+    # (or vs each other) is the same recording under a different
+    # lyrics-treatment label — accept outright.  Pairs involving a
+    # genuine version marker are NOT folded here; they fall through to
+    # the version logic below.
+    if versions_agree(expected_version, matched_version):
         return True
 
+    # --- one-sided live (original <-> live) ---
     one_sided_live = (
         (expected_version in _LIVE_AWARE_VERSIONS and matched_version == _BARE_VERSION)
         or (expected_version == _BARE_VERSION and matched_version in _LIVE_AWARE_VERSIONS)
     )
-    if not one_sided_live:
-        return False
+    if one_sided_live:
+        return (
+            fingerprint_score >= score_threshold
+            and title_similarity >= title_threshold
+            and artist_similarity >= artist_threshold
+        )
 
-    return (
-        fingerprint_score >= score_threshold
-        and title_similarity >= title_threshold
-        and artist_similarity >= artist_threshold
+    # --- one-sided instrumental/remix with very high confidence ---
+    # Only when the USER wanted the original (bare) and AcoustID tagged
+    # the matched recording as instrumental/remix.  The reverse direction
+    # (user wanted instrumental, got original) stays strict — the user
+    # explicitly asked for a non-vocal cut.
+    one_sided_loose = (
+        expected_version == _BARE_VERSION
+        and matched_version in _HIGH_CONFIDENCE_LOOSE_VERSIONS
     )
+    if one_sided_loose:
+        return (
+            fingerprint_score >= 0.90
+            and title_similarity >= title_threshold
+            and artist_similarity >= artist_threshold
+        )
+
+    return False
 
 
-__all__ = ['is_acceptable_version_mismatch']
+__all__ = ['is_acceptable_version_mismatch', 'versions_agree']

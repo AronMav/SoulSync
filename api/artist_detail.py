@@ -455,7 +455,7 @@ def get_artist_detail(artist_id):
             # itunes_artist_id / discogs_id / soul_id / amazon_id).
             artist_source_ids = source_id_map(
                 artist_info, 'artist',
-                providers=('spotify', 'deezer', 'itunes', 'discogs', 'hydrabase', 'amazon'),
+                providers=('spotify', 'deezer', 'itunes', 'discogs', 'hydrabase', 'amazon', 'yandex'),
             )
 
             artist_detail_discography = _get_artist_detail_discography(

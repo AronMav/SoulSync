@@ -30,7 +30,7 @@ MAX_ENTRIES = 5000
 # Usernames that ARE the service; anything else on a download is a peer.
 _SERVICE_USERNAMES = frozenset({
     'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr',
-    'soundcloud', 'amazon', 'torrent', 'usenet',
+    'soundcloud', 'amazon', 'yandex', 'torrent', 'usenet',
 })
 
 try:  # pragma: no cover - import-time fallback only

@@ -32,6 +32,21 @@ download_orchestrator = None
 # Structured-metadata sources. Soulseek peers use the sharing username, so they
 # are everything else. A mixed best-quality pool must score each family with
 # its own checker — not whoever happens to be results[0].
+# Sources whose candidates carry structured title/artist fields instead of a
+# slskd-style ``Artist/Album/Track.flac`` path. Torrent/usenet belong here because
+# their filename field is a URL; Yandex because its candidates carry
+# ``username='yandex'`` plus pre-filled title/artist.
+_STREAMING_SOURCES = (
+    "youtube", "tidal", "qobuz", "hifi", "deezer_dl", "soundcloud",
+    "amazon", "torrent", "usenet", "yandex",
+)
+
+# Sources whose API durations are trustworthy enough to reject a candidate BEFORE
+# downloading it. Yandex is deliberately absent: its catalogue durations drift from
+# the reference often enough that a strict pre-download check produced false
+# rejections. Post-download integrity checks and AcoustID cover real mismatches.
+_STRICT_DURATION_SOURCES = {"tidal", "qobuz", "hifi", "deezer_dl", "amazon"}
+
 _STREAMING_USERNAMES = frozenset({
     'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'soundcloud',
     'amazon', 'torrent', 'usenet',

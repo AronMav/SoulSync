@@ -2292,7 +2292,7 @@ const ALBUM_LEVEL_HYBRID_SOURCES = new Set(['soulseek', 'torrent', 'usenet']);
 const RETIRED_DOWNLOAD_SOURCES = new Set(['amazon']);
 
 let _hybridSourceOrder = ['soulseek', 'youtube'];
-let _hybridSourceEnabled = { soulseek: true, youtube: true, tidal: false, qobuz: false, hifi: false, deezer_dl: false, lidarr: false, soundcloud: false, torrent: false, usenet: false };
+let _hybridSourceEnabled = { soulseek: true, youtube: true, tidal: false, qobuz: false, hifi: false, deezer_dl: false, lidarr: false, soundcloud: false, yandex: false, torrent: false, usenet: false };
 // Enabled-but-not-fully-configured sources (per the server's status):
 // shown with a "needs setup" chip instead of being silently unchecked.
 let _hybridSourceUnready = {};

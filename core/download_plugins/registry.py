@@ -48,6 +48,7 @@ from core.qobuz_client import QobuzClient
 from core.soulseek_client import SoulseekClient
 from core.soundcloud_client import SoundcloudClient
 from core.tidal_download_client import TidalDownloadClient
+from core.yandex_download_client import YandexDownloadClient
 from core.youtube_client import YouTubeClient
 
 logger = get_logger("download_plugins.registry")
@@ -192,6 +193,7 @@ def build_default_registry() -> DownloadPluginRegistry:
                                  aliases=('deezer_dl',)))
     registry.register(PluginSpec(name='lidarr',    factory=LidarrDownloadClient,   display_name='Lidarr'))
     registry.register(PluginSpec(name='soundcloud',factory=SoundcloudClient,       display_name='SoundCloud'))
+    registry.register(PluginSpec(name='yandex',    factory=YandexDownloadClient,   display_name='Yandex Music'))
     registry.register(PluginSpec(name='torrent',   factory=TorrentDownloadPlugin,  display_name='Torrent (Prowlarr)'))
     registry.register(PluginSpec(name='usenet',    factory=UsenetDownloadPlugin,   display_name='Usenet (Prowlarr)'))
 

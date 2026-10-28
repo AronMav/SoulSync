@@ -294,6 +294,7 @@ class WatchlistArtist:
     deezer_artist_id: Optional[str] = None  # Cross-provider support
     discogs_artist_id: Optional[str] = None  # Cross-provider support
     musicbrainz_artist_id: Optional[str] = None  # Cross-provider support
+    yandex_artist_id: Optional[str] = None  # Cross-provider support
     include_albums: bool = True
     include_eps: bool = True
     include_singles: bool = True
@@ -341,6 +342,7 @@ class SimilarArtist:
     popularity: int = 0  # Cached popularity score
     similar_artist_deezer_id: Optional[str] = None  # Deezer artist ID
     similar_artist_musicbrainz_id: Optional[str] = None  # MusicBrainz artist ID
+    similar_artist_yandex_id: Optional[str] = None  # Yandex Music artist ID
 
 @dataclass
 class DiscoveryTrack:
@@ -1079,6 +1081,7 @@ class MusicDatabase:
                     discogs_artist_id TEXT,
                     musicbrainz_artist_id TEXT,
                     amazon_artist_id TEXT,
+                    yandex_artist_id TEXT,
                     artist_name TEXT NOT NULL,
                     quality_profile_id INTEGER DEFAULT NULL,
                     date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1290,6 +1293,9 @@ class MusicDatabase:
 
             # Add JioSaavn columns to library tables (migration)
             self._add_jiosaavn_columns(cursor)
+
+            # Add Yandex Music columns + the deleted-track blacklist (migration)
+            self._add_yandex_columns(cursor)
 
             # Add Spotify/iTunes enrichment tracking columns (migration)
             self._add_spotify_itunes_enrichment_columns(cursor)
@@ -3753,6 +3759,7 @@ class MusicDatabase:
                                 similar_artist_itunes_id TEXT,
                                 similar_artist_deezer_id TEXT,
                                 similar_artist_musicbrainz_id TEXT,
+                                similar_artist_yandex_id TEXT,
                                 similar_artist_name TEXT NOT NULL,
                                 similarity_rank INTEGER DEFAULT 1,
                                 occurrence_count INTEGER DEFAULT 1,
@@ -5018,6 +5025,7 @@ class MusicDatabase:
                             discogs_artist_id TEXT,
                             musicbrainz_artist_id TEXT,
                             amazon_artist_id TEXT,
+                    yandex_artist_id TEXT,
                             preferred_metadata_source TEXT DEFAULT NULL,
                             auto_download INTEGER NOT NULL DEFAULT 1,
                             profile_id INTEGER DEFAULT 1,
@@ -5051,6 +5059,7 @@ class MusicDatabase:
                             discogs_artist_id TEXT,
                             musicbrainz_artist_id TEXT,
                             amazon_artist_id TEXT,
+                    yandex_artist_id TEXT,
                             preferred_metadata_source TEXT DEFAULT NULL,
                             auto_download INTEGER NOT NULL DEFAULT 1
                         )
@@ -5649,6 +5658,74 @@ class MusicDatabase:
             logger.error(f"Error adding repair worker columns: {e}")
             # Don't raise - this is a migration, database can still function
 
+    def _add_yandex_columns(self, cursor):
+        """Add Yandex Music tracking columns and the deleted-track blacklist.
+
+        Mirrors ``_add_deezer_columns``. This method is the single owner of the
+        ``yandex_id`` / ``yandex_match_status`` / ``yandex_last_attempted``
+        columns on artists, albums and tracks, of the cross-provider Yandex ids
+        on ``watchlist_artists`` and ``similar_artists``, and of the
+        ``deleted_blacklist`` table — so a fresh database is complete before
+        any worker runs, and the enrichment worker never has to create its own
+        columns.
+
+        ``deleted_blacklist`` records "the user deleted this from the library
+        with the Navidrome trash button — never acquire it again". It is keyed
+        by NAME because the trash button knows an artist and a title, not a
+        provider id; the native blocklist matches tracks by id only, and the
+        ignore-list expires, which contradicts "never again".
+        """
+        for table in ("artists", "albums", "tracks"):
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = [column[1] for column in cursor.fetchall()]
+                if "yandex_id" not in columns:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN yandex_id TEXT")
+                if "yandex_match_status" not in columns:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN yandex_match_status TEXT")
+                if "yandex_last_attempted" not in columns:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN yandex_last_attempted TIMESTAMP")
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_yandex_id ON {table} (yandex_id)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_yandex_status ON {table} (yandex_match_status)"
+                )
+            except Exception as e:
+                logger.error(f"Error adding Yandex columns to {table}: {e}")
+
+        for table, column in (
+            ("watchlist_artists", "yandex_artist_id"),
+            ("similar_artists", "similar_artist_yandex_id"),
+        ):
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = [c[1] for c in cursor.fetchall()]
+                if columns and column not in columns:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+            except Exception as e:
+                logger.error(f"Error adding {column} to {table}: {e}")
+
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS deleted_blacklist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id INTEGER NOT NULL DEFAULT 1,
+                    artist_norm TEXT NOT NULL DEFAULT '',
+                    title_norm TEXT NOT NULL,
+                    artist TEXT DEFAULT '',
+                    title TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(profile_id, artist_norm, title_norm)
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_deleted_blacklist_lookup "
+                "ON deleted_blacklist (profile_id, title_norm)"
+            )
+        except Exception as e:
+            logger.error(f"Error creating deleted_blacklist: {e}")
+
     def _add_jiosaavn_columns(self, cursor):
         """Add JioSaavn tracking columns for enrichment (artists, albums, tracks)"""
         try:
@@ -6110,6 +6187,7 @@ class MusicDatabase:
                             discogs_artist_id TEXT,
                             musicbrainz_artist_id TEXT,
                             amazon_artist_id TEXT,
+                    yandex_artist_id TEXT,
                             preferred_metadata_source TEXT DEFAULT NULL,
                             auto_download INTEGER NOT NULL DEFAULT 1,
                             profile_id INTEGER DEFAULT 1,
@@ -6459,6 +6537,7 @@ class MusicDatabase:
                             similar_artist_itunes_id TEXT,
                             similar_artist_deezer_id TEXT,
                             similar_artist_musicbrainz_id TEXT,
+                                similar_artist_yandex_id TEXT,
                             similar_artist_name TEXT NOT NULL,
                             similarity_rank INTEGER DEFAULT 1,
                             occurrence_count INTEGER DEFAULT 1,
@@ -16116,6 +16195,32 @@ class MusicDatabase:
                 except Exception as _ignore_exc:
                     logger.debug("Wishlist ignore-list check skipped (fail-open): %s", _ignore_exc)
 
+                # Deleted-track blacklist: the user removed this track from the
+                # library with the Navidrome trash button and asked that it never
+                # come back. Every automatic re-add funnels through here — the
+                # watchlist scan, repair worker, discography backfill and the
+                # label scan all call this method — so one check covers them all;
+                # a check in the scanner alone would leave the others open.
+                # Matched by NAME because the trash button reports artist/title,
+                # not a provider id. Manual intent bypasses AND clears the entry,
+                # exactly as it does for the ignore-list above. Fail-open.
+                try:
+                    _dbl_artist = ', '.join(
+                        a.get('name', '') for a in (spotify_track_data.get('artists') or [])
+                        if isinstance(a, dict) and a.get('name')
+                    ) or spotify_track_data.get('artist') or ''
+                    _dbl_title = spotify_track_data.get('name') or ''
+                    if source_type == 'manual' or user_initiated:
+                        self.remove_deleted_blacklist(_dbl_artist, _dbl_title, profile_id=profile_id)
+                    elif self.is_deleted_blacklisted(_dbl_artist, _dbl_title, profile_id=profile_id):
+                        logger.info(
+                            "Skipping wishlist add — track was deleted and blacklisted: '%s - %s'",
+                            _dbl_artist, _dbl_title,
+                        )
+                        return self._wishlist_outcome("skipped", track_id, reason="deleted-blacklist")
+                except Exception as _dbl_exc:
+                    logger.debug("Deleted-blacklist check skipped (fail-open): %s", _dbl_exc)
+
                 from core.library import manual_library_match as _mlm
                 if _mlm.get_match_for_track(self, profile_id, spotify_track_data):
                     logger.info(
@@ -16339,6 +16444,175 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error removing track from wishlist: {e}")
             return False
+
+    def get_exhausted_wishlist_tracks(self, max_retries: int, profile_id: int = 1) -> list:
+        """Return wishlist tracks whose retry_count >= max_retries.
+
+        Used by the auto-abandon pass to identify tracks that have been
+        searched enough times without success and should be retired.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT wt.id, wt.spotify_track_id, wt.retry_count,
+                           wt.failure_reason, wt.date_added, wt.last_attempted,
+                           wt.spotify_data
+                    FROM wishlist_tracks wt
+                    WHERE wt.profile_id = ? AND wt.retry_count >= ?
+                    ORDER BY wt.retry_count DESC
+                """, (profile_id, max_retries))
+                rows = cursor.fetchall()
+
+                import json as _json
+                results = []
+                for row in rows:
+                    track_data = {}
+                    raw = row["spotify_data"] if "spotify_data" in row.keys() else None
+                    if raw:
+                        try:
+                            track_data = _json.loads(raw)
+                        except Exception as _json_exc:  # noqa: S110 - a bad blob is not fatal
+                            logger.debug("wishlist spotify_data is not JSON: %s", _json_exc)
+                    artists = track_data.get("artists", [])
+                    artist_name = (
+                        artists[0].get("name", "") if artists and isinstance(artists[0], dict)
+                        else str(artists[0]) if artists else ""
+                    )
+                    results.append({
+                        "id": row["id"],
+                        "spotify_track_id": row["spotify_track_id"],
+                        "retry_count": row["retry_count"],
+                        "failure_reason": row["failure_reason"],
+                        "track_name": track_data.get("name", ""),
+                        "artist_name": artist_name,
+                    })
+                return results
+        except Exception as e:
+            logger.error("Error fetching exhausted wishlist tracks: %s", e)
+            return []
+
+    # ── Deleted-track blacklist ──────────────────────────────────────────
+    #
+    # Name matching, not id matching: the Navidrome trash button reports an
+    # artist and a title. Collaborators arrive spelled three different ways —
+    # Navidrome joins them with a bullet, metadata sources use a comma or a
+    # semicolon — so a lookup also compares the FIRST artist on both sides.
+    # "&" and "/" are deliberately not separators: "Blank & Jones" and "AC/DC"
+    # are single names, and splitting them would ban unrelated artists.
+
+    @staticmethod
+    def _dbl_norm(value) -> str:
+        return (value or '').strip().lower()
+
+    @staticmethod
+    def _dbl_first_artist(value) -> str:
+        return re.split(r'[\u2022;,]', value or '')[0].strip().lower()
+
+    def add_deleted_blacklist(self, artist: str, title: str, profile_id: int = 1) -> bool:
+        """Record "deleted — never fetch again" for a track. Idempotent."""
+        title_norm = self._dbl_norm(title)
+        if not title_norm:
+            logger.warning("Refusing to blacklist a track with no title (artist=%r)", artist)
+            return False
+        try:
+            with self._get_connection() as conn:
+                conn.execute("""
+                    INSERT OR IGNORE INTO deleted_blacklist
+                        (profile_id, artist_norm, title_norm, artist, title)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (profile_id, self._dbl_norm(artist), title_norm, artist or '', title or ''))
+                conn.commit()
+            logger.info("Blacklisted deleted track: %s - %s", artist, title)
+            return True
+        except Exception as e:
+            logger.error("Error adding to deleted blacklist: %s", e)
+            return False
+
+    def is_deleted_blacklisted(self, artist: str, title: str, profile_id: int = 1) -> bool:
+        """True when this artist/title was deleted and must not be re-fetched.
+
+        Fail-open: any error answers False. The blacklist is a convenience, and
+        a broken lookup must never wedge every download.
+        """
+        title_norm = self._dbl_norm(title)
+        if not title_norm:
+            return False
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute("""
+                    SELECT artist_norm FROM deleted_blacklist
+                    WHERE profile_id = ? AND title_norm = ?
+                """, (profile_id, title_norm)).fetchall()
+            if not rows:
+                return False
+            incoming_full = self._dbl_norm(artist)
+            incoming_first = self._dbl_first_artist(artist)
+            for row in rows:
+                stored_full = row[0] or ''
+                # An entry stored without an artist bans the title outright.
+                if not stored_full:
+                    return True
+                if stored_full == incoming_full:
+                    return True
+                if incoming_first and self._dbl_first_artist(stored_full) == incoming_first:
+                    return True
+            return False
+        except Exception as e:
+            logger.debug("Deleted-blacklist lookup failed (fail-open): %s", e)
+            return False
+
+    def get_deleted_blacklist(self, profile_id: int = 1):
+        """Every blacklist entry for the profile, newest first."""
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT id, artist, title, artist_norm, title_norm, created_at
+                    FROM deleted_blacklist WHERE profile_id = ?
+                    ORDER BY created_at DESC, id DESC
+                """, (profile_id,)).fetchall()
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error("Error reading deleted blacklist: %s", e)
+            return []
+
+    def remove_deleted_blacklist(self, artist: str, title: str, profile_id: int = 1) -> bool:
+        """Lift the ban for a track. Uses the same matching as the lookup, so an
+        entry stored under one collaborator spelling can be cleared by another."""
+        title_norm = self._dbl_norm(title)
+        if not title_norm:
+            return False
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute("""
+                    SELECT id, artist_norm FROM deleted_blacklist
+                    WHERE profile_id = ? AND title_norm = ?
+                """, (profile_id, title_norm)).fetchall()
+                incoming_full = self._dbl_norm(artist)
+                incoming_first = self._dbl_first_artist(artist)
+                doomed = []
+                for row_id, stored_full in rows:
+                    stored_full = stored_full or ''
+                    if (not stored_full
+                            or stored_full == incoming_full
+                            or (incoming_first and self._dbl_first_artist(stored_full) == incoming_first)):
+                        doomed.append(row_id)
+                if not doomed:
+                    return False
+                conn.executemany("DELETE FROM deleted_blacklist WHERE id = ?", [(i,) for i in doomed])
+                conn.commit()
+            logger.info("Removed %d deleted-blacklist entries for %s - %s", len(doomed), artist, title)
+            return True
+        except Exception as e:
+            logger.error("Error removing from deleted blacklist: %s", e)
+            return False
+
+    # ── Wishlist ignore-list (#874) ──────────────────────────────────────
+    # A TTL'd skip-gate consulted by add_to_wishlist so user-removed /
+    # user-cancelled tracks are not auto-re-queued. All methods fail-open
+    # (an error here must never block a legitimate wishlist add).
+
 
     def purge_podcast_tracks_from_wishlist(self) -> int:
         """Purge any podcast tracks that leaked into wishlist_tracks."""
@@ -18445,7 +18719,7 @@ class MusicDatabase:
                 # Build SELECT query based on existing columns
                 base_columns = ['id', 'spotify_artist_id', 'artist_name', 'date_added',
                                'last_scan_timestamp', 'created_at', 'updated_at']
-                optional_columns = ['image_url', 'itunes_artist_id', 'deezer_artist_id', 'discogs_artist_id', 'musicbrainz_artist_id', 'include_albums', 'include_eps', 'include_singles',
+                optional_columns = ['image_url', 'itunes_artist_id', 'deezer_artist_id', 'discogs_artist_id', 'musicbrainz_artist_id', 'yandex_artist_id', 'include_albums', 'include_eps', 'include_singles',
                                    'include_live', 'include_remixes', 'include_acoustic', 'include_compilations',
                                    'include_instrumentals', 'include_other_artists', 'lookback_days', 'preferred_metadata_source',
                                    'auto_download', 'auto_download_pref', 'quality_profile_id', 'follow_defaults']
@@ -18476,6 +18750,7 @@ class MusicDatabase:
                     deezer_artist_id = row['deezer_artist_id'] if 'deezer_artist_id' in existing_columns else None
                     discogs_artist_id = row['discogs_artist_id'] if 'discogs_artist_id' in existing_columns else None
                     musicbrainz_artist_id = row['musicbrainz_artist_id'] if 'musicbrainz_artist_id' in existing_columns else None
+                    yandex_artist_id = row['yandex_artist_id'] if 'yandex_artist_id' in existing_columns else None
                     include_albums = bool(row['include_albums']) if 'include_albums' in existing_columns else True
                     include_eps = bool(row['include_eps']) if 'include_eps' in existing_columns else True
                     include_singles = bool(row['include_singles']) if 'include_singles' in existing_columns else True
@@ -18510,6 +18785,7 @@ class MusicDatabase:
                         deezer_artist_id=deezer_artist_id,
                         discogs_artist_id=discogs_artist_id,
                         musicbrainz_artist_id=musicbrainz_artist_id,
+                        yandex_artist_id=yandex_artist_id,
                         include_albums=include_albums,
                         include_eps=include_eps,
                         include_singles=include_singles,
@@ -18995,6 +19271,89 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error backfilling watchlist MusicBrainz IDs from library: {e}")
             return 0
+
+    def update_watchlist_yandex_id(self, watchlist_id: int, yandex_id: str) -> bool:
+        """Update the Yandex Music artist ID for a watchlist artist (cross-provider support)"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE watchlist_artists
+                    SET yandex_artist_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (yandex_id, watchlist_id))
+                conn.commit()
+                logger.info(f"Updated Yandex ID for watchlist artist {watchlist_id}: {yandex_id}")
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error updating watchlist Yandex ID: {e}")
+            return False
+
+
+    def backfill_watchlist_yandex_ids_from_library(self, profile_id: int = 1) -> int:
+        """Copy existing library Yandex artist IDs onto matching watchlist rows.
+
+        The Yandex enrichment worker writes IDs to ``artists.yandex_id``. The
+        watchlist scan reads ``watchlist_artists.yandex_artist_id``, so this
+        bridge lets already-enriched library matches serve the scan instead of
+        making it re-resolve every artist by name over the network.
+        """
+        match_sql = """
+            LOWER(a.name) = LOWER(watchlist_artists.artist_name)
+            OR (
+                watchlist_artists.spotify_artist_id IS NOT NULL
+                AND watchlist_artists.spotify_artist_id != ''
+                AND a.spotify_artist_id = watchlist_artists.spotify_artist_id
+            )
+            OR (
+                watchlist_artists.itunes_artist_id IS NOT NULL
+                AND watchlist_artists.itunes_artist_id != ''
+                AND a.itunes_artist_id = watchlist_artists.itunes_artist_id
+            )
+            OR (
+                watchlist_artists.deezer_artist_id IS NOT NULL
+                AND watchlist_artists.deezer_artist_id != ''
+                AND a.deezer_id = watchlist_artists.deezer_artist_id
+            )
+            OR (
+                watchlist_artists.musicbrainz_artist_id IS NOT NULL
+                AND watchlist_artists.musicbrainz_artist_id != ''
+                AND a.musicbrainz_id = watchlist_artists.musicbrainz_artist_id
+            )
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"""
+                    UPDATE watchlist_artists
+                    SET yandex_artist_id = (
+                            SELECT a.yandex_id
+                            FROM artists a
+                            WHERE a.yandex_id IS NOT NULL
+                              AND a.yandex_id != ''
+                              AND ({match_sql})
+                            LIMIT 1
+                        ),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE profile_id = ?
+                      AND (yandex_artist_id IS NULL OR yandex_artist_id = '')
+                      AND EXISTS (
+                          SELECT 1
+                          FROM artists a
+                          WHERE a.yandex_id IS NOT NULL
+                            AND a.yandex_id != ''
+                            AND ({match_sql})
+                      )
+                """, (profile_id,))
+                updated = cursor.rowcount
+                conn.commit()
+                if updated:
+                    logger.info(f"Backfilled Yandex IDs onto {updated} watchlist artists from the library")
+                return updated
+        except Exception as e:
+            logger.error(f"Error backfilling watchlist Yandex IDs: {e}")
+            return 0
+
 
     def update_watchlist_artist_itunes_id(self, spotify_artist_id: str, itunes_id: str) -> bool:
         """Update the iTunes artist ID for a watchlist artist by Spotify ID (for cross-provider caching)"""

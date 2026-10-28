@@ -404,7 +404,7 @@ class DownloadOrchestrator:
         # 2. Filter and validate results. Score each source family with its
         # own checker — a Soulseek peer first must not force Tidal/YouTube
         # through the P2P path (and vice versa).
-        _streaming_sources = ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon')
+        _streaming_sources = ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex')
         streaming = [t for t in tracks if getattr(t, 'username', None) in _streaming_sources]
         p2p = [t for t in tracks if getattr(t, 'username', None) not in _streaming_sources]
 

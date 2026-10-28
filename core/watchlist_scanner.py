@@ -788,14 +788,14 @@ class WatchlistScanner:
 
     @staticmethod
     def _artist_id_attribute_for_source(source: str) -> Optional[str]:
-        """Return the watchlist artist attribute that stores the given source ID."""
-        return {
-            'spotify': 'spotify_artist_id',
-            'itunes': 'itunes_artist_id',
-            'deezer': 'deezer_artist_id',
-            'discogs': 'discogs_artist_id',
-            'musicbrainz': 'musicbrainz_artist_id',
-        }.get(source)
+        """Return the watchlist artist attribute that stores the given source ID.
+
+        Delegates to ``core.watchlist_sources.source_column`` — one registry for
+        the whole app, so adding a provider cannot leave the scanner behind (the
+        duplication is exactly how Yandex went missing during the 3.1 port).
+        """
+        from core.watchlist_sources import source_column
+        return source_column(source)
 
     @staticmethod
     def _similar_artist_id_attribute_for_source(source: str) -> Optional[str]:
@@ -805,6 +805,7 @@ class WatchlistScanner:
             'itunes': 'similar_artist_itunes_id',
             'deezer': 'similar_artist_deezer_id',
             'musicbrainz': 'similar_artist_musicbrainz_id',
+            'yandex': 'similar_artist_yandex_id',
         }.get(source)
 
     @staticmethod
@@ -838,6 +839,9 @@ class WatchlistScanner:
         elif source == 'musicbrainz':
             self.database.update_watchlist_musicbrainz_id(watchlist_artist.id, source_id)
             watchlist_artist.musicbrainz_artist_id = source_id
+        elif source == 'yandex':
+            self.database.update_watchlist_yandex_id(watchlist_artist.id, source_id)
+            watchlist_artist.yandex_artist_id = source_id
 
     def _resolve_watchlist_artist_source_id(self, watchlist_artist: WatchlistArtist, source: str, client: Any) -> Optional[str]:
         """Resolve the artist ID for an exact source, searching by name if needed."""

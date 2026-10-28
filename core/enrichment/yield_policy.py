@@ -24,7 +24,7 @@ from typing import Optional
 # to the local media server) and repair (user-scheduled job runner, not a
 # background API drip) intentionally keep running.
 ALL_YIELD_WORKERS = (
-    'musicbrainz', 'audiodb', 'discogs', 'deezer', 'jiosaavn',
+    'musicbrainz', 'audiodb', 'discogs', 'deezer', 'yandex', 'jiosaavn',
     'spotify-enrichment', 'itunes-enrichment', 'lastfm-enrichment',
     'genius-enrichment', 'tidal-enrichment', 'qobuz-enrichment',
     'amazon-enrichment', 'bandcamp-enrichment', 'similar_artists', 'hydrabase', 'soulid',
@@ -32,7 +32,7 @@ ALL_YIELD_WORKERS = (
 
 # The sources discovery contends with (track matching APIs).
 API_CONTENTION_WORKERS = frozenset({
-    'spotify-enrichment', 'itunes-enrichment', 'deezer', 'discogs', 'hydrabase',
+    'spotify-enrichment', 'itunes-enrichment', 'deezer', 'yandex', 'discogs', 'hydrabase',
 })
 
 # Discovery state phases that mean work is hitting the matching apis right now.

@@ -230,6 +230,7 @@ from core.musicbrainz_worker import MusicBrainzWorker
 from core.audiodb_worker import AudioDBWorker
 from core.discogs_worker import DiscogsWorker
 from core.deezer_worker import DeezerWorker
+from core.yandex_worker import YandexWorker
 from core.jiosaavn_worker import JioSaavnWorker
 from core.spotify_worker import SpotifyWorker
 from core.itunes_worker import iTunesWorker
@@ -3199,6 +3200,7 @@ SERVICE_CONFIG_REGISTRY = {
     'spotify':      {'required': ['client_id', 'client_secret']},
     'itunes':       {'always': True},   # default storefront works anon
     'deezer':       {'always': True},   # anon search works, premium ARL is optional
+    'yandex':       {'required': ['token']},   # one token = metadata + new-releases + enrichment + downloads
     'musicbrainz':  {'always': True},   # public API, no credentials required
     'amazon':       {'always': True},   # T2Tunes proxy, no credentials required
     'jiosaavn':     {'always': True},   # public proxy API, no credentials required
@@ -3351,6 +3353,7 @@ def _get_enrichment_status():
         ('spotify_enrichment', 'Spotify', lambda: spotify_enrichment_worker),
         ('itunes_enrichment', 'iTunes', lambda: itunes_enrichment_worker),
         ('deezer_enrichment', 'Deezer', lambda: deezer_worker),
+        ('yandex_enrichment', 'Yandex Music', lambda: yandex_worker),
         ('tidal_enrichment', 'Tidal', lambda: tidal_enrichment_worker),
         ('qobuz_enrichment', 'Qobuz', lambda: qobuz_enrichment_worker),
         ('lastfm', 'Last.fm', lambda: lastfm_worker),
@@ -3490,7 +3493,7 @@ def get_status():
             # don't depend on slskd being reachable — when one of these is the
             # active source, surface "connected" without probing slskd so the
             # dashboard / sidebar indicator stays green.
-            serverless_sources = ('youtube', 'hifi', 'qobuz', 'tidal', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon')
+            serverless_sources = ('youtube', 'hifi', 'qobuz', 'tidal', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex')
             is_serverless = (download_mode in serverless_sources or
                              (download_mode == 'hybrid' and
                               hybrid_order and any(s in serverless_sources for s in hybrid_order)))
@@ -7148,7 +7151,7 @@ def start_download():
             if download_id:
                 # Register download for post-processing (simple transfer to /Transfer)
                 context_key = _make_context_key(username, filename)
-                is_streaming_source = username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon')
+                is_streaming_source = username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex')
                 # Per-download check overrides: skip AcoustID and/or
                 # quality-quarantine checks on request.
                 _skip_checks = []
@@ -7591,7 +7594,7 @@ def get_download_status():
             all_streaming_downloads = run_async(download_orchestrator.get_all_downloads())
 
             for download in all_streaming_downloads:
-                if download.username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon'):
+                if download.username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex'):
                     source_label = download.username.title()
                     # Convert DownloadStatus to transfer format that frontend expects
                     streaming_transfer = {
@@ -7779,7 +7782,7 @@ def clear_finished_downloads():
 # Streaming sources where the candidate's `username` field IS the source name
 # (Soulseek uses a real peer username; everything else stamps the source string).
 _STREAMING_SOURCE_NAMES = frozenset((
-    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon',
+    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex',
     'torrent', 'usenet',
 ))
 
@@ -11192,7 +11195,7 @@ def library_log_play_eligible():
         logger.debug(f"log-play/eligible failed (non-fatal): {e}")
         return jsonify({"success": False, "error": str(e)}), 200
 
-_enrichment_locks = {svc: threading.Lock() for svc in ('audiodb', 'deezer', 'musicbrainz', 'spotify', 'itunes', 'lastfm', 'genius', 'tidal', 'qobuz', 'discogs', 'bandcamp', 'jiosaavn')}
+_enrichment_locks = {svc: threading.Lock() for svc in ('audiodb', 'deezer', 'yandex', 'musicbrainz', 'spotify', 'itunes', 'lastfm', 'genius', 'tidal', 'qobuz', 'discogs', 'bandcamp', 'jiosaavn')}
 
 @app.route('/api/library/enrich', methods=['POST'])
 def library_enrich_entity():
@@ -11288,6 +11291,17 @@ def _get_artist_id_for_entity(database, entity_type, entity_id):
 
 def _run_single_enrichment(service, entity_type, entity_id, name, artist_name):
     """Run a single enrichment service on a single entity."""
+    if service == 'yandex':
+        if not yandex_worker:
+            return {"success": False, "error": "Yandex worker not initialized"}
+        if entity_type == 'artist':
+            yandex_worker._process_artist(entity_id, name)
+        elif entity_type == 'album':
+            yandex_worker._process_album(entity_id, name, artist_name)
+        elif entity_type == 'track':
+            yandex_worker._process_track(entity_id, name, artist_name)
+        return {"success": True, "message": f"Yandex lookup complete for {entity_type}"}
+
     if service == 'audiodb':
         if not audiodb_worker:
             return {"success": False, "error": "AudioDB worker not initialized"}
@@ -11466,6 +11480,7 @@ _SERVICE_ID_COLUMNS = {
     'spotify': {'artist': 'spotify_artist_id', 'album': 'spotify_album_id', 'track': 'spotify_track_id'},
     'musicbrainz': {'artist': 'musicbrainz_id', 'album': 'musicbrainz_release_id', 'track': 'musicbrainz_recording_id'},
     'deezer': {'artist': 'deezer_id', 'album': 'deezer_id', 'track': 'deezer_id'},
+    'yandex': {'artist': 'yandex_id', 'album': 'yandex_id', 'track': 'yandex_id'},
     'audiodb': {'artist': 'audiodb_id', 'album': 'audiodb_id', 'track': 'audiodb_id'},
     'discogs': {'artist': 'discogs_id', 'album': 'discogs_id'},
     'itunes': {'artist': 'itunes_artist_id', 'album': 'itunes_album_id', 'track': 'itunes_track_id'},
@@ -16774,7 +16789,7 @@ def _try_source_reuse(task_id, batch_id, track):
     if not source_tracks or not last_source:
         _sr.info("Skipped — no source_tracks or no last_source")
         return False
-    if last_source.get('username') in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon'):
+    if last_source.get('username') in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex'):
         _sr.info(f"Skipped — {last_source.get('username')} source (no folder-based reuse)")
         return False
 
@@ -16876,7 +16891,7 @@ def _store_batch_source(batch_id, username, filename):
     """Browse the successful download's folder and store results on the batch for reuse."""
     _sr = source_reuse_logger
     _sr.info(f"_store_batch_source called: batch={batch_id}, user={username}, file={filename}")
-    if not batch_id or username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'torrent', 'usenet'):
+    if not batch_id or username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex', 'torrent', 'usenet'):
         _sr.info(f"Skipped — no batch_id or streaming source ({username})")
         return
 
@@ -21940,6 +21955,20 @@ except Exception as e:
 # END JIOSAAVN INTEGRATION
 # ================================================================================================
 
+# --- Yandex Music Worker Initialization (artists/albums/tracks enrichment) ---
+yandex_worker = None
+try:
+    yandex_worker = YandexWorker(database=MusicDatabase())
+    yandex_worker.start()
+    if config_manager.get('yandex_enrichment_paused', False):
+        yandex_worker.pause()
+        logger.info("Yandex enrichment worker initialized (paused - restored from config)")
+    else:
+        logger.info("Yandex enrichment worker initialized and started")
+except Exception as e:
+    logger.error(f"Yandex worker initialization failed: {e}")
+    yandex_worker = None
+
 amazon_worker = None
 try:
     amazon_db = MusicDatabase()
@@ -22806,6 +22835,195 @@ if automation_engine is not None and download_orchestrator is not None:
 # ================================================================================================
 # END IMPORT / STAGING SYSTEM
 # ================================================================================================
+
+
+# ================================================================================================
+# YANDEX MUSIC AUTH + NAVIDROME DELETE API
+# ================================================================================================
+
+def _yandex_account_login(token):
+    """Validate a Yandex token by initialising a client; return the account
+    login/display name, or raise on failure."""
+    import yandex_music
+    client = yandex_music.Client(token).init()
+    acct = getattr(getattr(client, 'me', None), 'account', None)
+    return getattr(acct, 'login', None) or getattr(acct, 'display_name', None) or 'Yandex account'
+
+
+@app.route('/api/yandex/auth/token', methods=['POST'])
+def yandex_auth_token():
+    """Validate + save a Yandex Music token. One token powers everything Yandex:
+    downloads, the new-release (watchlist) scan, and library enrichment - they
+    all read ``yandex.token``."""
+    try:
+        data = request.get_json(silent=True) or {}
+        token = (data.get('token') or '').strip()
+        if not token:
+            return jsonify({"success": False, "error": "Yandex token required"}), 400
+        try:
+            login = _yandex_account_login(token)
+        except Exception as e:
+            return jsonify({"success": False, "error": f"Invalid token: {e}"}), 400
+        config_manager.set('yandex.token', token)
+        try:
+            from core.yandex_metadata_client import get_yandex_metadata_client
+            get_yandex_metadata_client()
+        except Exception as _client_exc:  # noqa: S110 - the token is saved either way
+            logger.debug("Yandex metadata client refresh failed: %s", _client_exc)
+        return jsonify({"success": True, "account": login})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/yandex/auth/status', methods=['GET'])
+def yandex_auth_status():
+    """Whether a Yandex token is configured (+ account login if it validates)."""
+    token = (config_manager.get('yandex.token') or '').strip()
+    if not token:
+        return jsonify({"authenticated": False})
+    try:
+        login = _yandex_account_login(token)
+        return jsonify({"authenticated": True, "user": {"display_name": login}})
+    except Exception as e:
+        return jsonify({"authenticated": False, "error": str(e)})
+
+
+@app.route('/api/yandex/auth/logout', methods=['POST'])
+def yandex_auth_logout():
+    """Clear the saved Yandex token."""
+    try:
+        config_manager.set('yandex.token', '')
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _nd_profile_id():
+    try:
+        from core.profile_context import get_current_profile_id
+        return get_current_profile_id()
+    except Exception:
+        return 1
+
+
+@app.route('/api/nd/delete', methods=['POST'])
+def nd_delete_song():
+    """Delete a single audio file from the library by relative path."""
+    data = request.get_json(silent=True) or {}
+    rel_path = (data.get('path') or '').strip()
+    if not rel_path:
+        return jsonify({'success': False, 'error': 'No path provided'}), 400
+
+    candidates = [
+        os.path.join('/music', rel_path),
+        os.path.join('/music', rel_path.lstrip('/')),
+        rel_path,
+    ]
+
+    deleted = False
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if not real.startswith('/music/'):
+            continue
+        if os.path.isfile(real):
+            try:
+                os.remove(real)
+                logger.info(f"[nd-delete] Deleted file: {real}")
+                deleted = True
+                break
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+    if not deleted:
+        return jsonify({'success': False, 'error': 'File not found in library'}), 404
+
+    blacklisted = False
+    try:
+        artist = (data.get('artist') or '').strip()
+        title = (data.get('title') or '').strip()
+        if title:
+            blacklisted = MusicDatabase().add_deleted_blacklist(
+                artist, title, profile_id=_nd_profile_id())
+    except Exception as e:
+        logger.error(f"[nd-delete] Could not blacklist deleted track: {e}")
+
+    return jsonify({'success': True, 'blacklisted': blacklisted})
+
+
+@app.route('/api/nd/blacklist', methods=['GET'])
+def nd_blacklist_list():
+    """Every track blocked by a deletion, newest first."""
+    try:
+        entries = MusicDatabase().get_deleted_blacklist(profile_id=_nd_profile_id())
+        return jsonify({'success': True, 'entries': entries, 'count': len(entries)})
+    except Exception as e:
+        logger.error(f"[nd-delete] Could not read the blacklist: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/nd/blacklist/remove', methods=['POST'])
+def nd_blacklist_remove():
+    """Lift the ban so automation may fetch the track again."""
+    data = request.get_json(silent=True) or {}
+    title = (data.get('title') or '').strip()
+    if not title:
+        return jsonify({'success': False, 'error': 'No title provided'}), 400
+    try:
+        removed = MusicDatabase().remove_deleted_blacklist(
+            (data.get('artist') or '').strip(), title, profile_id=_nd_profile_id())
+        return jsonify({'success': removed})
+    except Exception as e:
+        logger.error(f"[nd-delete] Could not lift a blacklist entry: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/nd/delete-album', methods=['POST'])
+def nd_delete_album():
+    """Delete an entire album directory from the library."""
+    data = request.get_json(silent=True) or {}
+    rel_dir = (data.get('dir') or '').strip()
+    if not rel_dir:
+        return jsonify({'success': False, 'error': 'No directory provided'}), 400
+
+    candidates = [
+        os.path.join('/music', rel_dir),
+        os.path.join('/music', rel_dir.lstrip('/')),
+    ]
+
+    deleted = False
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if not real.startswith('/music/'):
+            continue
+        if os.path.isdir(real):
+            try:
+                import shutil
+                shutil.rmtree(real)
+                logger.info(f"[nd-delete] Deleted album dir: {real}")
+                deleted = True
+                break
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+    if not deleted:
+        return jsonify({'success': False, 'error': 'Directory not found in library'}), 404
+
+    blacklisted = 0
+    try:
+        db = MusicDatabase()
+        for track in (data.get('tracks') or []):
+            if not isinstance(track, dict):
+                continue
+            title = (track.get('title') or '').strip()
+            if not title:
+                continue
+            if db.add_deleted_blacklist((track.get('artist') or '').strip(), title,
+                                        profile_id=_nd_profile_id()):
+                blacklisted += 1
+    except Exception as e:
+        logger.error(f"[nd-delete] Could not blacklist deleted album tracks: {e}")
+
+    return jsonify({'success': True, 'blacklisted': blacklisted})
 
 
 # ================================================================================================
@@ -23727,6 +23945,11 @@ _register_enrichment_services([
         config_paused_key='deezer_enrichment_paused',
     ),
     _EnrichmentService(
+        id='yandex', display_name='Yandex Music',
+        worker_getter=lambda: yandex_worker,
+        config_paused_key='yandex_enrichment_paused',
+    ),
+    _EnrichmentService(
         id='spotify', display_name='Spotify',
         worker_getter=lambda: spotify_enrichment_worker,
         config_paused_key='spotify_enrichment_paused',
@@ -24376,7 +24599,8 @@ def _emit_rate_monitor_loop():
     # Map rate monitor service keys to enrichment status keys
     _enrichment_key_map = {
         'spotify': 'spotify_enrichment', 'itunes': 'itunes_enrichment',
-        'deezer': 'deezer_enrichment', 'lastfm': 'lastfm', 'genius': 'genius',
+        'deezer': 'deezer_enrichment', 'yandex': 'yandex_enrichment',
+        'lastfm': 'lastfm', 'genius': 'genius',
         'musicbrainz': 'musicbrainz', 'audiodb': 'audiodb', 'discogs': 'discogs',
         'tidal': 'tidal_enrichment', 'qobuz': 'qobuz_enrichment', 'amazon': 'amazon_enrichment',
         'jiosaavn': 'jiosaavn_enrichment',
@@ -24445,6 +24669,7 @@ def _emit_enrichment_status_loop():
         'audiodb': lambda: audiodb_worker,
         'discogs': lambda: discogs_worker,
         'deezer': lambda: deezer_worker,
+        'yandex': lambda: yandex_worker,
         'jiosaavn': lambda: jiosaavn_worker,
         'spotify-enrichment': lambda: spotify_enrichment_worker,
         'itunes-enrichment': lambda: itunes_enrichment_worker,

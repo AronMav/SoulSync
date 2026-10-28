@@ -1940,7 +1940,7 @@ def watchlist_artist_link_provider(artist_id):
         new_provider_id = data.get('provider_id', '').strip()
         provider = data.get('provider', '').strip()
 
-        valid_providers = ('spotify', 'itunes', 'deezer', 'discogs', 'amazon', 'musicbrainz')
+        valid_providers = ('spotify', 'itunes', 'deezer', 'discogs', 'amazon', 'musicbrainz', 'yandex')
         if provider not in valid_providers:
             return jsonify({"success": False, "error": f"Invalid provider. Must be one of: {', '.join(valid_providers)}"}), 400
 
@@ -1974,6 +1974,7 @@ def watchlist_artist_link_provider(artist_id):
             'discogs': 'discogs_artist_id',
             'amazon': 'amazon_artist_id',
             'musicbrainz': 'musicbrainz_artist_id',
+            'yandex': 'yandex_artist_id',
         }
         col = col_map[provider]
 

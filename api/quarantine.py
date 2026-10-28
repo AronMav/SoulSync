@@ -429,7 +429,7 @@ def get_quarantine_audit_entry(entry_id):
         osr = ctx.get('original_search_result') if isinstance(ctx.get('original_search_result'), dict) else {}
         username = (osr.get('username') or '') if isinstance(osr, dict) else ''
         streaming = ('tidal', 'youtube', 'qobuz', 'hifi', 'deezer_dl',
-                     'lidarr', 'soundcloud', 'amazon')
+                     'lidarr', 'soundcloud', 'amazon', 'yandex')
         ti = ctx.get('track_info') if isinstance(ctx.get('track_info'), dict) else {}
         album_raw = ti.get('album', '')
         album_name = album_raw.get('name', '') if isinstance(album_raw, dict) else str(album_raw or '')

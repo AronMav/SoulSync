@@ -24,6 +24,7 @@ SERVICE_ENTITY_SUPPORT = {
     'spotify': ('artist', 'album', 'track'),
     'musicbrainz': ('artist', 'album', 'track'),
     'deezer': ('artist', 'album', 'track'),
+    'yandex': ('artist', 'album', 'track'),
     'audiodb': ('artist', 'album', 'track'),
     'discogs': ('artist', 'album'),          # no track-level id column
     'itunes': ('artist', 'album', 'track'),
