@@ -29,19 +29,21 @@ def test_similar_artists_has_a_yandex_id_column(tmp_path):
     assert 'similar_artist_yandex_id' in _columns(db, 'similar_artists')
 
 
-def test_yandex_columns_are_indexed_like_deezer(tmp_path):
+def test_yandex_columns_do_not_pay_for_an_index_up_front(tmp_path):
+    """3.6.0 builds enrichment indexes lazily, on a database that has data.
+
+    A fresh database must not carry per-source index conversions before there
+    is anything to index - the same rule tests/test_enrichment_queue_indexes.py
+    enforces for the deezer columns. So the yandex columns ship unindexed and
+    the queue's index pass adds them when it first needs them.
+    """
     db = MusicDatabase(str(tmp_path / "music.db"))
 
     with db._get_connection() as conn:
         names = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
 
-    for expected in (
-        'idx_artists_yandex_id', 'idx_artists_yandex_status',
-        'idx_albums_yandex_id', 'idx_albums_yandex_status',
-        'idx_tracks_yandex_id', 'idx_tracks_yandex_status',
-    ):
-        assert expected in names, expected
+    assert not [name for name in names if 'yandex' in name], sorted(names)
 
 
 def test_worker_no_longer_owns_the_schema():
