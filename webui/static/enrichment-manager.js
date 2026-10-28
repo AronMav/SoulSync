@@ -25,6 +25,8 @@ const ENRICHMENT_WORKERS = [
     { id: 'itunes',      name: 'iTunes',       color: '#fb5bc5', logoSel: '.itunes-enrich-logo' },
     { id: 'musicbrainz', name: 'MusicBrainz',  color: '#ba55d3', logoSel: '.mb-logo' },
     { id: 'deezer',      name: 'Deezer',       color: '#a238ff', logoSel: '.deezer-logo' },
+    { id: 'yandex',      name: 'Yandex Music', color: '#ffcc00', logoSel: '.yandex-logo',
+      logoUrl: '/static/img/brands/yandex.svg' },
     { id: 'jiosaavn',    name: 'JioSaavn',     color: '#2bc5b4', logoSel: '.jiosaavn-logo' },
     { id: 'audiodb',     name: 'AudioDB',      color: '#1c8cf0', logoSel: '.audiodb-logo' },
     { id: 'discogs',     name: 'Discogs',      color: '#cfcfcf', logoSel: '.discogs-logo', imgFilter: 'brightness(0) invert(1)' },
