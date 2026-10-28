@@ -11,13 +11,13 @@ from core.wishlist import processing
 
 
 def test_resolve_max_retry_count_default():
-    with patch('config.settings.config_manager') as cm:
+    with patch('core.settings.config_manager') as cm:
         cm.get.return_value = processing._DEFAULT_MAX_RETRY_COUNT
         assert processing._resolve_max_retry_count() == 5
 
 
 def test_resolve_max_retry_count_honors_config():
-    with patch('config.settings.config_manager') as cm:
+    with patch('core.settings.config_manager') as cm:
         cm.get.return_value = 3
         assert processing._resolve_max_retry_count() == 3
         cm.get.return_value = 10
@@ -25,7 +25,7 @@ def test_resolve_max_retry_count_honors_config():
 
 
 def test_resolve_max_retry_count_falls_back_on_garbage():
-    with patch('config.settings.config_manager') as cm:
+    with patch('core.settings.config_manager') as cm:
         cm.get.return_value = 'oops'
         assert processing._resolve_max_retry_count() == 5
         cm.get.return_value = 0
@@ -77,7 +77,7 @@ def test_abandon_removes_and_ignores():
 
 def test_abandon_uses_configured_cap():
     db = _make_db([])
-    with patch('config.settings.config_manager') as cm:
+    with patch('core.settings.config_manager') as cm:
         cm.get.return_value = 3
         processing.abandon_exhausted_tracks(db, profile_id=1)
     db.get_exhausted_wishlist_tracks.assert_called_once_with(3, profile_id=1)

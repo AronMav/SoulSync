@@ -21,12 +21,12 @@
 .issuesStatCard {
   flex: 1;
   min-width: 100px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 10px;
+  background: var(--white-a04);
+  border: 1px solid var(--white-a06);
+  border-radius: var(--radius-control);
   padding: 14px 16px;
   text-align: center;
-  transition: border-color 0.2s;
+  transition: border-color var(--dur-base);
 }
 
 .issuesStatNumber {
@@ -38,7 +38,7 @@
 
 .issuesStatLabel {
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.45);
+  color: var(--white-a45);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   margin-top: 4px;
@@ -53,7 +53,7 @@
 }
 
 .issuesStatResolved {
-  border-left: 3px solid #4ade80;
+  border-left: 3px solid var(--success);
 }
 
 .issuesStatDismissed {
@@ -70,53 +70,15 @@
   gap: 8px;
 }
 
-.issuesLoading,
-.issuesEmpty {
-  text-align: center;
-  padding: 60px 20px;
-  color: rgba(255, 255, 255, 0.4);
-}
-
 .issuesLoading {
+  text-align: center;
+  color: var(--white-a40);
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
   padding: 40px;
   font-size: 14px;
-}
-
-.issuesSpinner {
-  width: 20px;
-  height: 20px;
-  border: 2px solid rgba(255, 255, 255, 0.1);
-  border-top-color: rgba(var(--accent-light-rgb), 0.7);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.issuesEmptyIcon {
-  font-size: 40px;
-  margin-bottom: 12px;
-  opacity: 0.5;
-}
-
-.issuesEmptyTitle {
-  font-size: 16px;
-  font-weight: 500;
-  color: rgba(255, 255, 255, 0.6);
-  margin-bottom: 6px;
-}
-
-.issuesEmptyText {
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.35);
 }
 
 .issueCard {
@@ -127,22 +89,22 @@
   padding: 14px 16px;
   text-align: left;
   text-decoration: none;
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--white-a06);
+  background: var(--white-a03);
   color: inherit;
   cursor: pointer;
   transition:
-    transform 0.2s ease,
-    border-color 0.2s ease,
-    background 0.2s ease,
-    box-shadow 0.2s ease;
+    transform var(--dur-base) ease,
+    border-color var(--dur-base) ease,
+    background var(--dur-base) ease,
+    box-shadow var(--dur-base) ease;
 }
 
 .issueCard:hover {
   transform: translateY(-1px);
-  background: rgba(255, 255, 255, 0.06);
-  border-color: rgba(255, 255, 255, 0.12);
+  background: var(--white-a06);
+  border-color: var(--white-a12);
   box-shadow: 0 12px 28px rgba(0, 0, 0, 0.24);
 }
 
@@ -155,15 +117,15 @@
 .issueCardThumb {
   width: 52px;
   height: 52px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   object-fit: cover;
 }
 
 .issueCardThumbPlaceholder {
   width: 52px;
   height: 52px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.05);
+  border-radius: var(--radius-md);
+  background: var(--white-a05);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -199,25 +161,19 @@
   text-overflow: ellipsis;
 }
 
-.issueCardResponded {
-  font-size: 13px;
-  flex-shrink: 0;
-  opacity: 0.7;
-}
-
 .issueCardEntity {
   display: flex;
   align-items: center;
   gap: 6px;
   font-size: 12px;
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--white-a50);
   flex-wrap: wrap;
 }
 
 .issueCardEntityType {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--white-a08);
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -231,7 +187,7 @@
 }
 
 .issueCardMetaLine {
-  color: rgba(255, 255, 255, 0.35);
+  color: var(--white-a35);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -239,7 +195,7 @@
 
 .issueCardDescription {
   font-size: 12px;
-  color: rgba(255, 255, 255, 0.4);
+  color: var(--white-a40);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -252,13 +208,13 @@
   gap: 8px;
   flex-wrap: wrap;
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.3);
+  color: var(--white-a30);
 }
 
 .issueCardProfile {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--white-a06);
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
 }
 
 .issueCardDate {
@@ -274,388 +230,15 @@
   gap: 8px;
 }
 
-.issueStatusBadge {
-  padding: 3px 10px;
-  border-radius: 20px;
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.3px;
-  white-space: nowrap;
-}
-
-.issueStatusOpen {
-  background: rgba(255, 165, 0, 0.15);
-  color: #ffa500;
-  border: 1px solid rgba(255, 165, 0, 0.25);
-}
-
-.issueStatusProgress {
-  background: rgba(77, 166, 255, 0.15);
-  color: #4da6ff;
-  border: 1px solid rgba(77, 166, 255, 0.25);
-}
-
-.issueStatusResolved {
-  background: rgba(74, 222, 128, 0.15);
-  color: #4ade80;
-  border: 1px solid rgba(74, 222, 128, 0.25);
-}
-
-.issueStatusDismissed {
-  background: rgba(136, 136, 136, 0.15);
-  color: #888;
-  border: 1px solid rgba(136, 136, 136, 0.25);
-}
-
-.issuePriorityDot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-}
-
-.issuePriorityLow {
-  background: #666;
-}
-
-.issuePriorityNormal {
-  background: #4da6ff;
-}
-
-.issuePriorityHigh {
-  background: #ff4d4d;
-  box-shadow: 0 0 6px rgba(255, 77, 77, 0.4);
-}
-
-.modalOverlay {
-  position: fixed;
-  inset: 0;
-  z-index: 11000;
-  background: rgba(5, 9, 16, 0.76);
-  backdrop-filter: blur(18px);
-  display: grid;
-  place-items: center;
-  padding: 18px;
-}
-
-.modal {
-  width: min(1060px, 100%);
-  max-height: min(90vh, 980px);
-  overflow: auto;
-  border-radius: 28px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: linear-gradient(180deg, rgba(16, 22, 34, 0.98), rgba(12, 16, 25, 0.98));
-  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.45);
-}
-
-.issueDetailModal {
-  max-width: 750px;
-  width: 95vw;
-  max-height: 85vh;
-}
-
-.modalHeader {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 18px;
-  padding: 20px 22px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.modalHeaderTitle {
-  margin: 0 0 8px;
-  font-size: 1.4rem;
-}
-
-.modalClose {
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.05);
-  color: #fff;
-  border-radius: 14px;
-  width: 40px;
-  height: 40px;
-  cursor: pointer;
-}
-
-.modalBody {
-  padding: 22px;
-  display: grid;
-  gap: 18px;
-}
-
-.issueHero {
-  display: flex;
-  gap: 16px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  margin-bottom: 14px;
-}
-
-.issueHeroArtGroup {
-  position: relative;
-  flex-shrink: 0;
-}
-
-.issueHeroArtistThumb {
-  width: 48px;
-  height: 48px;
-  border-radius: 50%;
-  object-fit: cover;
-  position: absolute;
-  top: -6px;
-  left: -10px;
-  border: 2px solid rgba(30, 30, 30, 0.9);
-  z-index: 1;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
-}
-
-.issueHeroAlbumArt {
-  width: 140px;
-  height: 140px;
-  border-radius: 10px;
-  object-fit: cover;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-}
-
-.issueHeroAlbumPlaceholder {
-  width: 140px;
-  height: 140px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 40px;
-  color: rgba(255, 255, 255, 0.15);
-}
-
-.issueHeroInfo {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 4px;
-}
-
-.issueHeroArtist {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.5);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  font-weight: 500;
-}
-
-.issueHeroAlbum {
-  font-size: 20px;
-  font-weight: 700;
-  color: #fff;
-  line-height: 1.2;
-}
-
-.issueHeroTrackName {
-  font-size: 14px;
-  color: rgba(255, 255, 255, 0.7);
-  font-weight: 500;
-  margin-top: 2px;
-}
-
-.issueHeroMeta {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.4);
-  margin-top: 2px;
-}
-
-.issueDetailInfoBar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 10px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-  margin-bottom: 14px;
-}
-
-.issueDetailInfoLeft,
-.issueDetailInfoRight {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.issueDetailCategory {
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.7);
-}
-
-.issueDetailDate {
-  color: rgba(255, 255, 255, 0.35);
-  font-size: 12px;
-}
-
-.issueDetailProfile {
-  background: rgba(255, 255, 255, 0.06);
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 11px;
-}
-
-.issueDetailSection {
-  margin-bottom: 16px;
-}
-
-.issueDetailSectionTitle {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
-  color: rgba(255, 255, 255, 0.4);
-  margin-bottom: 8px;
-  font-weight: 500;
-}
-
-.issueDetailTitleText {
-  font-size: 15px;
-  font-weight: 500;
-  color: #fff;
-  margin-bottom: 8px;
-}
-
-.issueDetailDescription {
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.65);
-  line-height: 1.6;
-  white-space: pre-wrap;
-}
-
-.issueDetailNoDesc {
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.25);
-  font-style: italic;
-}
-
-.issueDetailMetaGrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  gap: 8px;
-}
-
-.issueMetaItem {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 8px;
-}
-
-.issueMetaIcon {
-  font-size: 14px;
-  opacity: 0.5;
-  flex-shrink: 0;
-  width: 18px;
-  text-align: center;
-}
-
-.issueMetaLabel {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.4px;
-  color: rgba(255, 255, 255, 0.35);
-  flex-shrink: 0;
-}
-
-.issueMetaValue {
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.85);
-  margin-left: auto;
-  font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 120px;
-}
-
-.issueActionButtons {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 14px;
-}
-
-.issueActionButton {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 16px;
-  border-radius: 8px;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  border: 1px solid transparent;
-  transition: all 0.2s ease;
-  font-family: inherit;
-}
-
-.issueActionButton:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.issueActionDownload {
-  background: rgba(var(--accent-light-rgb), 0.12);
-  color: rgb(var(--accent-light-rgb));
-  border-color: rgba(var(--accent-light-rgb), 0.25);
-}
-
-.issueActionDownload:hover:not(:disabled) {
-  background: rgba(var(--accent-light-rgb), 0.22);
-  border-color: rgba(var(--accent-light-rgb), 0.4);
-}
-
-.issueActionWishlist {
-  background: rgba(255, 165, 0, 0.1);
-  color: #ffa500;
-  border-color: rgba(255, 165, 0, 0.2);
-}
-
-.issueActionWishlist:hover:not(:disabled) {
-  background: rgba(255, 165, 0, 0.2);
-  border-color: rgba(255, 165, 0, 0.35);
-}
-
 @media (max-width: 900px) {
   .issuesStats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .issueHero {
-    flex-direction: column;
-    align-items: center;
-    text-align: center;
-  }
-
-  .issueHeroInfo {
-    align-items: center;
-  }
-
-  .issueDetailInfoBar {
-    flex-direction: column;
-    align-items: flex-start;
   }
 }
 
 @media (max-width: 720px) {
   .issuesContainer {
     padding: 18px;
-  }
-
-  .issuesHeaderRight {
-    width: 100%;
   }
 
   .issuesFilters {
@@ -689,5 +272,240 @@
     align-items: flex-start;
     flex-direction: row;
     justify-content: space-between;
+  }
+}
+
+.issuesRefine {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.issuesRefine > :first-child {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.issuesScope {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: var(--radius-control);
+  background: var(--white-a05);
+  border: 1px solid var(--white-a08);
+}
+
+.issuesScopeButton {
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--white-a55);
+  cursor: pointer;
+}
+
+.issuesScopeButton[aria-pressed='true'] {
+  background: var(--white-a10);
+  color: #fff;
+}
+
+.issueCardUnread {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: rgb(var(--accent-rgb));
+  background: rgba(var(--accent-rgb), 0.14);
+}
+
+.issuesMore {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.issuesMoreCount {
+  font-size: 12.5px;
+  color: var(--white-a45);
+}
+
+.issuesMoreButton {
+  padding: 8px 18px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--white-a12);
+  background: var(--white-a05);
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.issuesMoreButton:hover:not(:disabled) {
+  background: var(--white-a09);
+}
+
+.issuesMoreButton:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+@media (max-width: 640px) {
+  .issuesRefine > * {
+    flex: 1 1 100%;
+  }
+}
+
+/* ── admin bulk select ── */
+
+.issueRow {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+
+.issueRow > a {
+  flex: 1;
+  min-width: 0;
+}
+
+/* the tick sits on the corner of the artwork: shown on hover, on focus, and
+   on every row once anything is ticked */
+.issueRowCheck {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: rgb(var(--accent-rgb));
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--dur-fast) ease;
+}
+
+.issueRow:hover .issueRowCheck,
+.issueRowCheck:focus-visible,
+.issuesListSelecting .issueRowCheck {
+  opacity: 1;
+}
+
+.issueRowPicked > a {
+  border-color: rgba(var(--accent-rgb), 0.45);
+  background: rgba(var(--accent-rgb), 0.06);
+}
+
+.bulkBar {
+  position: sticky;
+  bottom: 16px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+  padding: 8px 8px 8px 16px;
+  border-radius: var(--radius-card);
+  background: rgba(22, 22, 26, 0.96);
+  border: 1px solid var(--white-a10);
+  box-shadow: 0 16px 40px var(--black-a45);
+  backdrop-filter: blur(10px);
+}
+
+.bulkCount {
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.bulkSpacer {
+  flex: 1;
+}
+
+.bulkButton,
+.bulkQuiet,
+.bulkClose,
+.bulkMenuItem {
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 9px;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--white-a80);
+  cursor: pointer;
+}
+
+.bulkButton:hover:not(:disabled),
+.bulkClose:hover,
+.bulkMenuItem:hover,
+.bulkMenuItem:focus-visible {
+  background: var(--white-a08);
+  color: #fff;
+  outline: none;
+}
+
+.bulkButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.bulkQuiet {
+  font-weight: 500;
+  color: rgb(var(--accent-light-rgb));
+}
+
+.bulkDanger {
+  color: #ff8a80;
+}
+
+.bulkClose {
+  padding: 4px 10px;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--white-a50);
+}
+
+.bulkMenuRoot {
+  position: relative;
+}
+
+.bulkMenu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 140px;
+  padding: 6px;
+  border-radius: var(--radius-lg);
+  background: rgba(24, 24, 26, 0.98);
+  border: 1px solid var(--white-a10);
+  box-shadow: 0 16px 48px var(--black-a60);
+}
+
+.bulkMenuItem {
+  display: block;
+  width: 100%;
+  text-align: left;
+}
+
+@media (max-width: 640px) {
+  .bulkBar {
+    flex-wrap: wrap;
+  }
+}
+
+/* no hover on touch: the tick is always there */
+@media (hover: none) {
+  .issueRowCheck {
+    opacity: 1;
   }
 }

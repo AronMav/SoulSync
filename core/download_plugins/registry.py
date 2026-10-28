@@ -193,7 +193,6 @@ def build_default_registry() -> DownloadPluginRegistry:
                                  aliases=('deezer_dl',)))
     registry.register(PluginSpec(name='lidarr',    factory=LidarrDownloadClient,   display_name='Lidarr'))
     registry.register(PluginSpec(name='soundcloud',factory=SoundcloudClient,       display_name='SoundCloud'))
-    # Yandex Music (RU-native lossless FLAC via yandex_music lib + yandex-music-downloader CLI).
     registry.register(PluginSpec(name='yandex',    factory=YandexDownloadClient,   display_name='Yandex Music'))
     registry.register(PluginSpec(name='torrent',   factory=TorrentDownloadPlugin,  display_name='Torrent (Prowlarr)'))
     registry.register(PluginSpec(name='usenet',    factory=UsenetDownloadPlugin,   display_name='Usenet (Prowlarr)'))

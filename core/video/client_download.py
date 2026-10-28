@@ -13,6 +13,7 @@ import asyncio
 import os
 from typing import Any, Callable, Optional
 
+from core.video.season_pack import is_pack_download
 from core.video.slskd_search import _is_video
 from utils.logging_config import get_logger
 
@@ -34,12 +35,19 @@ def _norm_state(status: Any) -> str:
 def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
                             resolve_path: Callable[[Any], Any],
                             find_video: Callable[[Any, Any], Any],
-                            organizer: Optional[Callable] = None) -> dict:
+                            organizer: Optional[Callable] = None,
+                            import_pack: Optional[Callable] = None) -> dict:
     """Next-state patch for a torrent/usenet download. ``get_status(source, ref)`` returns the
     client's status object (or None if it forgot the job), ``resolve_path`` maps its reported
     save_path to a locally-readable one, ``find_video(root, name)`` returns the main video file
     for THIS job — scoped to its own content (``name`` = the torrent/nzb job name), never the
-    largest file in a shared download folder."""
+    largest file in a shared download folder.
+
+    ``import_pack(dl, root, name)`` handles the season-pack case, and exists because
+    ``find_video`` is the wrong shape for it: a pack finishes as a FOLDER of episodes, and
+    narrowing it to one file means one episode is judged and the rest are abandoned on disk.
+    It returns None when the job turns out not to be a folder after all (some 'packs' are a
+    single file), so the ordinary path still runs."""
     ref = dl.get("client_ref")
     if not ref:
         return {"_missing": True}
@@ -69,8 +77,16 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
             size = int(getattr(status, "size", 0) or 0)
             done = int(getattr(status, "downloaded", 0) or 0)
             eta = int((size - done) / speed) if (speed > 0 and size > done) else None
-        return {"status": "downloading", "progress": pct,
-                "speed_bps": speed, "eta_seconds": eta}
+        patch = {"status": "downloading", "progress": pct,
+                 "speed_bps": speed, "eta_seconds": eta}
+        # the torrent client is holding it back on purpose (its own queue, a
+        # recheck). that's not a stall, so the monitor keeps the clock off it.
+        # usenet's queued also covers grabbing/propagating, which can hang, so
+        # it stays on the clock
+        if str(dl.get("source") or "").lower() == "torrent" \
+                and str(getattr(status, "state", "") or "").lower() == "queued":
+            patch["_client_queued"] = True
+        return patch
     # Completed → locate THIS job's finished video file, then import. Prefer the client's
     # exact content_path (this torrent's own file/folder) — the reliable anti-cross-attribution
     # signal: the shared save_path DIR holds every concurrent grab, and the torrent NAME often
@@ -81,19 +97,80 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     content = getattr(status, "content_path", None)
     if content:
         save = resolve_path(content)
-        src = find_video(save, None) if save else None       # already this job's own content
+        name = None                                          # already this job's own content
     else:
         reported = getattr(status, "save_path", None) or getattr(status, "incomplete_path", None)
         save = resolve_path(reported)
         name = getattr(status, "name", None)
-        src = find_video(save, name) if save else None
+        # a usenet client reports the job's OWN folder (sab ``storage``, nzbget
+        # FinalDir/DestDir), not the shared parent a torrent client reports.
+        # looking for save/name inside it found nothing, so every usenet grab sat
+        # at 100% until the stall timer failed it. scope by name only when that
+        # subfolder really is there
+        if str(dl.get("source") or "").lower() == "usenet" and save and name \
+                and not _scoped_content(save, name):
+            name = None
+    job_dir = _usenet_job_dir(dl, save, name, job_name=getattr(status, "name", None))
+    # A season pack is a FOLDER of episodes. Falling through to find_video here would pick
+    # its largest file, hand that one episode to the importer, and leave the rest on disk —
+    # and since a pack row carries no single episode identity, the importer then rejects it
+    # outright ("Season/complete packs need manual import"), stranding the whole download.
+    if save and import_pack is not None and is_pack_download(dl):
+        packed = import_pack(dl, save, name)
+        if packed is not None:
+            return _with_job_dir(packed, job_dir)
+    src = find_video(save, name) if save else None
     if not src:
         if dl.get("dest_path"):
             return {"status": "completed", "progress": 100.0, "dest_path": dl.get("dest_path")}
         return {"progress": 100.0}   # complete but the file isn't visible yet — keep polling
     if organizer is not None:
-        return organizer(dl, src)
+        return _with_job_dir(organizer(dl, src), job_dir, src)
     return {"status": "completed", "progress": 100.0, "dest_path": src}
+
+
+def _usenet_job_dir(dl: dict, save, name, job_name=None) -> Optional[str]:
+    """The usenet job's OWN download folder, or None.
+
+    What the client reports varies: a folder (nzbget's FinalDir, sab for a
+    multi-file job), the shared parent (scoped to ``<save>/<name>``), or -- sab
+    for a single-file job -- the finished FILE itself. For a file the job folder
+    is its parent, but only when that folder is named after the job
+    (``job_name``, case-insensitive): a category set up without job folders
+    puts the file straight in the category folder, which must never be
+    treated as the job's own. torrents never get one (the client is still
+    seeding). None unless it really is a folder."""
+    if str(dl.get("source") or "").lower() != "usenet" or not save:
+        return None
+    path = _scoped_content(save, name) if name else save
+    if path and os.path.isdir(path):
+        return str(path)
+    if path and os.path.isfile(path) and job_name:
+        parent = os.path.dirname(os.path.abspath(str(path)))
+        if os.path.basename(parent).casefold() == str(job_name).strip().casefold() \
+                and os.path.isdir(parent):
+            return parent
+    return None
+
+
+def _with_job_dir(patch, job_dir: Optional[str], src=None):
+    """Tag a completed import with its usenet job folder (transient
+    ``_cleanup_dir``, stripped like the other underscore keys). The monitor
+    removes the folder once the row is persisted and it is empty, so a grab no
+    longer leaves an empty release folder behind in the client's completed
+    folder. Only when the imported file came from inside that folder."""
+    if not job_dir or not isinstance(patch, dict) or patch.get("status") != "completed":
+        return patch
+    if src is not None:
+        try:
+            inside = os.path.commonpath([os.path.abspath(str(src)), os.path.abspath(job_dir)]) \
+                == os.path.abspath(job_dir)
+        except ValueError:
+            inside = False
+        if not inside:
+            return patch
+    patch["_cleanup_dir"] = job_dir
+    return patch
 
 
 # ── production seams ──────────────────────────────────────────────────────────
@@ -178,7 +255,18 @@ def find_video_file(root, name=None) -> Optional[str]:
     return _largest_video(root)
 
 
-def process_active_client_download(dl: dict, organizer=None) -> dict:
+def find_content_dir(root, name=None) -> Optional[str]:
+    """This job's own content as a DIRECTORY, or None when it is a single file. The pack
+    path needs the folder, not the file inside it, and must never widen to ``root`` — that
+    is the shared download dir holding every concurrent grab."""
+    if not root:
+        return None
+    scoped = _scoped_content(root, name) if name else str(root)
+    return scoped if scoped and os.path.isdir(scoped) else None
+
+
+def process_active_client_download(dl: dict, organizer=None, import_pack=None) -> dict:
     """Production entry: poll the real client + resolve + find the video for one torrent/usenet row."""
     return process_client_download(dl, get_status=_get_status, resolve_path=_resolve_path,
-                                   find_video=find_video_file, organizer=organizer)
+                                   find_video=find_video_file, organizer=organizer,
+                                   import_pack=import_pack)

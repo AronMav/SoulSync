@@ -17,9 +17,12 @@ re-joins whenever slskd reports us absent — idempotent, one extra call only
 when actually needed.
 """
 
-from __future__ import annotations
-
+import ipaddress
+import math as _math
+import os
 import re as _re
+import time
+from urllib.parse import urljoin, urlparse
 
 from flask import Blueprint, g, jsonify, request
 
@@ -31,7 +34,7 @@ _MAX_MESSAGE_LEN = 1000
 # Preset chat avatars live at webui/static/avatar/1.png .. <AVATAR_COUNT>.png.
 # The id is only ever an INDEX into that fixed set — remote input must never
 # reach a filesystem path.
-AVATAR_COUNT = 100
+AVATAR_COUNT = 244  # 101-244 are the games set. chat.js CHAT_AVATARS must match
 # Avatars only their owner may wear. The picker hides them from everyone else,
 # but the envelope is client-controlled, so ownership is ALSO enforced on send
 # here and on render in chat.js — a forged id can't put someone else's face on
@@ -46,6 +49,7 @@ def _avatar_allowed(av: int, username: str) -> bool:
         return True
     return str(username or "").strip().casefold() == owner
 _INGEST_AT: dict = {}      # room -> last full-buffer archive ingest (epoch)
+_INGEST_KEY: dict = {}     # room -> last buffer fingerprint (live-tail change tracking)
 _SELF = {"name": "", "at": 0.0}   # our slskd username, cached (network call)
 _AVAILABLE = {"rooms": None, "at": 0.0}   # /rooms/available cache (big list, 5-min TTL)
 
@@ -121,6 +125,27 @@ def _room_name() -> str:
         return "SoulSync"
 
 
+RETENTION_DAYS_DEFAULT = 30
+RETENTION_DAYS_MAX = 3650  # ~10 years; beyond that you're archiving, not chatting
+
+
+def _retention_days(cfg_getter=None) -> int:
+    """The configured room-history retention in days, sanitized. 0 = keep
+    everything (the 5,000-per-room count cap still bounds disk)."""
+    get = cfg_getter or _config_get
+    try:
+        raw = get("soulseek.chat_history_retention_days", RETENTION_DAYS_DEFAULT)
+    except Exception:
+        return RETENTION_DAYS_DEFAULT
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        return RETENTION_DAYS_DEFAULT
+    if days != days:  # NaN
+        return RETENTION_DAYS_DEFAULT
+    return max(0, min(days, RETENTION_DAYS_MAX))
+
+
 def _extra_rooms() -> list:
     """Extra Soulseek rooms the admin joined (beyond the community room).
     Persisted in config because slskd forgets its rooms on restart — the
@@ -161,6 +186,15 @@ def _clean_message(payload) -> str | None:
     if not msg:
         return None
     return msg[:_MAX_MESSAGE_LEN]
+
+
+def _flatten_for_wire(msg: str) -> str:
+    """Bare text for the Soulseek server. It silently drops any chat message
+    that contains a newline (Nicotine+ filters them for the same reason): slskd
+    says 201, the echo never comes, and the sender watches their message vanish.
+    Only plain room sends and PMs go out bare; an envelope is base64 and has
+    no newlines to lose."""
+    return str(msg or "").replace("\r", "").replace("\n", " ")
 
 
 def _ensure_joined(client, room: str) -> bool:
@@ -231,6 +265,12 @@ def _unwrap_room_messages(messages):
                     m["av"] = _av
             except (TypeError, ValueError):
                 pass
+            # User flair badge ('bg'). badge_of re-validates on receive, so a
+            # hostile client can't smuggle a staff word past the send guard —
+            # every client folds the same verdict from the same stream.
+            _bg = chat_codec.badge_of(dec)
+            if _bg:
+                m["badge"] = _bg
             _th = dec.get("th")
             if isinstance(_th, str) and _th.strip():
                 m["th"] = _th.strip()[:160]
@@ -243,6 +283,28 @@ def _unwrap_room_messages(messages):
             f = chat_codec.file_of(dec)
             if f:
                 m["file"] = f
+            np = chat_codec.np_of(dec)
+            if np:
+                m["np"] = np
+            w = chat_codec.want_of(dec)
+            if w:
+                m["want"] = w
+            # A shared overlay template. The definition rides its own envelope
+            # key (protocol_of would reject layers-of-objects), and the card
+            # carries the asset refs it depends on so the reader is told what
+            # will be missing BEFORE they import rather than after.
+            ov = chat_codec.overlay_of(dec)
+            if ov:
+                m["overlay"] = {"n": ov["n"],
+                                "layers": len(ov["d"].get("layers") or []),
+                                "assets": chat_codec.overlay_assets(ov["d"]),
+                                "d": ov["d"]}
+            # Edit carrier: the client fold replaces the target's displayed
+            # text and keeps the history; the carrier itself stays a real
+            # message (Soulseek can't unsend, so hiding it would lie).
+            e2 = chat_codec.edit_of(dec)
+            if e2:
+                m["ed"] = e2
         out.append(m)
     return out, reactions, protocol
 
@@ -291,7 +353,7 @@ def _resolve_track_path(db, track_id):
     if not fp:
         return None
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         from core.library.path_resolver import resolve_library_file_path
         return resolve_library_file_path(str(fp), config_manager=config_manager)
     except Exception:
@@ -374,6 +436,49 @@ def _parse_youtube_id(q: str):
     return None
 
 
+# how many yt-dlp is asked for before the jukebox picks its five. the
+# duration gate in search_videos (30 s to 15 min) used to eat most of a
+# five-result ask, so the picker showed one or two.
+_JUKEBOX_SEARCH_POOL = 15
+_JUKEBOX_RESULTS = 5
+_JBX_WEAK = _re.compile(r"\b(reaction|reacts?|review|karaoke|tutorial|lesson|how to|"
+                        r"explained|interview|podcast|unboxing|trailer|8d audio|slowed|sped up|"
+                        r"nightcore)\b", _re.I)
+_JBX_STRONG = _re.compile(r"\b(official|audio|visualizer|vevo|topic)\b", _re.I)
+
+
+def _jukebox_score(v) -> float:
+    """a jukebox wants the song, so the ranking says what youtube's order
+    doesn't: the artist's own upload or a Topic/VEVO channel first, a
+    reaction or a karaoke track last, and views only to break ties."""
+    title = str(getattr(v, "title", "") or "")
+    channel = str(getattr(v, "channel", "") or "")
+    score = 0.0
+    if _JBX_STRONG.search(title) or _JBX_STRONG.search(channel):
+        score += 3.0
+    if channel.lower().endswith(" - topic") or "vevo" in channel.lower():
+        score += 2.0
+    if _JBX_WEAK.search(title):
+        score -= 6.0
+    if _re.search(r"\b(cover|remix|live|acoustic)\b", title, _re.I):
+        score -= 1.5
+    try:
+        views = float(getattr(v, "view_count", 0) or 0)
+        if views > 0:
+            score += min(3.0, _math.log10(views) / 3.0)
+    except (TypeError, ValueError):
+        pass
+    return score
+
+
+def rank_jukebox_results(found, limit: int = _JUKEBOX_RESULTS) -> list:
+    """the best `limit` of what yt-dlp returned, valid ids only, best first,
+    ties keeping youtube's order."""
+    keep = [v for v in (found or []) if _YT_ID_RE.match(str(getattr(v, "video_id", "") or ""))]
+    ranked = sorted(enumerate(keep), key=lambda iv: (-_jukebox_score(iv[1]), iv[0]))
+    return [v for _, v in ranked[:limit]]
+
+
 def _oembed_fetch(video_id):
     """One seam for the keyless YouTube oEmbed lookup (monkeypatched in tests).
 
@@ -389,8 +494,213 @@ def _oembed_fetch(video_id):
     return r.json()
 
 
+_LINK_PREVIEW_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _is_safe_preview_url(url: str) -> bool:
+    """SSRF guard for chat link preview fetching.
+
+    Only external http/https addresses. Loopback, private IP ranges,
+    multicast, and internal hostnames are strictly blocked.
+    """
+    try:
+        p = urlparse(str(url or "").strip())
+        if p.scheme not in ("http", "https"):
+            return False
+        host = (p.hostname or "").lower().strip()
+        if not host or host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+            return False
+        if host.endswith((".local", ".internal", ".lan", ".home", ".corp", ".onion")):
+            return False
+        # what the name RESOLVES to is what gets fetched. checking only an ip
+        # literal let "127.0.0.1.nip.io", "http://2130706433/" and any public
+        # name pointed at a lan address straight through
+        addrs = _resolve_host(host, p.port or (443 if p.scheme == "https" else 80))
+        return bool(addrs) and all(_is_public_ip(a) for a in addrs)
+    except Exception:
+        return False
+
+
+def _resolve_host(host: str, port: int) -> list[str]:
+    import socket
+    return [info[4][0] for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)]
+
+
+def _is_public_ip(addr: str) -> bool:
+    ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+_PREVIEW_MAX_REDIRECTS = 3
+_HEX_COLOR = _re.compile(r"^#[0-9a-fA-F]{3,8}$")
+
+
+def _preview_get(url: str, headers: dict):
+    """GET that re-runs the ssrf guard on every redirect hop. requests follows
+    redirects on its own, so a public link that 302s to the router's admin
+    page used to be fetched without a second look."""
+    import requests
+    for _ in range(_PREVIEW_MAX_REDIRECTS + 1):
+        if not _is_safe_preview_url(url):
+            return None, url
+        r = requests.get(url, headers=headers, timeout=4, stream=True, allow_redirects=False)
+        if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
+            location = r.headers.get("location")
+            r.close()
+            if not location:
+                return None, url
+            url = urljoin(url, location)
+            continue
+        return r, url
+    return None, url
+
+
+def _frameable(headers) -> bool:
+    """whether the page lets another site show it in an iframe. most big sites
+    refuse, and the iframe still fires onload, so "preview inline" used to open
+    a dead box with no fallback."""
+    xfo = str(headers.get("x-frame-options") or "").strip().lower()
+    if xfo:
+        return False
+    csp = str(headers.get("content-security-policy") or "").lower()
+    for part in csp.split(";"):
+        part = part.strip()
+        if part.startswith("frame-ancestors"):
+            sources = part.split()[1:]
+            return "*" in sources
+    return True
+
+
+def _fetch_link_preview(url: str) -> dict | None:
+    """Fetch OpenGraph and basic HTML metadata for a URL posted in chat.
+
+    Returns a dict with title, description, image, site_name, domain, theme_color.
+    Safe against SSRF and cached in memory.
+    """
+    now = time.time()
+    if url in _LINK_PREVIEW_CACHE:
+        cached_time, data = _LINK_PREVIEW_CACHE[url]
+        if now - cached_time < 3600:
+            return data
+
+    try:
+        from bs4 import BeautifulSoup
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 (compatible; SoulSync/1.0; +https://github.com/Nezreka/SoulSync)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        r, final_url = _preview_get(url, headers)
+        if r is None:
+            return None
+        r.raise_for_status()
+        ctype = r.headers.get("content-type", "").lower()
+        if "text/html" not in ctype and "xhtml" not in ctype:
+            return None
+
+        chunks = []
+        total = 0
+        for chunk in r.iter_content(chunk_size=8192, decode_unicode=True):
+            if chunk:
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > 65536 or "</head>" in chunk.lower():
+                    break
+        raw_html = "".join(chunks)
+        soup = BeautifulSoup(raw_html, "html.parser")
+
+        # Title
+        title = ""
+        og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
+        if og_title and og_title.get("content"):
+            title = str(og_title["content"]).strip()
+        elif soup.title and soup.title.string:
+            title = str(soup.title.string).strip()
+
+        # Description
+        desc = ""
+        og_desc = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"name": "twitter:description"})
+        if og_desc and og_desc.get("content"):
+            desc = str(og_desc["content"]).strip()
+
+        # Image
+        img = ""
+        og_img = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "twitter:image"})
+        if og_img and og_img.get("content"):
+            img = str(og_img["content"]).strip()
+            if img and not (img.startswith("http://") or img.startswith("https://")):
+                img = urljoin(final_url, img)
+            if not img.startswith(("http://", "https://")):
+                img = ""
+
+        # Site Name
+        site_name = ""
+        og_site = soup.find("meta", property="og:site_name")
+        if og_site and og_site.get("content"):
+            site_name = str(og_site["content"]).strip()
+
+        # Theme color
+        theme_color = ""
+        tc = soup.find("meta", attrs={"name": "theme-color"})
+        if tc and tc.get("content"):
+            theme_color = str(tc["content"]).strip()
+        # it lands in a style attribute, so anything but a plain hex colour
+        # could append its own declarations (position: fixed over the app)
+        if not _HEX_COLOR.match(theme_color):
+            theme_color = ""
+
+        domain = urlparse(url).hostname or ""
+
+        data = {
+            "ok": True,
+            "url": url,
+            "title": title[:160],
+            "description": desc[:300],
+            "image": img[:500],
+            "site_name": (site_name or domain)[:80],
+            "domain": domain,
+            "theme_color": theme_color,
+            "frameable": _frameable(r.headers),
+        }
+        if len(_LINK_PREVIEW_CACHE) > 500:
+            _LINK_PREVIEW_CACHE.clear()
+        _LINK_PREVIEW_CACHE[url] = (now, data)
+        return data
+    except Exception as e:
+        logger.debug(f"chat: link-preview failed for {url}: {e}")
+        return None
+
+
 def create_blueprint() -> Blueprint:
     bp = Blueprint("chat_api", __name__)
+
+    def connection_state(client):
+        probe = getattr(client, "get_chat_connection_state", None)
+        if not callable(probe):
+            return {"connected": True}  # compatibility with injected chat adapters
+        try:
+            return _run_async(probe(), timeout=5)
+        except Exception:
+            return {"connected": False, "code": "slskd_unavailable",
+                    "error": "Cannot reach slskd. Check its connection before sending. Your draft is preserved."}
+
+    @bp.before_request
+    def require_soulseek_connection():
+        path = request.path
+        sends = request.method == "POST" and (path in (
+            "/api/chat/room/message", "/api/chat/room/protocol", "/api/chat/room/react",
+            "/api/chat/rooms/join") or path.startswith("/api/chat/conversations/"))
+        reads = request.method == "GET" and (path == "/api/chat/room" or path.startswith("/api/chat/conversations/"))
+        if not (sends or reads) or (sends and not _can_send()):
+            return None
+        client = _client()
+        if client is None:
+            return None  # route retains its existing not-configured response
+        state = connection_state(client)
+        if not state.get("connected"):
+            return jsonify({**state, "can_send": False}), 503
+        return None
 
     # ── Arcade bank (play money) ─────────────────────────────────────────
     # Per profile, local, refilled every local midnight. It is NOT authoritative
@@ -439,6 +749,7 @@ def create_blueprint() -> Blueprint:
                 return _config_get(key, default)
             except Exception:
                 return default
+
         return jsonify({
             "room": str(_cfg("soulseek.chat_room", "SoulSync") or "SoulSync"),
             "member_send": bool(_cfg("soulseek.chat_member_send", False)),
@@ -450,6 +761,12 @@ def create_blueprint() -> Blueprint:
             # Chosen preset avatar (0 = none). Server-side so it follows the
             # account across browsers rather than living in one localStorage.
             "avatar": int(_cfg("soulseek.chat_avatar", 0) or 0),
+            # Flair badge shown next to the account's name in the room.
+            # Server-side for the same reason as the avatar.
+            "badge": str(_cfg("soulseek.chat_badge", "") or ""),
+            # Room-history retention, in days (0 = keep everything, up to the
+            # 5,000-per-room count cap). Default 30.
+            "history_retention_days": _retention_days(_cfg),
         })
 
     @bp.route("/api/chat/settings", methods=["POST"])
@@ -482,6 +799,35 @@ def create_blueprint() -> Blueprint:
             elif not _avatar_allowed(_av, _self_username(_client())):
                 _av = 0          # reserved for someone else — don't store it
             _config_set("soulseek.chat_avatar", _av)
+        if "badge" in body:
+            # present = intentional: a value sets it, empty string clears it.
+            # badge_of is the same validator the wire uses — a staff word the
+            # user typed is refused HERE with the reason, not silently sent
+            # as nothing (the send path would 400 on it).
+            from core import chat_codec as _cc
+
+            _raw = str(body.get("badge") or "")
+            _clean = _cc.badge_of({"bg": _raw}) or ""
+            if _raw.strip() and not _clean:
+                return jsonify({"error": 'That badge can\'t be used — keep it short, plain text, and nothing staff-like ("admin", "dev"…) or profane.'}), 400
+            _config_set("soulseek.chat_badge", _clean)
+        if "history_retention_days" in body:
+            try:
+                _days = int(body.get("history_retention_days"))
+            except (TypeError, ValueError):
+                _days = RETENTION_DAYS_DEFAULT
+            _days = max(0, min(_days, RETENTION_DAYS_MAX))
+            _config_set("soulseek.chat_history_retention_days", _days)
+            # the new window applies NOW, not on tomorrow's scheduled sweep —
+            # lowering it to 7 days shouldn't leave 30 days of rows overnight
+            try:
+                _db_inst = _db()
+                if _db_inst is not None and _days > 0:
+                    _n = _db_inst.prune_chat_messages(_days)
+                    if _n:
+                        logger.info("chat: retention change pruned %d messages older than %d days", _n, _days)
+            except Exception:
+                logger.debug("chat: retention prune on save failed", exc_info=True)
         if "giphy_key" in body:
             # present = intentional: a value sets it, empty string clears it
             _config_set("soulseek.chat_giphy_key", str(body.get("giphy_key") or "").strip())
@@ -742,6 +1088,209 @@ def create_blueprint() -> Blueprint:
             if conn:
                 conn.close()
 
+    @bp.route("/api/chat/wanted/resolve-share", methods=["POST"])
+    def chat_wanted_resolve_share():
+        """Look up local library files matching a Wanted/ISO card, computing the
+        relative share filenames for Soulseek P2P direct sharing."""
+        if not _can_send():
+            return jsonify({"error": "Sending is disabled for this profile"}), 403
+
+        db = _db()
+        if db is None:
+            return jsonify({"ok": False, "error": "Database is unavailable"}), 503
+
+        payload = request.get_json(silent=True) or {}
+        title = str(payload.get("title") or "").strip()
+        artist = str(payload.get("artist") or "").strip()
+        album = str(payload.get("album") or "").strip()
+        req_type = str(payload.get("type") or "album").strip().lower()
+
+        if not title and not artist:
+            return jsonify({"ok": False, "error": "Title or artist required"}), 400
+
+        # Try to resolve configured slskd share directories
+        share_dirs = []
+        client = _client()
+        if client is not None and _run_async is not None:
+            try:
+                if hasattr(client, "get_share_directories"):
+                    share_dirs = _run_async(client.get_share_directories()) or []
+            except Exception as e:
+                logger.debug("chat: resolve-share could not get share dirs: %s", e)
+                share_dirs = []
+
+        conn = None
+        try:
+            conn = db._get_connection()
+            album_row = None
+            tracks_rows = []
+
+            # 1. Match album if requested or if not strictly a single track
+            if req_type in ("album", "ep", "single") or not req_type:
+                alb_query = title or album
+                if alb_query:
+                    like_alb = "%" + alb_query.replace("%", "\\%") + "%"
+                    like_art = "%" + artist.replace("%", "\\%") + "%" if artist else "%"
+                    album_row = conn.execute(
+                        """SELECT al.id, al.title, al.year, COALESCE(ar.name, '') as artist,
+                                  al.thumb_url, ar.thumb_url as artist_thumb_url
+                           FROM albums al
+                           LEFT JOIN artists ar ON ar.id = al.artist_id
+                           WHERE al.title LIKE ? AND (ar.name LIKE ? OR ? LIKE ('%' || ar.name || '%') OR ? = '%')
+                           ORDER BY CASE WHEN LOWER(al.title) = LOWER(?) THEN 0 ELSE 1 END,
+                                    al.id LIMIT 1""",
+                        (like_alb, like_art, artist if artist else "%", like_art, alb_query)
+                    ).fetchone()
+
+                    # Fall back to album title if artist naming has slight discrepancy
+                    if not album_row and artist:
+                        album_row = conn.execute(
+                            """SELECT al.id, al.title, al.year, COALESCE(ar.name, '') as artist,
+                                      al.thumb_url, ar.thumb_url as artist_thumb_url
+                               FROM albums al
+                               LEFT JOIN artists ar ON ar.id = al.artist_id
+                               WHERE al.title LIKE ?
+                               ORDER BY CASE WHEN LOWER(al.title) = LOWER(?) THEN 0 ELSE 1 END,
+                                        al.id LIMIT 1""",
+                            (like_alb, alb_query)
+                        ).fetchone()
+
+                if album_row:
+                    tracks_rows = conn.execute(
+                        """SELECT t.id, t.title, t.track_number, t.duration, t.file_path,
+                                  t.file_size, t.bitrate,
+                                  COALESCE(t.track_artist, ar.name, '') as artist,
+                                  al.title as album,
+                                  al.thumb_url as album_thumb_url,
+                                  ar.thumb_url as artist_thumb_url
+                           FROM tracks t
+                           JOIN albums al ON al.id = t.album_id
+                           LEFT JOIN artists ar ON ar.id = t.artist_id
+                           WHERE t.album_id = ? AND t.file_path IS NOT NULL AND t.file_path != ''
+                           ORDER BY t.track_number, t.id""",
+                        (album_row["id"],)
+                    ).fetchall()
+
+            # 2. If no album matched or if req_type is 'track', try track search
+            if not tracks_rows:
+                track_query = title
+                like_trk = "%" + track_query.replace("%", "\\%") + "%"
+                like_art = "%" + artist.replace("%", "\\%") + "%" if artist else "%"
+                tracks_rows = conn.execute(
+                    """SELECT t.id, t.title, t.track_number, t.duration, t.file_path,
+                              t.file_size, t.bitrate,
+                              COALESCE(t.track_artist, ar.name, '') as artist,
+                              COALESCE(al.title, '') as album,
+                              al.thumb_url as album_thumb_url,
+                              ar.thumb_url as artist_thumb_url
+                       FROM tracks t
+                       LEFT JOIN artists ar ON ar.id = t.artist_id
+                       LEFT JOIN albums al ON al.id = t.album_id
+                       WHERE t.title LIKE ? AND (ar.name LIKE ? OR t.track_artist LIKE ? OR ? LIKE ('%' || ar.name || '%') OR ? = '%')
+                         AND t.file_path IS NOT NULL AND t.file_path != ''
+                       ORDER BY CASE WHEN LOWER(t.title) = LOWER(?) THEN 0 ELSE 1 END,
+                                t.id LIMIT ?""",
+                    (like_trk, like_art, like_art, artist if artist else "%", like_art, track_query,
+                     1 if req_type == "track" else 50)
+                ).fetchall()
+
+                # Fallback to track title alone if artist string differs
+                if not tracks_rows and track_query and artist:
+                    tracks_rows = conn.execute(
+                        """SELECT t.id, t.title, t.track_number, t.duration, t.file_path,
+                                  t.file_size, t.bitrate,
+                                  COALESCE(t.track_artist, ar.name, '') as artist,
+                                  COALESCE(al.title, '') as album,
+                                  al.thumb_url as album_thumb_url,
+                                  ar.thumb_url as artist_thumb_url
+                           FROM tracks t
+                           LEFT JOIN artists ar ON ar.id = t.artist_id
+                           LEFT JOIN albums al ON al.id = t.album_id
+                           WHERE t.title LIKE ? AND t.file_path IS NOT NULL AND t.file_path != ''
+                           ORDER BY CASE WHEN LOWER(t.title) = LOWER(?) THEN 0 ELSE 1 END,
+                                    t.id LIMIT ?""",
+                        (like_trk, track_query, 1 if req_type == "track" else 50)
+                    ).fetchall()
+
+            if not tracks_rows:
+                return jsonify({"ok": True, "found": False, "message": "No matching local files found"})
+
+            # Helper to strip share directory from file path for Soulseek
+            def _to_share_path(fp: str) -> str:
+                norm_fp = fp.replace("\\", "/")
+                for sd in share_dirs:
+                    if not sd:
+                        continue
+                    norm_sd = sd.rstrip("/") + "/"
+                    if norm_fp.lower().startswith(norm_sd.lower()):
+                        rel = norm_fp[len(norm_sd):]
+                        return rel.replace("/", "\\")
+                parts = [p for p in norm_fp.split("/") if p]
+                if len(parts) >= 3:
+                    return "\\".join(parts[-3:])
+                elif len(parts) >= 2:
+                    return "\\".join(parts[-2:])
+                return norm_fp.replace("/", "\\")
+
+            def _to_share_dir(rel_fn: str) -> str:
+                norm = rel_fn.replace("/", "\\")
+                if "\\" in norm:
+                    return norm.rsplit("\\", 1)[0]
+                return ""
+
+            out_tracks = []
+            total_size = 0
+            for r in tracks_rows:
+                fp = str(r["file_path"] or "")
+                sz = int(r["file_size"] or 0)
+                if sz == 0 and os.path.exists(fp):
+                    try:
+                        sz = os.path.getsize(fp)
+                    except Exception as exc:
+                        logger.debug("Failed to get size for %s: %s", fp, exc)
+                total_size += sz
+                share_fn = _to_share_path(fp)
+                out_tracks.append({
+                    "id": r["id"],
+                    "title": r["title"] or "Unknown",
+                    "track_number": r["track_number"] or 1,
+                    "duration": r["duration"] or 0,
+                    "size": sz,
+                    "bitrate": r["bitrate"] or 0,
+                    "filename": share_fn,
+                    "artist": r["artist"] or artist,
+                    "album": r["album"] or (album_row["title"] if album_row else "")
+                })
+
+            resolved_title = (album_row["title"] if album_row else (out_tracks[0]["album"] or out_tracks[0]["title"]))
+            resolved_artist = (album_row["artist"] if album_row else out_tracks[0]["artist"])
+            primary_dir = _to_share_dir(out_tracks[0]["filename"]) if out_tracks else ""
+            res_img = (album_row["thumb_url"] if (album_row and "thumb_url" in album_row.keys() and album_row["thumb_url"])
+                       else (tracks_rows[0]["album_thumb_url"] if (tracks_rows and "album_thumb_url" in tracks_rows[0].keys() and tracks_rows[0]["album_thumb_url"]) else ""))
+            res_ar_img = (album_row["artist_thumb_url"] if (album_row and "artist_thumb_url" in album_row.keys() and album_row["artist_thumb_url"])
+                          else (tracks_rows[0]["artist_thumb_url"] if (tracks_rows and "artist_thumb_url" in tracks_rows[0].keys() and tracks_rows[0]["artist_thumb_url"]) else ""))
+
+            return jsonify({
+                "ok": True,
+                "found": True,
+                "type": "album" if (album_row or len(out_tracks) > 1) else "track",
+                "title": resolved_title,
+                "artist": resolved_artist,
+                "year": album_row["year"] if album_row else "",
+                "image_url": res_img or "",
+                "artist_image_url": res_ar_img or "",
+                "directory": primary_dir,
+                "track_count": len(out_tracks),
+                "total_size": total_size,
+                "tracks": out_tracks
+            })
+        except Exception as e:
+            logger.exception("chat: resolve-share failed")
+            return jsonify({"ok": False, "error": str(e)}), 500
+        finally:
+            if conn:
+                conn.close()
+
     @bp.route("/api/chat/files/upload", methods=["POST"])
     def chat_files_upload():
         """Upload to filepost.dev and hand back the CDN link + metadata.
@@ -975,10 +1524,12 @@ def create_blueprint() -> Blueprint:
     def chat_status():
         """Cheap page hydrate: is chat usable, which room, may I send."""
         client = _client()
+        connection = connection_state(client) if client is not None else {"connected": False}
         return jsonify({
+            **connection,
             "configured": client is not None,
             "room": _room_name(),
-            "can_send": _can_send(),
+            "can_send": _can_send() and connection.get("connected", False),
             "is_admin": bool(getattr(g, "is_admin", True)),   # shows the settings cog
             # our slskd account name — the page needs it for @mention highlights
             "username": _self_username(client) if client is not None else "",
@@ -1013,8 +1564,12 @@ def create_blueprint() -> Blueprint:
             if not _ensure_joined(client, room):
                 return jsonify({"error": "Could not join room '%s' — is slskd connected "
                                          "to the Soulseek network?" % room}), 502
-            messages = _run_async(client.get_room_messages(room))
-            users = _run_async(client.get_room_users(room))
+            # timeout=5: the chat page hydrates this every 4s, and the app has
+            # 8 request threads total — an unbounded wait on a slow slskd let
+            # one hung hydrate pin a slot indefinitely (perf sweep, Aug 2026).
+            # A miss 502s and the next poll simply tries again.
+            messages = _run_async(client.get_room_messages(room), timeout=5)
+            users = _run_async(client.get_room_users(room), timeout=5)
         except Exception as e:
             logger.exception("chat: room hydrate failed")
             return jsonify({"error": str(e)}), 502
@@ -1031,16 +1586,46 @@ def create_blueprint() -> Blueprint:
             try:
                 import time as _time
                 now = _time.time()
-                if now - _INGEST_AT.get(room, 0) > 60:
+                if not _INGEST_AT:
+                    _INGEST_KEY.clear()
+                live_key = (str(live[-1].get("timestamp") or "") + ":" + str(len(live))) if live else ""
+                last_key = _INGEST_KEY.get(room)
+                should_ingest = (now - _INGEST_AT.get(room, 0) > 60) or (live_key and live_key != last_key)
+                if should_ingest:
                     _INGEST_AT[room] = now
+                    _INGEST_KEY[room] = live_key
                     db.add_chat_messages(room, live)
+                    # The WRITE is throttled with the messages; the read below
+                    # is not. Reactions are carriers, so the message archive
+                    # never held them and a reaction died with slskd's buffer.
+                    db.add_chat_reactions(room, reactions)
+                # Merged on EVERY hydrate, never on the 60s tick alone: this
+                # page polls every 4s, so folding stored reactions in only when
+                # the throttle opens would make old chips appear for one poll
+                # and vanish for the next fourteen.
+                for _k, _by in (db.get_chat_reactions(room) or {}).items():
+                    _live = reactions.setdefault(_k, {})
+                    for _e, _users in _by.items():
+                        _cur = _live.setdefault(_e, [])
+                        for _u in _users:
+                            if _u not in _cur:
+                                _cur.append(_u)
                 # Game carriers ride every hydrate rather than the 60s throttle:
                 # they are rare (usually none at all), the natural-key UNIQUE
                 # makes repeats free, and losing one loses a move.
                 db.add_chat_game_carriers(room, protocol_events)
                 arch = db.get_chat_messages(room, limit=100)
                 if arch:
-                    out = arch
+                    seen = {}
+                    for m in arch:
+                        k = (str(m.get("username") or ""), str(m.get("timestamp") or ""), str(m.get("message") or ""))
+                        seen[k] = m
+                    for m in live:
+                        k = (str(m.get("username") or ""), str(m.get("timestamp") or ""), str(m.get("message") or ""))
+                        seen[k] = m
+                    merged = list(seen.values())
+                    merged.sort(key=lambda x: str(x.get("timestamp") or ""))
+                    out = merged[-100:]
             except Exception:
                 logger.debug("chat: archive unavailable, serving live buffer", exc_info=True)
         # Games outlive slskd's buffer: replay the archived gm.* carriers
@@ -1123,10 +1708,15 @@ def create_blueprint() -> Blueprint:
 
         vid = _parse_youtube_id(q)
         if vid:
+            # oembed is for the title. it answers 401 for a video whose owner
+            # disallows embedding (plenty of label uploads) and 404 for a
+            # private one; the id plays either way, so a failed lookup means
+            # "no title yet", never "no link". links used to die here.
             try:
                 meta = _oembed_fetch(vid) or {}
-            except Exception:
-                return jsonify({"error": "That video could not be resolved"}), 404
+            except Exception as exc:
+                logger.debug("chat: jukebox oembed lookup failed for %s: %s", vid, exc)
+                meta = {}
             return jsonify({"results": [{
                 "id": vid,
                 "title": str(meta.get("title") or "")[:120] or vid,
@@ -1136,15 +1726,13 @@ def create_blueprint() -> Blueprint:
         if _youtube_search is None:
             return jsonify({"error": "Search is unavailable — paste a YouTube link"}), 503
         try:
-            found = _youtube_search(q, 5) or []
+            found = _youtube_search(q, _JUKEBOX_SEARCH_POOL) or []
         except Exception:
             logger.exception("chat: jukebox search failed")
             return jsonify({"error": "YouTube search failed"}), 502
         results = []
-        for v in found[:5]:
+        for v in rank_jukebox_results(found):
             vid2 = str(getattr(v, "video_id", "") or "")
-            if not _YT_ID_RE.match(vid2):
-                continue
             results.append({
                 "id": vid2,
                 "title": str(getattr(v, "title", "") or "")[:120],
@@ -1153,6 +1741,18 @@ def create_blueprint() -> Blueprint:
                 "views": int(getattr(v, "view_count", 0) or 0),
             })
         return jsonify({"results": results})
+
+    @bp.route("/api/chat/link-preview", methods=["GET"])
+    def chat_link_preview():
+        """Fetch OpenGraph and page metadata for an external link in chat."""
+        raw_url = str(request.args.get("url") or "").strip()
+        if not raw_url or len(raw_url) > 500:
+            return jsonify({"error": "Valid url parameter required"}), 400
+
+        meta = _fetch_link_preview(raw_url)
+        if not meta:
+            return jsonify({"error": "Preview unavailable"}), 404
+        return jsonify(meta)
 
     # ── Auto-DJ radio brain ────────────────────────────────────────────────
     # The old radio searched YouTube for the PLAYING TRACK'S OWN TITLE, so the
@@ -1245,7 +1845,7 @@ def create_blueprint() -> Blueprint:
         lastfm = None
         try:
             from core.lastfm_client import LastFMClient
-            from config.settings import config_manager as _cfg
+            from core.settings import config_manager as _cfg
             _key = _cfg.get("lastfm.api_key", "")
             if _key:
                 lastfm = LastFMClient(api_key=_key)
@@ -1359,21 +1959,85 @@ def create_blueprint() -> Blueprint:
         if not _can_send():
             return jsonify({"error": "Chat sending is admin-only on this server"}), 403
         msg = _clean_message(request.get_json(silent=True))
-        if not msg:
+        # An overlay share carries no text on purpose - the CARD is the message,
+        # the way a poll or a game move is - so this guard has to know about it or
+        # the feature can never send anything. A file share slips past because its
+        # url IS the text.
+        _shared_overlay = isinstance((request.get_json(silent=True) or {}).get("overlay"), dict)
+        if not msg and not _shared_overlay:
             return jsonify({"error": "empty message"}), 400
         # Room messages ride the SoulSync envelope (rich format; other clients
         # see line noise). PMs are NEVER encoded — they must stay readable to
         # non-SoulSync users (and the ProveIt bots need literal plaintext).
         from core import chat_codec
         body = request.get_json(silent=True) or {}
+
+        # PLAIN mode. Everything in this room was enveloped unconditionally, so
+        # anyone talking to a vanilla Soulseek user was talking to themselves —
+        # the room LOOKED shared and was not. `plain` sends the raw text so
+        # every Soulseek client can read it.
+        #
+        # Nothing rich can ride along: there is no envelope to carry a reply
+        # ref, a template, a channel tag or an avatar. Those are REFUSED rather
+        # than quietly dropped — silently sending a bare sentence when someone
+        # attached a template is the same class of lie this mode exists to fix.
+        if body.get("plain") is True:
+            for field, label in (("overlay", "an overlay template"), ("file", "a file"),
+                                 ("reply", "a reply"), ("edit", "an edit"),
+                                 ("np", "a Now Playing card"), ("want", "a Wanted card")):
+                if body.get(field):
+                    return jsonify({"error": "Plain text can't carry %s — every Soulseek "
+                                             "client has to be able to read it. Switch back "
+                                             "to SoulSync format to send that." % label}), 400
+            chan = str(body.get("chan") or "").strip().lower()
+            if chan and chan != "general":
+                return jsonify({"error": "Plain text always goes to the main room — a "
+                                         "channel tag needs the SoulSync envelope."}), 400
+            if body.get("thread"):
+                return jsonify({"error": "Plain text can't go in a thread — threads need "
+                                         "the SoulSync envelope."}), 400
+            room = _resolve_room(body.get("room"))
+            if room is None:
+                return jsonify({"error": "Not in that room"}), 404
+            try:
+                if not _ensure_joined(client, room):
+                    return jsonify({"error": "Could not join room '%s'" % room}), 502
+                ok = _run_async(client.send_room_message(room, _flatten_for_wire(msg)))
+            except Exception as e:
+                logger.exception("chat: plain room send failed")
+                return jsonify({"error": str(e)}), 502
+            if not ok:
+                return jsonify({"error": "slskd rejected the message"}), 502
+            return jsonify({"ok": True, "plain": True})
+
         extra = None
         rep = chat_codec.reply_of({"r": body.get("reply")})
         if rep:
             extra = {"r": rep}
+        # A shared overlay template. Validated by the SAME codec the receive
+        # path uses, so anything that leaves here is something a reader's card
+        # can render. Refused loudly rather than sent as a dud: a template that
+        # exceeds the wire limit would otherwise arrive truncated, which reads
+        # as a broken design rather than as a message that did not fit.
+        ovl = chat_codec.overlay_of({"o": body.get("overlay")})
+        if body.get("overlay") is not None and ovl is None:
+            return jsonify({"error": "That overlay template can't be shared "
+                                     "(it needs a name and at least one layer)."}), 400
+        if ovl:
+            extra = dict(extra or {})
+            extra["o"] = ovl
         fmeta = chat_codec.file_of({"f": body.get("file")})
         if fmeta:
             extra = dict(extra or {})
             extra["f"] = fmeta
+        npmeta = chat_codec.np_of({"np": body.get("np")})
+        if npmeta:
+            extra = dict(extra or {})
+            extra["np"] = npmeta
+        wantmeta = chat_codec.want_of({"want": body.get("want")})
+        if wantmeta:
+            extra = dict(extra or {})
+            extra["want"] = wantmeta
         # Virtual channel tag. Slug-validated here so a hostile client can't
         # stuff arbitrary text into the envelope; the default channel is left
         # untagged so old clients (and vanilla Soulseek) read it as #general.
@@ -1391,6 +2055,18 @@ def create_blueprint() -> Blueprint:
                 extra["av"] = _av
         except (TypeError, ValueError):
             pass
+        # User flair badge. Validated by the SAME codec the receive path
+        # uses, so anything that leaves here renders on every client.
+        # Refused loudly rather than silently dropped: a staff-impersonation
+        # word ("admin", "dev") failing quiet would leave the user thinking
+        # their badge was live.
+        _badge_raw = body.get("badge")
+        if _badge_raw:
+            _bd = chat_codec.badge_of({"bg": _badge_raw})
+            if _bd is None:
+                return jsonify({"error": 'That badge can\'t be used — keep it short, plain text, and nothing staff-like ("admin", "dev"…) or profane.'}), 400
+            extra = dict(extra or {})
+            extra["bg"] = _bd
         # Thread membership (parent message key + carried display name).
         thread = str(body.get("thread") or "").strip()[:160]
         if thread:
@@ -1399,8 +2075,24 @@ def create_blueprint() -> Blueprint:
             tname = str(body.get("thread_name") or "").strip()[:80]
             if tname:
                 extra["tn"] = tname
+        # Message edit: 'ed' targets one of the sender's OWN earlier messages
+        # by key; this envelope's text is the replacement. Author-match and
+        # the 2-edit cap are enforced by the client fold on every machine —
+        # the server only shape-checks (edit_of).
+        edit = chat_codec.edit_of({"ed": body.get("edit")})
+        if edit:
+            extra = dict(extra or {})
+            extra["ed"] = edit
         wrapped = chat_codec.encode(msg, extra)
         if wrapped is None:
+            # Name the half that did not fit. With a template attached the text
+            # is almost never the problem, and "message too long" sends someone
+            # to shorten a sentence that was already short.
+            if ovl:
+                layers = len((ovl.get("d") or {}).get("layers") or [])
+                return jsonify({"error": "That template is too big to send over chat "
+                                         "(%d layers). Export it to a file instead."
+                                         % layers}), 400
             return jsonify({"error": "message too long for Soulseek chat"}), 400
         room = _resolve_room(body.get("room"))
         if room is None:
@@ -1465,7 +2157,7 @@ def create_blueprint() -> Blueprint:
         if not msg:
             return jsonify({"error": "empty message"}), 400
         try:
-            ok = _run_async(client.send_private_message(username, msg))
+            ok = _run_async(client.send_private_message(username, _flatten_for_wire(msg)))
         except Exception as e:
             logger.exception("chat: PM send failed")
             return jsonify({"error": str(e)}), 502

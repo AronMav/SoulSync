@@ -143,7 +143,7 @@ def chat_app():
     state = {"client": client, "admin": True, "config": {}}
     chat_api.configure(
         client_getter=lambda: state["client"],
-        run_async=lambda v: v,
+        run_async=lambda v, timeout=None: v,
         config_get=lambda key, default=None: state["config"].get(key, default),
         config_set=lambda key, value: state["config"].__setitem__(key, value),
     )
@@ -155,7 +155,7 @@ def chat_app():
         g.is_admin = state["admin"]
     app.register_blueprint(chat_api.create_blueprint())
     yield app.test_client(), state
-    chat_api.configure(client_getter=lambda: None, run_async=lambda v: v,
+    chat_api.configure(client_getter=lambda: None, run_async=lambda v, timeout=None: v,
                        config_get=lambda k, d=None: d)
 
 
@@ -273,7 +273,7 @@ class TestChatSettings:
     def _wire_set(self, state):
         chat_api.configure(
             client_getter=lambda: state["client"],
-            run_async=lambda v: v,
+            run_async=lambda v, timeout=None: v,
             config_get=lambda key, default=None: state["config"].get(key, default),
             config_set=lambda key, value: state["config"].__setitem__(key, value),
         )
@@ -637,7 +637,7 @@ class TestBrowseAndGrab:
         client = _BrowsingClient()
         perms = {"admin": False, "can_download": False}
         chat_api.configure(
-            client_getter=lambda: client, run_async=lambda v: v,
+            client_getter=lambda: client, run_async=lambda v, timeout=None: v,
             config_get=lambda k, d=None: d)
         app = Flask(__name__)
 
@@ -657,3 +657,205 @@ class TestBrowseAndGrab:
     def test_download_requires_files(self, browse_app):
         http, state = browse_app
         assert http.post("/api/chat/user/pal/download", json={}).status_code == 400
+
+
+@pytest.mark.parametrize("connection", [
+    {"isConnected": False, "isLoggedIn": False, "state": "Disconnecting"},
+    {"isConnected": True, "isLoggedIn": False},
+    None,
+])
+def test_chat_connection_requires_network_login(connection):
+    client = _RecordingClient({("GET", "server/state"): connection})
+    state = _run(client.get_chat_connection_state())
+    assert state["connected"] is False
+    assert "slskd" in state["error"]
+
+
+@pytest.mark.parametrize("endpoint", ["server", "server/state"])
+def test_chat_connection_accepts_logged_in_server(endpoint):
+    client = _RecordingClient({("GET", endpoint): {"isConnected": True, "isLoggedIn": True}})
+    assert _run(client.get_chat_connection_state()) == {"connected": True}
+
+
+@pytest.mark.parametrize("endpoint", ["server", "server/state"])
+def test_chat_connection_reports_disconnected_per_endpoint(endpoint):
+    client = _RecordingClient({("GET", endpoint): {"isConnected": False, "isLoggedIn": False}})
+    state = _run(client.get_chat_connection_state())
+    assert state["connected"] is False
+    assert state["code"] == "slskd_disconnected"
+
+
+@pytest.mark.parametrize("path,payload", [
+    ("/api/chat/room/message", {"message": "draft"}),
+    ("/api/chat/conversations/peer", {"message": "draft"}),
+    ("/api/chat/room/protocol", {"p": {"k": "hello"}}),
+    ("/api/chat/room/react", {"message": "draft"}),
+])
+def test_disconnected_chat_never_submits_messages_or_carriers(chat_app, path, payload):
+    http, state = chat_app
+    client = state["client"]
+    client.get_chat_connection_state = lambda: {"connected": False, "code": "slskd_disconnected", "error": "Reconnect in slskd"}
+    response = http.post(path, json=payload)
+    assert response.status_code == 503
+    assert response.get_json()["code"] == "slskd_disconnected"
+    assert not client.sent_room and not client.sent_pm and not client.joined
+    assert http.get("/api/chat/status").get_json()["can_send"] is False
+
+
+def test_chat_recovers_on_next_poll_after_slskd_reconnects(chat_app):
+    http, state = chat_app
+    client = state["client"]
+    client.get_chat_connection_state = lambda: {"connected": False, "error": "Reconnect in slskd"}
+    assert http.get("/api/chat/room").status_code == 503
+    assert not client.joined
+    client.get_chat_connection_state = lambda: {"connected": True}
+    response = http.get("/api/chat/room")
+    assert response.status_code == 200
+    assert response.get_json()["can_send"] is True
+    assert not client.sent_room and not client.sent_pm  # never auto-resend drafts
+
+
+def test_link_preview_requires_url(chat_app):
+    http, _ = chat_app
+    assert http.get("/api/chat/link-preview").status_code == 400
+    assert http.get("/api/chat/link-preview?url=").status_code == 400
+
+
+def test_link_preview_blocks_unsafe_urls(chat_app):
+    http, _ = chat_app
+    # SSRF guard: localhost / private IPs fail safe
+    assert http.get("/api/chat/link-preview?url=http://localhost:8008").status_code == 404
+    assert http.get("/api/chat/link-preview?url=http://127.0.0.1:5000").status_code == 404
+    assert http.get("/api/chat/link-preview?url=http://192.168.1.1").status_code == 404
+
+
+def test_link_preview_returns_metadata(chat_app, monkeypatch):
+    http, _ = chat_app
+    fake_data = {
+        "ok": True,
+        "url": "https://example.com/song",
+        "title": "Song Title",
+        "description": "Song description",
+        "image": "https://example.com/cover.jpg",
+        "site_name": "Example",
+        "domain": "example.com",
+        "theme_color": "#1db954",
+    }
+    monkeypatch.setattr(chat_api, "_fetch_link_preview", lambda url: fake_data)
+    res = http.get("/api/chat/link-preview?url=https://example.com/song")
+    assert res.status_code == 200
+    assert res.get_json() == fake_data
+
+
+# ── link preview hardening ───────────────────────────────────────────────────
+# previews fire on their own for every link on screen, so whatever a stranger
+# posts in a soulseek room decides what every watching soulsync server fetches.
+
+class _FakeResp:
+    def __init__(self, status=200, headers=None, body="<html><head><title>t</title></head></html>"):
+        self.status_code = status
+        self.headers = {"content-type": "text/html; charset=utf-8",
+                        **{k.lower(): v for k, v in (headers or {}).items()}}
+        self.is_redirect = status in (301, 302, 303, 307, 308)
+        self._body = body
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=8192, decode_unicode=True):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+class _CaseInsensitive(dict):
+    def get(self, k, d=None):
+        return super().get(k.lower(), d)
+
+
+@pytest.fixture()
+def preview_net(monkeypatch):
+    """fake dns + fake http. every fetched url is recorded."""
+    import requests
+    chat_api._LINK_PREVIEW_CACHE.clear()
+    dns = {"public.example": ["93.184.216.34"], "evil.example": ["93.184.216.35"],
+           "sneaky.example": ["192.168.1.1"], "127.0.0.1.nip.io": ["127.0.0.1"]}
+    pages = {}
+    fetched = []
+
+    def resolve(host, port):
+        if host in dns:
+            return dns[host]
+        return [host]     # ip literals resolve to themselves
+
+    def get(url, **kw):
+        assert kw.get("allow_redirects") is False, "redirects must be walked by hand"
+        fetched.append(url)
+        r = pages.get(url) or _FakeResp()
+        r.headers = _CaseInsensitive(r.headers)
+        return r
+
+    monkeypatch.setattr(chat_api, "_resolve_host", resolve)
+    monkeypatch.setattr(requests, "get", get)
+    yield pages, fetched
+    chat_api._LINK_PREVIEW_CACHE.clear()
+
+
+def test_link_preview_does_not_follow_a_redirect_into_the_lan(preview_net):
+    pages, fetched = preview_net
+    pages["https://evil.example/r"] = _FakeResp(302, {"Location": "http://192.168.1.1/admin"})
+    assert chat_api._fetch_link_preview("https://evil.example/r") is None
+    assert fetched == ["https://evil.example/r"]
+
+
+def test_link_preview_still_follows_a_public_redirect(preview_net):
+    pages, fetched = preview_net
+    pages["https://evil.example/r"] = _FakeResp(301, {"Location": "https://public.example/page"})
+    data = chat_api._fetch_link_preview("https://evil.example/r")
+    assert data and data["title"] == "t"
+    assert fetched == ["https://evil.example/r", "https://public.example/page"]
+
+
+@pytest.mark.parametrize("url", [
+    "http://sneaky.example/",        # public-looking name, lan address
+    "http://127.0.0.1.nip.io/",      # wildcard dns to loopback
+    "http://[::ffff:127.0.0.1]/",    # ipv4-mapped loopback
+    "http://100.64.0.1/",            # carrier-grade nat, not public
+])
+def test_link_preview_checks_what_the_name_resolves_to(preview_net, url):
+    _, fetched = preview_net
+    assert chat_api._fetch_link_preview(url) is None
+    assert fetched == []
+
+
+def test_decimal_ip_form_is_caught_by_the_real_resolver():
+    """"http://2130706433/" is 127.0.0.1. getaddrinfo parses it locally, no dns."""
+    assert chat_api._is_safe_preview_url("http://2130706433/") is False
+
+
+@pytest.mark.parametrize("color,kept", [
+    ("#1db954", "#1db954"),
+    ("#fff", "#fff"),
+    ("red;position:fixed;inset:0", ""),
+    ("#000;background:url(x)", ""),
+])
+def test_theme_color_cannot_inject_css(preview_net, color, kept):
+    pages, _ = preview_net
+    pages["https://public.example/c"] = _FakeResp(
+        body=f'<html><head><title>t</title><meta name="theme-color" content="{color}"></head></html>')
+    assert chat_api._fetch_link_preview("https://public.example/c")["theme_color"] == kept
+
+
+@pytest.mark.parametrize("headers,frameable", [
+    ({}, True),
+    ({"X-Frame-Options": "DENY"}, False),
+    ({"X-Frame-Options": "SAMEORIGIN"}, False),
+    ({"Content-Security-Policy": "default-src 'self'; frame-ancestors 'self'"}, False),
+    ({"Content-Security-Policy": "frame-ancestors *"}, True),
+    ({"Content-Security-Policy": "default-src 'self'"}, True),
+])
+def test_preview_says_whether_the_page_can_be_framed(preview_net, headers, frameable):
+    pages, _ = preview_net
+    pages["https://public.example/f"] = _FakeResp(headers=headers)
+    assert chat_api._fetch_link_preview("https://public.example/f")["frameable"] is frameable

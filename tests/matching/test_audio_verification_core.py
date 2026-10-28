@@ -4,7 +4,9 @@ One place for normalization + the PASS/SKIP/FAIL decision used by BOTH import-ti
 verification and the library AcoustID scan, so the two paths can't drift apart.
 """
 
-from core.matching.audio_verification import normalize, evaluate, Decision
+import pytest
+
+from core.matching.audio_verification import normalize, similarity, evaluate, Decision
 
 
 def _rec(title, artist, duration=None):
@@ -65,6 +67,48 @@ def test_normalize_strips_paren_bracket_angle_and_keeps_cjk():
     assert normalize("Attack on Titan <TV Size>") == "attack on titan"
 
 
+@pytest.mark.parametrize("title,canonical", [
+    ("(Nice Dream)", "nice dream"),
+    ("[Rhubarb]", "rhubarb"),
+    ("[untitled]", "untitled"),
+    ("(Fork and Knife)", "fork and knife"),
+    ("(levitation)", "levitation"),
+    ("-", "-"),
+])
+def test_whole_title_is_not_erased_by_annotation_stripping(title, canonical):
+    assert normalize(title) == canonical
+    assert similarity(title, title) == 1.0
+
+
+def test_whole_title_matches_unwrapped_candidate():
+    assert similarity("(Nice Dream)", "Nice Dream") == 1.0
+    assert similarity("[Rhubarb]", "Rhubarb") == 1.0
+    assert normalize("[Rhubarb] - Remastered 2011") == "rhubarb"
+    assert similarity("[Rhubarb] - Remastered 2011", "Rhubarb") == 1.0
+    assert similarity("-", "&") == 0.0
+
+
+def test_whole_title_finding_passes_when_artist_and_title_match():
+    out = evaluate("(Nice Dream)", "Radiohead",
+                   [_rec("(Nice Dream)", "Radiohead")], fingerprint_score=0.979)
+    assert out.decision == Decision.PASS
+
+
+def test_whole_title_fix_does_not_accept_a_different_artist_or_song():
+    wrong_artist = evaluate("(Exchange)", "Massive Attack",
+                            [_rec("Exchange", "Zao")], fingerprint_score=1.0)
+    wrong_song = evaluate("&", "Pinegrove",
+                          [_rec("Need 2", "Pinegrove")], fingerprint_score=0.998)
+    assert wrong_artist.decision == Decision.FAIL
+    assert wrong_song.decision == Decision.FAIL
+
+
+def test_whole_title_fix_keeps_version_gate():
+    out = evaluate("[Rhubarb] - Instrumental", "Aphex Twin",
+                   [_rec("[Rhubarb]", "Aphex Twin")], fingerprint_score=0.99)
+    assert out.decision == Decision.FAIL
+
+
 def test_normalize_strips_version_and_featuring():
     assert normalize("In My Feelings - Instrumental") == "in my feelings"
     assert normalize("Song feat. Someone") == "song"
@@ -80,49 +124,4 @@ def test_empty_expected_artist_does_not_fail():
     # because the DB has no artist value.
     out = evaluate("Some Track", "", [_rec("Some Track", "Whoever")],
                    fingerprint_score=0.95)
-    assert out.decision == Decision.PASS
-
-
-# ---------------------------------------------------------------------------
-# Advisory labels — "(Explicit)"/"(Clean)" are lyrics-treatment labels on the
-# same recording, not version cuts. Live case (2026-09-16): Qobuz served
-# "Welcome 2 Detroit (Album Version (Explicit))" (full FLAC) but MusicBrainz'
-# recording is bare-titled -> the version gate quarantined the correct file
-# with "Version mismatch: expected (explicit) but file is (original)".
-# ---------------------------------------------------------------------------
-
-# Real AcoustID lookup for Trick Trick - Welcome 2 Detroit, fp 0.98.
-_W2D_RECORDINGS = [
-    _rec("Welcome 2 Detroit", "Trick-Trick feat. Eminem"),
-    _rec("Welcome 2 Detroit (instrumental)", "Trick-Trick"),
-    _rec("Welcome to Detroit City", "Eminem feat. Trick-Trick"),
-    _rec("Instrumental Track #1", "[unknown]"),
-    _rec("Welcome 2 Detroit (main)", "Trick-Trick featuring Eminem"),
-    _rec("6 Minutes", "Tricky"),
-    _rec("Welcome 2 Detroit (clean)", "Trick-Trick"),
-]
-
-
-def test_explicit_label_vs_bare_mb_title_passes():
-    # The reporter's exact file: expected carries "(Explicit)", the best
-    # AcoustID/MB recording is bare-titled. Same recording — PASS.
-    out = evaluate(
-        "Welcome 2 Detroit (Album Version (Explicit))", "Trick Trick",
-        _W2D_RECORDINGS, fingerprint_score=0.98,
-    )
-    assert out.decision == Decision.PASS
-
-
-def test_advisory_labeled_candidate_accepted():
-    # An "(Explicit)"-labeled recording is the same cut as the bare
-    # expected title — it must stay eligible in the version gate (and
-    # the result is a PASS, not a version quarantine).
-    out = evaluate(
-        "In My Feelings", "Drake",
-        [
-            _rec("Some Other Song", "Drake"),
-            _rec("In My Feelings (Explicit)", "Drake"),
-        ],
-        fingerprint_score=0.95,
-    )
     assert out.decision == Decision.PASS

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import threading
+import uuid
 import weakref
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +26,7 @@ __all__ = [
     "save_audio_file",
     "get_image_dimensions",
     "strip_all_non_audio_tags",
+    "strip_musicbrainz_identity_tags",
     "verify_metadata_written",
     "wipe_source_tags",
 ]
@@ -43,7 +46,7 @@ def get_logger():
 
 def get_config_manager():
     try:
-        from config.settings import config_manager as settings_config_manager
+        from core.settings import config_manager as settings_config_manager
 
         return settings_config_manager
     except Exception:
@@ -249,6 +252,29 @@ def _audio_intact(before: Any, after: Any) -> bool:
     return True
 
 
+def _is_tag_write_error(exc: Exception) -> bool:
+    """Whether the tagging library refused to encode these tags.
+
+    Distinct from "the atomic path could not run". mutagen raises its own error
+    type for a tag set it cannot write at all — an over-long FLAC block being
+    the one seen in the wild. Retrying that in place cannot help, so it must not
+    be treated as a fallback-worthy failure.
+
+    OSError is deliberately NOT included: a disk or permission problem is
+    exactly the case the in-place fallback exists for.
+    """
+    try:
+        import mutagen
+
+        if isinstance(exc, mutagen.MutagenError):
+            return True
+    except Exception as probe_err:  # noqa: BLE001 - mutagen missing cannot make this fatal
+        logger.debug("mutagen error-type probe failed: %s", probe_err)
+    # mutagen.flac.error subclasses IOError on some versions rather than
+    # MutagenError, so match the message it actually raises too.
+    return "too long to write" in str(exc).lower()
+
+
 def save_audio_file(audio_file: Any, symbols: Any) -> bool:
     """Persist mutagen tag changes ATOMICALLY and only if the audio survives it
     (#819 + #1000). Returns True if the file was written, False if the write was
@@ -280,7 +306,12 @@ def save_audio_file(audio_file: Any, symbols: Any) -> bool:
         _raw_audio_save(audio_file, symbols)
         return True
 
-    tmp = f"{path}.sstmp"
+    # dd28-31: a FIXED temp name is only safe if writers to one file are
+    # serialized, and they are not — a bulk-fix thread and a scan's own
+    # auto-fix can reach the same file at the same time. The loser then fell
+    # into the generic except branch and dropped back to the non-atomic
+    # in-place save this whole function exists to replace.
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.sstmp"
     try:
         shutil.copy2(path, tmp)               # snapshot original (audio + tags)
         _raw_audio_save(audio_file, symbols, target=tmp)  # write new tags into the copy
@@ -317,14 +348,30 @@ def save_audio_file(audio_file: Any, symbols: Any) -> bool:
                      "untouched, tags NOT written", os.path.basename(path), bad)
         return False
     except Exception as atomic_err:
-        # Atomic path couldn't run (copy/format/replace error). Fall back to the
-        # plain in-place save so any edge the atomic path can't handle behaves
-        # exactly as before #819.
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except OSError:
             pass
+
+        # Split by WHY it failed, because the two need opposite handling.
+        #
+        # A tagging-library error means the write itself is invalid — the tags
+        # cannot be encoded at all, most often a FLAC picture block over the
+        # 16MB a 24-bit length can express. Retrying that in place runs the same
+        # doomed write against the user's real file: it fails identically, logs
+        # a second traceback, and on a writer that fails part-way it would be
+        # writing to the original instead of a copy. That is the same reasoning
+        # the integrity-check branch above already applies.
+        if _is_tag_write_error(atomic_err):
+            logger.error("[Atomic Save] tags could not be encoded for %s (%s) — original "
+                         "left untouched, tags NOT written",
+                         os.path.basename(path), atomic_err)
+            return False
+
+        # Anything else (copy, permission, replace, unsupported edge) means the
+        # atomic path couldn't RUN. Fall back to the plain in-place save so
+        # those behave exactly as before #819.
         logger.warning("[Atomic Save] atomic path failed (%s) — in-place fallback for %s",
                        atomic_err, os.path.basename(path))
         _raw_audio_save(audio_file, symbols)
@@ -444,4 +491,146 @@ def wipe_source_tags(file_path: str) -> bool:
         return True
     except Exception as exc:
         logger.error("[Tag Wipe] Failed (non-fatal): %s", exc)
+        return False
+
+
+# MusicBrainz ALBUM-identity tags: the fields a media server keys an album on
+# (navidrome groups by album + album artist + musicbrainz release id). Only
+# these are surgical-stripped by strip_musicbrainz_identity_tags below — every
+# per-track tag (title, artist, track number, recording id, ...) is left
+# exactly as it was.
+_MB_ALBUM_IDENTITY_TAGS = (
+    "MUSICBRAINZ_RELEASE_ID",
+    "MUSICBRAINZ_RELEASEGROUPID",
+    "MUSICBRAINZ_ALBUMARTISTID",
+)
+
+# Extra spellings foreign taggers use for the same identity ids, matched
+# case-insensitively alongside the canonical tag-map keys.
+_MB_ALBUM_IDENTITY_EXTRA_KEYS = (
+    # Vorbis/APE variants seen in the wild
+    "MUSICBRAINZ_ALBUMID",
+    "MUSICBRAINZ_RELEASEID",
+    "MUSICBRAINZ_RELEASEGROUPID",
+    "MUSICBRAINZ_ALBUMARTISTID",
+)
+
+
+def _norm_mb_key(key: str) -> str:
+    """Normalize a MusicBrainz tag key/description for comparison: case-,
+    whitespace- and underscore-insensitive ("MusicBrainz Album Id" ==
+    "MUSICBRAINZ_ALBUMID" == "musicbrainz releaseid")."""
+    return re.sub(r"[\s_]+", "", key).casefold()
+
+
+def _strip_apev2_identity_tags(tags) -> int:
+    """Delete album-identity keys from an APEv2 tag object (WavPack, Musepack,
+    Monkey's Audio). mutagen's APEv2 deletion is case-insensitive but
+    whitespace/underscore-sensitive, so iterate the stored keys and match
+    with _norm_mb_key rather than deleting by a differently-spelled key.
+    Returns the number of keys removed."""
+    removed = 0
+    wanted = {_norm_mb_key(k) for k in _MB_ALBUM_IDENTITY_EXTRA_KEYS}
+    for stored_key in list(tags.keys()):
+        if _norm_mb_key(stored_key) in wanted:
+            del tags[stored_key]
+            removed += 1
+    return removed
+
+
+def strip_musicbrainz_identity_tags(file_path: str) -> bool:
+    """Remove only the MusicBrainz ALBUM-identity tags from a file, leaving
+    every other tag untouched.
+
+    #1555: when metadata enhancement throws on a clean/matched import, the
+    # #804 protection preserves the file's existing tags wholesale — which
+    # keeps the Soulseek uploader's FOREIGN MusicBrainz release id on this
+    # one track while its siblings get SoulSync's pinned release id. The
+    # media server then shows the album as two identical-looking duplicate
+    # entries (one per release id). Stripping just the identity ids closes
+    # the split vector without losing the preserved tags #804 protects.
+
+    Returns True when the file is clean (or needed no work). Returns False
+    when the strip could not be completed — including when the atomic save
+    aborted on an audio-integrity check, in which case the original file is
+    untouched. Non-fatal either way: callers must never hold up the pipeline
+    for tag surgery.
+    """
+    try:
+        from core.metadata.source import ID3_TAG_MAP, VORBIS_TAG_MAP, MP4_TAG_MAP
+        symbols = get_mutagen_symbols()
+        if not symbols:
+            return False
+
+        audio = symbols.File(file_path)
+        if audio is None:
+            return False
+
+        stripped = 0
+        tags = getattr(audio, "tags", None)
+        if isinstance(tags, symbols.ID3):
+            # Match TXXX descriptions with the same normalization as the
+            # APEv2 branch: foreign taggers don't use Picard's exact
+            # description spelling ("MUSICBRAINZ_RELEASEID", trailing
+            # spaces, odd casing all occur in the wild on MP3s).
+            wanted_descs = set()
+            for key in _MB_ALBUM_IDENTITY_TAGS:
+                _frame, desc = ID3_TAG_MAP.get(key, ("TXXX", key))
+                wanted_descs.add(_norm_mb_key(str(desc)))
+            # Foreign taggers also write key-style spellings as TXXX
+            # descriptions ("MUSICBRAINZ_RELEASEID"), which normalize
+            # differently from Picard's worded descriptions.
+            wanted_descs.update(_norm_mb_key(k) for k in _MB_ALBUM_IDENTITY_EXTRA_KEYS)
+            for txxx_key in list(tags.keys()):
+                if not txxx_key.startswith("TXXX:"):
+                    continue
+                if _norm_mb_key(txxx_key[5:]) in wanted_descs:
+                    hits = tags.getall(txxx_key)
+                    tags.delall(txxx_key)
+                    stripped += len(hits)
+        elif isinstance(tags, symbols.APEv2):
+            # WavPack / Musepack / Monkey's Audio: the Soulseek lossless set.
+            stripped += _strip_apev2_identity_tags(tags)
+        elif is_vorbis_like(audio, symbols):
+            candidates = []
+            for key in _MB_ALBUM_IDENTITY_TAGS:
+                candidates.append(VORBIS_TAG_MAP.get(key, key))
+            candidates.extend(_MB_ALBUM_IDENTITY_EXTRA_KEYS)
+            for candidate in dict.fromkeys(candidates):
+                if candidate in audio:
+                    stripped += len(audio[candidate])
+                    del audio[candidate]
+        elif isinstance(audio, symbols.MP4):
+            for key in _MB_ALBUM_IDENTITY_TAGS:
+                mp4_key = "----:com.apple.iTunes:" + MP4_TAG_MAP.get(key, key)
+                if mp4_key in audio:
+                    stripped += len(audio[mp4_key])
+                    del audio[mp4_key]
+        else:
+            # Unknown container: nothing we know how to strip — not an error,
+            # but say so out loud so a future split on an exotic container
+            # isn't a mystery.
+            logger.info(
+                "[MB Identity] No strip handler for container %s: %s",
+                type(audio).__name__, os.path.basename(file_path),
+            )
+            return True
+
+        if stripped:
+            if save_audio_file(audio, symbols):
+                logger.info(
+                    "[MB Identity] Stripped %s MusicBrainz album-identity tag(s) from: %s",
+                    stripped, os.path.basename(file_path),
+                )
+            else:
+                # Integrity abort: the original file was left untouched, so
+                # the foreign ids are still there — report honestly.
+                logger.warning(
+                    "[MB Identity] Tag write aborted (audio integrity), "
+                    "file left untouched: %s", os.path.basename(file_path),
+                )
+                return False
+        return True
+    except Exception as exc:
+        logger.error("[MB Identity] Failed (non-fatal): %s", exc)
         return False

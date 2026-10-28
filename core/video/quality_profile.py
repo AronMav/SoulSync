@@ -17,6 +17,8 @@ The model (rich-curated — Radarr-competitive without a full custom-formats eng
   - preferences (SOFT — they score/tie-break, they never reject on their own):
       ``prefer_codec`` (any|hevc|av1), ``prefer_hdr`` (off|prefer|require),
       ``prefer_audio`` (any|surround|lossless|atmos), ``prefer_repack`` (bool).
+  - ``audio_language_mode`` (off|prefer|require) + ``audio_languages`` : dubbed /
+                        MULTI releases. require is a real filter, prefer ranks.
   - ``min_size_gb`` / ``max_size_gb`` : size guard per item (0 = no limit).
 
 Pure data + normalize/validate here (no DB, no network) so it's unit-tested in
@@ -31,18 +33,29 @@ from typing import Any
 
 # The quality ladder, ordered best→worst. ``key`` = ``<source>-<resolution>`` (plus
 # the two resolution-less SD tiers). This is the default ranking the UI renders.
+#
+# The ladder MUST cover everything ``quality_eval.tier_key`` can name, or those
+# releases are unreachable — no toggle can accept them. That was a real hole:
+# WEBRip existed only at 1080p, so every 720p WEBRip (one of the commonest TV
+# release shapes) was rejected as "isn't in your enabled tiers" no matter how the
+# profile was configured. ``test_quality_tier_keyspace`` now pins the two sets
+# together, so adding a source or a resolution to the parser fails loudly here.
 TIERS = (
-    "remux-2160p", "bluray-2160p", "web-2160p",
+    "remux-2160p", "bluray-2160p", "web-2160p", "webrip-2160p", "hdtv-2160p",
     "remux-1080p", "bluray-1080p", "web-1080p", "webrip-1080p", "hdtv-1080p",
-    "bluray-720p", "web-720p", "hdtv-720p",
+    "bluray-720p", "web-720p", "webrip-720p", "hdtv-720p",
     "dvd", "sdtv",
 )
 
 # Default-enabled tiers: solid 1080p + 720p coverage. 4K tiers off (size) and the
 # SD tiers (dvd/sdtv) off — users opt into those deliberately.
+#
+# ``webrip-720p`` is ON by default like its 1080p sibling: it is a mainstream TV
+# quality, and it only became togglable when the ladder gained it, so leaving it
+# off would silently preserve the bug it was added to fix.
 _DEFAULT_ON = frozenset({
     "remux-1080p", "bluray-1080p", "web-1080p", "webrip-1080p", "hdtv-1080p",
-    "bluray-720p", "web-720p", "hdtv-720p",
+    "bluray-720p", "web-720p", "webrip-720p", "hdtv-720p",
 })
 
 # Hard rejects (never grabbed). x264 is offered but OFF by default (rejecting it
@@ -52,7 +65,14 @@ REJECTS = ("cam", "screener", "workprint", "3d", "x264")
 CODECS = ("any", "hevc", "av1")              # SOFT codec preference (tie-breaker)
 HDR_MODES = ("off", "prefer", "require")     # require = HDR-only (a real filter)
 AUDIO_MODES = ("any", "surround", "lossless", "atmos")
+# audio language (dubbed / MULTI). off = don't look, prefer = rank releases
+# tagged with one of the languages (or MULTI) first, require = skip the rest.
+# a release with no tag is the original audio, so require skips it.
+LANGUAGE_MODES = ("off", "prefer", "require")
+AUDIO_LANGUAGES = ("fr", "de", "it", "es", "pt", "ja", "ko", "zh", "ru", "pl", "nl",
+                   "sv", "da", "no", "fi", "hi", "tr", "cs", "hu", "ar", "uk", "en")
 MAX_SIZE_CAP_GB = 200                        # slider ceiling; 0 means "no limit"
+MAX_MIN_SEEDERS = 100                        # slider ceiling; 0 means "no floor"
 
 # The cutoff is a LOOSE resolution target (Radarr-style "upgrade until"): once the
 # library holds an item at this resolution or better, stop chasing upgrades. ""
@@ -75,10 +95,19 @@ def default_profile() -> dict:
         "prefer_hdr": "prefer",
         "prefer_audio": "any",
         "prefer_repack": True,
+        "audio_language_mode": "off",
+        "audio_languages": [],
         "max_movie_gb": 0,      # per-item size guard, split by runtime (0 = no limit)
         "max_episode_gb": 0,
         "format_scores": {},    # custom-format score overrides (P3): {format_id: score}
         "min_format_score": 0,  # hard floor on the summed format score (0 = off)
+        # Torrent health floor, the *arr apps' "minimum seeders". A swarm with no
+        # seeders cannot finish: the client parks on 'downloading metadata' or
+        # stalls at 0% forever. Grabbing them anyway is how a client fills up with
+        # dead torrents while the wishlist row reports a fruitless search. Applies
+        # ONLY where a seeder count exists (torrents) — usenet and Soulseek have no
+        # such thing and are never gated. 0 = no floor.
+        "min_seeders": 1,
     }
 
 
@@ -141,6 +170,12 @@ def normalize(raw: Any) -> dict:
     if raw.get("prefer_audio") in AUDIO_MODES:
         d["prefer_audio"] = raw["prefer_audio"]
     d["prefer_repack"] = bool(raw.get("prefer_repack", d["prefer_repack"]))
+    if raw.get("audio_language_mode") in LANGUAGE_MODES:
+        d["audio_language_mode"] = raw["audio_language_mode"]
+    al = raw.get("audio_languages")
+    if isinstance(al, list):
+        chosen = {str(x or "").strip().lower() for x in al}
+        d["audio_languages"] = [c for c in AUDIO_LANGUAGES if c in chosen]
 
     d["max_movie_gb"] = _clamp_size(raw.get("max_movie_gb"))
     d["max_episode_gb"] = _clamp_size(raw.get("max_episode_gb"))
@@ -157,6 +192,10 @@ def normalize(raw: Any) -> dict:
                 continue
         d["format_scores"] = clean
     d["min_format_score"] = max(-1000, min(1000, _coerce_int(raw.get("min_format_score"), 0)))
+    # Absent from a stored profile → the default floor of 1, so installs written
+    # before the gate existed gain it on the next read rather than keeping the
+    # old grab-anything behaviour. An explicit 0 is honoured as "no floor".
+    d["min_seeders"] = min(MAX_MIN_SEEDERS, max(0, _coerce_int(raw.get("min_seeders"), d["min_seeders"])))
     return d
 
 
@@ -260,7 +299,7 @@ def load_for_item(db, item: Any) -> dict:
 
 __all__ = [
     "TIERS", "REJECTS", "CODECS", "HDR_MODES", "AUDIO_MODES", "RESOLUTIONS",
-    "MAX_SIZE_CAP_GB", "DEFAULT_PROFILE_ID", "default_profile", "normalize",
+    "MAX_SIZE_CAP_GB", "MAX_MIN_SEEDERS", "DEFAULT_PROFILE_ID", "default_profile", "normalize",
     "normalize_tiers", "load", "save", "list_profiles", "profile_by_id",
     "save_named", "delete_named", "load_for_item",
 ]

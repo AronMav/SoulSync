@@ -6,8 +6,9 @@ import time
 import threading
 from functools import wraps
 from dataclasses import dataclass
+from core.http_error_status import http_error_status
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
 from core.metadata.artist_album_cache import get_cached_artist_album_items, store_artist_album_items
 from core.metadata.cache import get_metadata_cache
 
@@ -88,10 +89,27 @@ _last_api_call_time = 0
 _api_call_lock = threading.Lock()
 MIN_API_INTERVAL = 0.35  # Default: 350ms between API calls (~171/min, under Spotify's ~180/min limit)
 
+
+def _request_scoped_free_opt_in() -> bool:
+    """Whether THIS Flask request explicitly asked for Spotify.
+
+    Interactive endpoints that were explicitly pointed at Spotify (search with
+    the Spotify chip, artist detail navigated from a Spotify card, album-tracks
+    with source=spotify) set ``g._spotify_free_ok`` — clicking Spotify is
+    asking for Spotify, so the no-auth source may serve when the official API
+    can't, even without the persistent 'Spotify (no auth)' metadata-source
+    opt-in. Outside a request context (enrichment, watchlist, any background
+    thread) this is always False, so auto-scraping stays opt-in."""
+    try:
+        from flask import g, has_request_context
+        return bool(has_request_context() and getattr(g, '_spotify_free_ok', False))
+    except Exception:
+        return False
+
 def _get_min_api_interval():
     """Get configurable API interval from settings, falling back to default."""
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         val = config_manager.get('spotify.min_api_interval', None)
         if val is not None:
             return max(0.1, float(val))  # Floor at 100ms to prevent abuse
@@ -294,11 +312,12 @@ def _detect_and_set_rate_limit(exception, endpoint_name="unknown"):
     """Check if a Spotify exception is a 429 rate limit and activate global ban if so.
     Returns True if rate limit was detected."""
     error_str = str(exception)
-    # Check both string matching and http_status attribute (SpotifyException has it)
-    is_429 = getattr(exception, 'http_status', None) == 429
-    is_rate_limit_str = "429" in error_str or "rate limit" in error_str.lower()
+    # SpotifyException exposes the HTTP status; use text only for statusless errors.
+    status = http_error_status(exception)
+    is_rate_limit = (status == 429 if status is not None
+                     else "429" in error_str or "rate limit" in error_str.lower())
 
-    if is_429 or is_rate_limit_str:
+    if is_rate_limit:
         # Try to extract Retry-After from exception headers
         retry_after = None
         has_real_header = False
@@ -344,6 +363,15 @@ def _detect_and_set_rate_limit(exception, endpoint_name="unknown"):
     return False
 
 
+def _is_premium_required_error(exception) -> bool:
+    """Spotify 403 returned when the app owner has no active Premium subscription."""
+    msg = str(exception).lower()
+    return (
+        getattr(exception, 'http_status', None) == 403
+        and "active premium subscription required" in msg
+    )
+
+
 def rate_limited(func):
     """Decorator to enforce rate limiting on Spotify API calls with retry and exponential backoff"""
     @wraps(func)
@@ -384,8 +412,11 @@ def rate_limited(func):
                 raise  # Don't retry our own ban errors
             except Exception as e:
                 error_str = str(e).lower()
-                is_rate_limit = "rate limit" in error_str or "429" in str(e)
-                is_server_error = "502" in str(e) or "503" in str(e)
+                status = http_error_status(e)
+                is_rate_limit = (status == 429 if status is not None
+                                 else "rate limit" in error_str or "429" in error_str)
+                is_server_error = (status in (502, 503) if status is not None
+                                   else "502" in error_str or "503" in error_str)
 
                 if is_rate_limit:
                     # Try to extract Retry-After from spotipy exception headers
@@ -444,6 +475,10 @@ class Track:
     release_date: Optional[str] = None
     album_type: Optional[str] = None
     total_tracks: Optional[int] = None
+    explicit: Optional[bool] = None
+    # the mirrored playlist's own id when ``id`` is what discovery matched
+    # instead. saved manual matches are filed under it (#1289)
+    source_track_id: Optional[str] = None
 
     @classmethod
     def from_spotify_track(cls, track_data: Dict[str, Any]) -> 'Track':
@@ -466,7 +501,8 @@ class Track:
             image_url=album_image_url,
             release_date=track_data.get('album', {}).get('release_date'),
             album_type=track_data.get('album', {}).get('album_type'),
-            total_tracks=track_data.get('album', {}).get('total_tracks')
+            total_tracks=track_data.get('album', {}).get('total_tracks'),
+            explicit=track_data.get('explicit'),
         )
 
 @dataclass
@@ -672,12 +708,21 @@ class SpotifyClient:
         return spotify_free_installed()
 
     def _free_wanted(self) -> bool:
-        """Does the user actually want the free source? OPT-IN: only when they
-        picked 'Spotify Free'. This keeps free from auto-scraping for anyone who
-        didn't choose it — a plain-'Spotify' user just waits out a rate-limit ban
-        as before. A user on 'Spotify Free' who also connects an account uses the
-        official account normally and free only bridges their bans."""
-        return self._free_selected()
+        """Does the user actually want the free source? OPT-IN, two ways:
+
+        - they picked 'Spotify Free' as their metadata source (persistent), or
+        - THIS request explicitly targeted Spotify (the interactive endpoints —
+          search with the Spotify chip, artist detail navigated from a Spotify
+          card, album-tracks with source=spotify — mark the Flask request via
+          ``g._spotify_free_ok``). Clicking Spotify IS asking for Spotify; the
+          alternative was silently serving iTunes under a Spotify label.
+
+        Background work (enrichment, watchlist scans) runs outside a request
+        context, so the per-request path can never engage there — auto-scraping
+        stays opt-in exactly as before. Authed + healthy users are also
+        unaffected either way: the official path always wins while it works
+        (see _free_active)."""
+        return self._free_selected() or _request_scoped_free_opt_in()
 
     def _free_available(self) -> bool:
         """Free CAN serve: package installed AND the user wants Spotify."""
@@ -1268,6 +1313,54 @@ class SpotifyClient:
             return {"success": False, "error": msg}
 
     @rate_limited
+    def remove_playlist_tracks(self, playlist_id: str, track_ids: List[str]) -> Dict[str, Any]:
+        """Remove specific tracks from a Spotify playlist by track IDs or URIs.
+
+        Requires playlist-modify-public or playlist-modify-private scope and ownership
+        or collaborative access to the playlist.
+        Returns {success, removed_count, error}.
+        """
+        if not self.is_spotify_authenticated():
+            return {"success": False, "removed_count": 0, "error": "Spotify is not connected"}
+        if not playlist_id:
+            return {"success": False, "removed_count": 0, "error": "No playlist ID provided"}
+
+        uris = []
+        for t in (track_ids or []):
+            if not t:
+                continue
+            t_str = str(t).strip()
+            if not t_str:
+                continue
+            if t_str.startswith("spotify:track:"):
+                uris.append(t_str)
+            else:
+                uris.append(f"spotify:track:{t_str}")
+
+        if not uris:
+            return {"success": True, "removed_count": 0}
+
+        try:
+            removed = 0
+            for i in range(0, len(uris), 100):
+                batch = uris[i:i + 100]
+                self.sp.playlist_remove_all_occurrences_of_items(playlist_id, batch)
+                removed += len(batch)
+            logger.info(f"Removed {removed} tracks from Spotify playlist {playlist_id}")
+            return {"success": True, "removed_count": removed}
+        except Exception as e:
+            msg = str(e)
+            logger.warning(f"Error removing tracks from Spotify playlist {playlist_id}: {msg}")
+            if "403" in msg:
+                return {
+                    "success": False,
+                    "removed_count": 0,
+                    "error": "Spotify playlist cannot be modified. Make sure the playlist is Collaborative or owned by your connected Spotify account."
+                }
+            _detect_and_set_rate_limit(e, "remove_playlist_tracks")
+            return {"success": False, "removed_count": 0, "error": msg}
+
+    @rate_limited
     def get_saved_tracks_count(self) -> int:
         """Get the total count of user's saved/liked songs without fetching all tracks"""
         if not self.is_spotify_authenticated():
@@ -1437,7 +1530,10 @@ class SpotifyClient:
             raise
 
     @rate_limited
-    def _get_playlist_tracks(self, playlist_id: str) -> List[Track]:
+    def _get_playlist_tracks(self, playlist_id: str, raise_errors: bool = False) -> List[Track]:
+        """All tracks of a playlist. A failed fetch returns [] unless
+        ``raise_errors``, so callers that would store the result as the
+        playlist's contents can tell a failure from an empty playlist."""
         if not self.is_spotify_authenticated():
             return []
 
@@ -1470,6 +1566,8 @@ class SpotifyClient:
             return tracks
 
         except Exception as e:
+            if raise_errors:
+                raise
             logger.error(f"Error fetching playlist tracks: {e}")
             return []
     
@@ -1478,20 +1576,35 @@ class SpotifyClient:
         if not self.is_spotify_authenticated():
             return None
 
+        clean_id = re.sub(r'_req_[a-f0-9]+$', '', str(playlist_id or ''))
+
         # "Liked Songs" is virtual — no playlist URI exists for it, so the
         # playlist endpoint 400s ("Unsupported URL / URI"). Serve it from the
         # saved-tracks endpoint instead, so mirrored playlists / anything that
         # re-resolves by stored id can refresh it like a normal playlist.
-        if playlist_id in (LIKED_SONGS_PLAYLIST_ID, 'liked-songs'):
+        if (
+            clean_id in (LIKED_SONGS_PLAYLIST_ID, 'liked-songs')
+            or clean_id.startswith(f"{LIKED_SONGS_PLAYLIST_ID}")
+            or clean_id.startswith("liked-songs")
+        ):
             return self._liked_songs_as_playlist()
 
         try:
-            playlist_data = self.sp.playlist(playlist_id)
-            tracks = self._get_playlist_tracks(playlist_id)
+            playlist_data = self.sp.playlist(clean_id)
+            # A failed track fetch must not come back as an empty playlist: a
+            # mirror refresh would store it, deleting every track it had.
+            tracks = self._get_playlist_tracks(clean_id, raise_errors=True)
             return Playlist.from_spotify_playlist(playlist_data, tracks)
 
         except Exception as e:
-            logger.error(f"Error fetching playlist {playlist_id}: {e}")
+            if http_error_status(e) == 403:
+                logger.error(
+                    f"Spotify refused the tracks of playlist {playlist_id} (403). Spotify only "
+                    f"serves the items of playlists you own or collaborate on, so a playlist "
+                    f"you follow can't be read. Copy it into a playlist of your own instead."
+                )
+            else:
+                logger.error(f"Error fetching playlist {playlist_id}: {e}")
             return None
 
     def _liked_songs_as_playlist(self) -> Optional[Playlist]:
@@ -1645,8 +1758,9 @@ class SpotifyClient:
         # Free should serve (no-auth / rate-limited / budget / worker prefer-free) OR
         # when it's simply available (opted-in) and official above returned nothing —
         # so an authed-but-broken official Spotify falls back to Free instead of empty.
-        if allow_fallback and (self._free_active() or self._free_available()
-                               or (prefer_free and self._free_installed())):
+        # not allow_fallback-gated: free IS Spotify (see get_track_details)
+        if (self._free_active() or self._free_available()
+                or (prefer_free and self._free_installed())):
             try:
                 objs = [Track.from_spotify_track(t)
                         for t in self._free_meta.search_tracks(query, effective_limit)]
@@ -1728,8 +1842,9 @@ class SpotifyClient:
         # No-creds Spotify (SpotipyFree): keep Spotify catalog/matching when official
         # can't serve (no auth / rate-limited / worker prefer-free) OR when it's opted-in
         # and official above returned nothing — before the iTunes/Deezer fallback.
-        if allow_fallback and (self._free_active() or self._free_available()
-                               or (prefer_free and self._free_installed())):
+        # not allow_fallback-gated: free IS Spotify (see get_track_details)
+        if (self._free_active() or self._free_available()
+                or (prefer_free and self._free_installed())):
             try:
                 objs = [Artist.from_spotify_artist(a)
                         for a in self._free_meta.search_artists(query, limit)]
@@ -1814,8 +1929,9 @@ class SpotifyClient:
         # opted-in and official above returned nothing — before the iTunes/Deezer fallback.
         # Albums have no name-search upstream, so resolve via the artist's discography —
         # needs artist + album names.
-        if allow_fallback and (self._free_active() or self._free_available()
-                               or (prefer_free and self._free_installed())) and artist and album:
+        # not allow_fallback-gated: free IS Spotify (see get_track_details)
+        if (self._free_active() or self._free_available()
+                or (prefer_free and self._free_installed())) and artist and album:
             try:
                 objs = [Album.from_spotify_album(a)
                         for a in self._free_meta.search_albums_via_artist(artist, album, min(limit, 10))]
@@ -1870,8 +1986,13 @@ class SpotifyClient:
                 # Fall through to iTunes fallback
 
         # No-creds Spotify (SpotipyFree) for a real Spotify track id when
-        # official Spotify is unavailable (no auth / rate-limited).
-        if allow_fallback and self._free_active() and not self._is_itunes_id(track_id):
+        # official Spotify is unavailable (no auth / rate-limited). NOT gated on
+        # allow_fallback: free IS Spotify (same catalog, same ids), while
+        # allow_fallback governs switching to OTHER sources. Exact-source
+        # callers (album_tracks' source chain passes allow_fallback=False) used
+        # to get None here, fall through to another catalog with this Spotify
+        # id, and serve a random colliding release's tracklist.
+        if self._free_active() and not self._is_itunes_id(track_id):
             free = self._free_meta.get_track_details(track_id)
             if free:
                 return free
@@ -1969,7 +2090,7 @@ class SpotifyClient:
 
         # No-creds Spotify (SpotipyFree) for a real Spotify album id when
         # official Spotify is unavailable (no auth / rate-limited).
-        if allow_fallback and self._free_active() and not self._is_itunes_id(album_id):
+        if self._free_active() and not self._is_itunes_id(album_id):  # not allow_fallback-gated: free IS Spotify (see get_track_details)
             free = self._free_meta.get_album(album_id)
             if free:
                 return free
@@ -2053,7 +2174,7 @@ class SpotifyClient:
 
         # No-creds Spotify (SpotipyFree) for a real Spotify album id when
         # official Spotify is unavailable (no auth / rate-limited).
-        if allow_fallback and self._free_active() and not self._is_itunes_id(album_id):
+        if self._free_active() and not self._is_itunes_id(album_id):  # not allow_fallback-gated: free IS Spotify (see get_track_details)
             free = self._free_meta.get_album_tracks(album_id)
             if free:
                 return free
@@ -2171,7 +2292,7 @@ class SpotifyClient:
         # No-creds Spotify (SpotipyFree) for a real Spotify artist id when
         # official Spotify is unavailable (no auth / rate-limited). The free
         # discography is already album-shaped — project to Album dataclasses.
-        if allow_fallback and self._free_active() and not self._is_itunes_id(artist_id):
+        if self._free_active() and not self._is_itunes_id(artist_id):  # not allow_fallback-gated: free IS Spotify (see get_track_details)
             try:
                 free = [Album.from_spotify_album(a)
                         for a in self._free_meta.get_artist_albums_list(artist_id, limit)]
@@ -2231,15 +2352,22 @@ class SpotifyClient:
                 return result
             except Exception as e:
                 _detect_and_set_rate_limit(e, 'get_artist')
-                logger.error(f"Error fetching artist via Spotify: {e}")
-                # Fall through to iTunes fallback
+                if _is_premium_required_error(e):
+                    logger.debug("Spotify official artist lookup requires Premium; trying free metadata for %s", artist_id)
+                else:
+                    logger.error(f"Error fetching artist via Spotify: {e}")
+                # Fall through to Spotify Free / configured fallback
 
         # No-creds Spotify (SpotipyFree) for a real Spotify artist id when
-        # official Spotify is unavailable (no auth / rate-limited).
-        if allow_fallback and self._free_active() and not self._is_itunes_id(artist_id):
-            free = self._free_meta.get_artist(artist_id)
-            if free:
-                return free
+        # official Spotify is unavailable (no auth / rate-limited / Premium gate)
+        # or when Free is explicitly configured and official returned nothing.
+        if not self._is_itunes_id(artist_id) and (self._free_active() or self._free_available()):
+            try:
+                free = self._free_meta.get_artist(artist_id)
+                if free:
+                    return free
+            except Exception as e:
+                logger.debug("SpotipyFree get_artist(%s) failed: %s", artist_id, e)
 
         # Fallback - only if ID is numeric (non-Spotify format)
         if allow_fallback and self._is_itunes_id(artist_id):

@@ -64,7 +64,7 @@ def test_config_off_means_literal(tmp_path, monkeypatch):
 
 
 def test_config_toggle_flips_the_default():
-    from config.settings import config_manager
+    from core.settings import config_manager
     original = config_manager.get('file_organization.artistletter_symbol_fallback', None)
     try:
         config_manager.set('file_organization.artistletter_symbol_fallback', True)
@@ -81,9 +81,16 @@ def test_config_toggle_flips_the_default():
 def test_all_call_sites_use_the_shared_helper():
     paths_src = (_ROOT / 'core' / 'imports' / 'paths.py').read_text(encoding='utf-8')
     ws_src = (_ROOT / 'web_server.py').read_text(encoding='utf-8')
-    assert paths_src.count('artist_letter(clean_context.get("artist", "U"))') == 2
-    assert ws_src.count("_shared_artist_letter(clean_context.get('artist', 'U'))") == 2
-    assert "_shared_artist_letter(safe_artist)" in ws_src
+    assert "artist_letter(album_artist_value)" in paths_src
+    assert "artist_letter(letter_artist_name)" in paths_src
+    assert "_shared_artist_letter(album_artist_value)" in ws_src
+    assert "_shared_artist_letter(letter_artist_name)" in ws_src
+    # the music-video path builder lives in its own module now, handed the
+    # shared helper by the route
+    mv_src = (_ROOT / 'core' / 'downloads' / 'music_video.py').read_text(encoding='utf-8')
+    assert "artist_letter=_shared_artist_letter" in ws_src
+    assert "artist_letter(safe_artist)" in mv_src
+    assert "[0].upper()" not in mv_src
     # the raw extraction may never reappear at a call site
     assert "[0].upper()" not in paths_src.replace('literal = (artist or "U")[0].upper()', '')
     for needle in ("(clean_context.get('artist', 'U') or 'U')[0].upper()",

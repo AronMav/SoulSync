@@ -72,7 +72,7 @@ function openDiscoveryFixModal(platform, identifier, trackIndex) {
     const discoveryModal = document.getElementById(`youtube-discovery-modal-${identifier}`);
     if (!discoveryModal) {
         console.error('❌ Discovery modal not found:', identifier);
-        showToast('Discovery modal not found', 'error');
+        showToast('Identification modal not found', 'error');
         return;
     }
 
@@ -226,7 +226,6 @@ async function searchDiscoveryFix() {
     const allSources = [
         { key: 'spotify', endpoint: '/api/spotify/search_tracks', label: 'Spotify' },
         { key: 'deezer', endpoint: '/api/deezer/search_tracks', label: 'Deezer' },
-        { key: 'yandex', endpoint: '/api/yandex/search_tracks', label: 'Yandex Music' },
         { key: 'itunes', endpoint: '/api/itunes/search_tracks', label: 'iTunes' },
         { key: 'musicbrainz', endpoint: '/api/musicbrainz/search_tracks', label: 'MusicBrainz' },
     ];
@@ -356,6 +355,7 @@ function renderDiscoveryFixResults(tracks, fixModalOverlay) {
         card.innerHTML = `
             <div class="fix-result-card-content">
                 <div class="fix-result-title">${escapeHtml(track.name || 'Unknown Track')}</div>
+                ${track.disambiguation ? `<div class="fix-result-disambiguation">Recording note: ${escapeHtml(track.disambiguation)}</div>` : ''}
                 <div class="fix-result-artist">${escapeHtml((track.artists || ['Unknown Artist']).join(', '))}</div>
                 <div class="fix-result-album">${escapeHtml(track.album || 'Unknown Album')}</div>
                 <div class="fix-result-duration">${formatDuration(track.duration_ms || 0)}</div>
@@ -422,7 +422,9 @@ async function selectDiscoveryFixTrack(track) {
                 artists: track.artists,
                 album: track.album,
                 duration_ms: track.duration_ms,
-                image_url: track.image_url || null
+                image_url: track.image_url || null,
+                source: track.source,
+                disambiguation: track.disambiguation || ''
             }
         };
 
@@ -714,10 +716,6 @@ window.openDiscoveryFixModal = openDiscoveryFixModal;
 window.closeDiscoveryFixModal = closeDiscoveryFixModal;
 window.searchDiscoveryFix = searchDiscoveryFix;
 window.unmatchDiscoveryTrack = unmatchDiscoveryTrack;
-window.openMatchingModal = openMatchingModal;
-window.closeMatchingModal = closeMatchingModal;
-window.selectArtist = selectArtist;
-window.selectAlbum = selectAlbum;
 
 /**
  * Handle post-download cleanup: clear finished downloads from slskd.
@@ -849,6 +847,7 @@ async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwn
         const addToWishlistBtn = document.getElementById('confirm-add-to-wishlist-btn');
         if (addToWishlistBtn) {
             addToWishlistBtn.onclick = () => handleAddToWishlist();
+            addToWishlistBtn.textContent = wishlistAddLabel();
         }
 
         // Quality Profile for this acquisition (P1-01). Preselects the mirror's
@@ -960,6 +959,11 @@ function generateWishlistTrackList(tracks, trackOwnership) {
     }).join('');
 }
 
+// a profile without download rights sends a request, so the button says so
+function wishlistAddLabel() {
+    return (typeof canDownload === 'function' && !canDownload()) ? 'Request' : 'Add to Wishlist';
+}
+
 /**
  * Handle the "Add to Wishlist" button click
  */
@@ -974,6 +978,9 @@ async function handleAddToWishlist() {
     // Read once, before the modal can be re-rendered mid-loop, so every track in
     // this batch gets the SAME profile (P1-01).
     const qualityProfileId = currentWishlistModalQualityProfileId();
+
+    // request limit used up: say so instead of an add the server drops
+    if (typeof checkMusicRequestQuota === 'function' && !(await checkMusicRequestQuota())) return;
 
     try {
         // Show loading state
@@ -1089,7 +1096,10 @@ async function handleAddToWishlist() {
             let message = `Added ${successCount} track${successCount !== 1 ? 's' : ''} to wishlist`;
             if (skippedCount > 0) message += ` (${skippedCount} already owned)`;
             if (errorCount > 0) message += ` — ${errorCount} failed`;
-            showToast(message, errorCount > 0 ? 'warning' : 'success');
+            // a profile that asks first hears who it went to instead
+            if (errorCount > 0 || typeof announceWishlistRequest !== 'function' || !announceWishlistRequest()) {
+                showToast(message, errorCount > 0 ? 'warning' : 'success');
+            }
         } else {
             showToast('Failed to add any tracks to wishlist', 'error');
         }
@@ -1106,7 +1116,7 @@ async function handleAddToWishlist() {
         // Reset button state
         if (addToWishlistBtn) {
             addToWishlistBtn.classList.remove('loading');
-            addToWishlistBtn.textContent = 'Add to Wishlist';
+            addToWishlistBtn.textContent = wishlistAddLabel();
             addToWishlistBtn.disabled = false;
         }
     }
@@ -1374,6 +1384,15 @@ async function handleWishlistDownloadNow() {
  * Add all tracks from any download modal to the wishlist
  * Universal handler for all modal types (artist albums, playlists, YouTube, Tidal, etc.)
  */
+/** a track's album with the modal album's locked release type applied, when
+ * the modal album was opened from the artist page (album_type_locked) */
+function _withLockedAlbumType(trackAlbum, modalAlbum) {
+    if (!modalAlbum || !modalAlbum.album_type_locked || !trackAlbum || typeof trackAlbum !== 'object') {
+        return trackAlbum;
+    }
+    return { ...trackAlbum, album_type: modalAlbum.album_type, album_type_locked: true };
+}
+
 async function addModalTracksToWishlist(playlistId) {
     const process = activeDownloadProcesses[playlistId];
     if (!process) {
@@ -1406,6 +1425,10 @@ async function addModalTracksToWishlist(playlistId) {
     // not for playlists, so we must NOT use it as a blanket default.
     const processArtist = process.artist || null;
     const album = process.album || process.playlist || { name: 'Playlist', id: playlistId };
+
+    // a profile that asks first and has used its request limit: say so here,
+    // the server would drop the add without a word
+    if (typeof checkMusicRequestQuota === 'function' && !(await checkMusicRequestQuota())) return;
 
     // Same control the modal's "Begin Analysis" reads, so both buttons in this
     // dialog agree on the Quality Profile (P1-01).
@@ -1493,6 +1516,12 @@ async function addModalTracksToWishlist(playlistId) {
                     trackAlbumType = 'album';
                 }
 
+                // an artist-page album is locked to the section it showed under;
+                // tracks queued from its modal keep that, or the wishlist files
+                // them by a track-count guess instead
+                trackAlbum = _withLockedAlbumType(trackAlbum, process.album);
+                trackAlbumType = trackAlbum.album_type || trackAlbumType;
+
                 // Resolve artist: for album downloads, use the album-level artist to keep
                 // all tracks grouped under one artist in the wishlist. Per-track artists
                 // (like individual vocalists on a soundtrack) should NOT split the album.
@@ -1549,7 +1578,9 @@ async function addModalTracksToWishlist(playlistId) {
             if (skippedCount > 0) message += ` (${skippedCount} already owned)`;
             if (errorCount > 0) message += ` — ${errorCount} failed`;
             if (wingItSkipped > 0) message += ` (${wingItSkipped} wing-it skipped)`;
-            showToast(message, 'success');
+            if (errorCount > 0 || typeof announceWishlistRequest !== 'function' || !announceWishlistRequest()) {
+                showToast(message, 'success');
+            }
 
             // Close the modal on success
             await closeDownloadMissingModal(playlistId);
@@ -1565,25 +1596,15 @@ async function addModalTracksToWishlist(playlistId) {
         if (wishlistBtn) {
             wishlistBtn.disabled = false;
             wishlistBtn.classList.remove('loading');
-            wishlistBtn.textContent = 'Add to Wishlist';
+            wishlistBtn.textContent = wishlistAddLabel();
         }
     }
 }
 
-/**
- * Format duration from milliseconds to MM:SS format
- */
-function formatDuration(durationMs) {
-    if (!durationMs || durationMs <= 0) {
-        return '--:--';
-    }
-
-    const totalSeconds = Math.floor(durationMs / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-}
+// formatDuration lived here too, returning '--:--' for an unknown duration.
+// It was DEAD: sync-services.js declared the same name and loaded later, so its
+// '0:00' version won for every caller in this file. The one definition now
+// lives in shared-helpers.js — see the note there.
 
 // Note: Functions from other modules (downloads.js, sync-spotify.js, sync-services.js, artists.js)
 // are already global via their function declarations and do not need window.X = X assignments.
@@ -1596,1087 +1617,14 @@ window.handleWishlistDownloadNow = handleWishlistDownloadNow;
 window.addModalTracksToWishlist = addModalTracksToWishlist;
 
 
-// APPEND THIS JAVASCRIPT SNIPPET (B)
-
-function initializeFilters() {
-    const toggleBtn = document.getElementById('filter-toggle-btn');
-    const container = document.getElementById('filters-container');
-    const content = document.getElementById('filter-content');
-
-    if (toggleBtn && container && content) {
-        // Using .onclick ensures we only ever have one click handler
-        toggleBtn.onclick = () => {
-            const isExpanded = container.classList.contains('expanded');
-
-            if (isExpanded) {
-                // Collapse the container
-                container.classList.remove('expanded');
-                toggleBtn.textContent = '⏷ Filters';
-            } else {
-                // Expand the container
-                content.classList.remove('hidden'); // Make sure content is visible for animation
-                container.classList.add('expanded');
-                toggleBtn.textContent = '⏶ Filters';
-            }
-        };
-    }
-
-    // This part is correct and doesn't need to change
-    document.querySelectorAll('.filter-btn').forEach(button => {
-        button.addEventListener('click', handleFilterClick);
-    });
-}
-
-function handleFilterClick(event) {
-    const button = event.target;
-    const filterType = button.dataset.filterType;
-    const value = button.dataset.value;
-
-    if (filterType === 'type') currentFilterType = value;
-    if (filterType === 'format') currentFilterFormat = value;
-    if (filterType === 'sort') currentSortBy = value;
-
-    if (button.id === 'sort-order-btn') {
-        isSortReversed = !isSortReversed;
-        button.textContent = isSortReversed ? '↑' : '↓';
-    }
-
-    document.querySelectorAll(`.filter-btn[data-filter-type="${filterType}"]`).forEach(btn => {
-        btn.classList.remove('active');
-    });
-    if (filterType) { // Don't try to activate the sort order button
-        button.classList.add('active');
-    }
-
-    applyFiltersAndSort();
-}
-
-function resetFilters() {
-    currentFilterType = 'all';
-    currentFilterFormat = 'all';
-    currentSortBy = 'quality_score';
-    isSortReversed = false;
-
-    document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
-    document.querySelector('.filter-btn[data-filter-type="type"][data-value="all"]').classList.add('active');
-    document.querySelector('.filter-btn[data-filter-type="format"][data-value="all"]').classList.add('active');
-    document.querySelector('.filter-btn[data-filter-type="sort"][data-value="quality_score"]').classList.add('active');
-    document.getElementById('sort-order-btn').textContent = '↓';
-}
-
-function applyFiltersAndSort() {
-    let processedResults = [...allSearchResults];
-    const query = document.getElementById('downloads-search-input').value.trim().toLowerCase();
-
-    // 1. Filter by Type
-    if (currentFilterType !== 'all') {
-        processedResults = processedResults.filter(r => r.result_type === currentFilterType);
-    }
-
-    // 2. Filter by Format
-    if (currentFilterFormat !== 'all') {
-        processedResults = processedResults.filter(r => {
-            const quality = (r.dominant_quality || r.quality || '').toLowerCase();
-            return quality === currentFilterFormat;
-        });
-    }
-
-    // 3. Sort Results
-    processedResults.sort((a, b) => {
-        let valA, valB;
-
-        // Special handling for relevance sort
-        if (currentSortBy === 'relevance') {
-            valA = calculateRelevanceScore(a, query);
-            valB = calculateRelevanceScore(b, query);
-            return valB - valA; // Higher score is better
-        }
-
-        // Special handling for availability
-        if (currentSortBy === 'availability') {
-            valA = (a.free_upload_slots || 0) - (a.queue_length || 0) * 0.1;
-            valB = (b.free_upload_slots || 0) - (b.queue_length || 0) * 0.1;
-            return valB - valA;
-        }
-
-        valA = a[currentSortBy] || 0;
-        valB = b[currentSortBy] || 0;
-
-        if (typeof valA === 'string') {
-            // For name/title sort, use the correct property
-            const titleA = (a.album_title || a.title || '').toLowerCase();
-            const titleB = (b.album_title || b.title || '').toLowerCase();
-            return titleA.localeCompare(titleB);
-        }
-
-        // Default numeric sort (descending)
-        return valB - valA;
-    });
-
-    // Handle sort direction toggle
-    const sortDefaults = {
-        relevance: 'desc', quality_score: 'desc', size: 'desc', bitrate: 'desc',
-        upload_speed: 'desc', duration: 'desc', availability: 'desc',
-        title: 'asc', username: 'asc'
-    };
-
-    const defaultOrder = sortDefaults[currentSortBy] || 'desc';
-    if ((defaultOrder === 'asc' && isSortReversed) || (defaultOrder === 'desc' && !isSortReversed)) {
-        processedResults.reverse();
-    }
-
-    displayDownloadsResults(processedResults);
-}
-
-function calculateRelevanceScore(result, query) {
-    let score = 0.0;
-    const queryTerms = query.split(' ').filter(t => t.length > 1);
-
-    // 1. Search Term Matching (40%)
-    let searchableText = `${result.title || ''} ${result.artist || ''} ${result.album || ''} ${result.album_title || ''}`.toLowerCase();
-    let termMatches = 0;
-    for (const term of queryTerms) {
-        if (searchableText.includes(term)) {
-            termMatches++;
-        }
-    }
-    score += (termMatches / queryTerms.length) * 0.40;
-
-    // 2. Quality Score (25%)
-    score += (result.quality_score || 0) * 0.25;
-
-    // 3. User Reliability (Availability & Speed) (20%)
-    const reliability = ((result.free_upload_slots || 0) > 0 ? 0.5 : 0) + Math.min(1, (result.upload_speed || 0) / 500) * 0.5;
-    score += reliability * 0.20;
-
-    // 4. File Completeness (Bitrate & Duration) (15%)
-    const completeness = (Math.min(1, (result.bitrate || 0) / 320) * 0.5) + (result.duration > 0 ? 0.5 : 0);
-    score += completeness * 0.15;
-
-    return score;
-}
-// Add to global scope for onclick
-window.handleFilterClick = handleFilterClick;
-
-// ===============================
-// MATCHED DOWNLOADS MODAL
-// ===============================
-
-// Global state for matching modal
-let currentMatchingData = {
-    searchResult: null,
-    isAlbumDownload: false,
-    albumResult: null,
-    selectedArtist: null,
-    selectedAlbum: null,
-    currentStage: 'artist' // 'artist' or 'album'
-};
-
-let searchTimers = {
-    artist: null,
-    album: null
-};
-
-function openMatchingModal(searchResult, isAlbumDownload = false, albumResult = null) {
-    console.log('🎯 Opening matching modal for:', searchResult);
-
-    // Store the current matching data
-    currentMatchingData = {
-        searchResult: searchResult,
-        isAlbumDownload: isAlbumDownload,
-        albumResult: albumResult,
-        selectedArtist: null,
-        selectedAlbum: null,
-        currentStage: 'artist'
-    };
-
-    // Show modal
-    const overlay = document.getElementById('matching-modal-overlay');
-    overlay.classList.remove('hidden');
-
-    // Reset modal state
-    resetModalState();
-
-    // Set appropriate title and stage
-    const modalTitle = document.getElementById('matching-modal-title');
-    const artistStageTitle = document.getElementById('artist-stage-title');
-
-    if (isAlbumDownload) {
-        modalTitle.textContent = 'Match album download to release';
-        artistStageTitle.textContent = 'Step 1: Select the correct Artist';
-        document.getElementById('album-selection-stage').style.display = 'block';
-    } else {
-        modalTitle.textContent = 'Match track download to release';
-        artistStageTitle.textContent = 'Select the correct Artist for this Single';
-        document.getElementById('album-selection-stage').style.display = 'none';
-    }
-
-    // Generate initial artist suggestions
-    fetchArtistSuggestions();
-
-    // Setup event listeners
-    setupModalEventListeners();
-}
-
-function closeMatchingModal() {
-    const overlay = document.getElementById('matching-modal-overlay');
-    overlay.classList.add('hidden');
-
-    // Clear timers
-    Object.values(searchTimers).forEach(timer => {
-        if (timer) clearTimeout(timer);
-    });
-
-    // Reset state
-    currentMatchingData = {
-        searchResult: null,
-        isAlbumDownload: false,
-        albumResult: null,
-        selectedArtist: null,
-        selectedAlbum: null,
-        currentStage: 'artist'
-    };
-}
-
-function resetModalState() {
-    // Show artist stage, hide album stage
-    document.getElementById('artist-selection-stage').classList.remove('hidden');
-    document.getElementById('album-selection-stage').classList.add('hidden');
-
-    // Clear all suggestion containers
-    document.getElementById('artist-suggestions').innerHTML = '';
-    document.getElementById('artist-manual-results').innerHTML = '';
-    document.getElementById('album-suggestions').innerHTML = '';
-    document.getElementById('album-manual-results').innerHTML = '';
-
-    // Clear search inputs
-    document.getElementById('artist-search-input').value = '';
-    document.getElementById('album-search-input').value = '';
-
-    // Reset button states
-    document.getElementById('confirm-match-btn').disabled = true;
-
-    // Reset selections
-    currentMatchingData.selectedArtist = null;
-    currentMatchingData.selectedAlbum = null;
-    currentMatchingData.currentStage = 'artist';
-}
-
-function setupModalEventListeners() {
-    // Search input listeners
-    const artistInput = document.getElementById('artist-search-input');
-    const albumInput = document.getElementById('album-search-input');
-
-    artistInput.removeEventListener('input', handleArtistSearch);
-    artistInput.addEventListener('input', handleArtistSearch);
-
-    albumInput.removeEventListener('input', handleAlbumSearch);
-    albumInput.addEventListener('input', handleAlbumSearch);
-
-    // Button listeners
-    const skipBtn = document.getElementById('skip-matching-btn');
-    const cancelBtn = document.getElementById('cancel-match-btn');
-    const confirmBtn = document.getElementById('confirm-match-btn');
-
-    skipBtn.onclick = skipMatching;
-    cancelBtn.onclick = closeMatchingModal;
-    confirmBtn.onclick = confirmMatch;
-}
-
-async function fetchArtistSuggestions() {
-    try {
-        showLoadingCards('artist-suggestions', 'Finding artist...');
-
-        const response = await fetch('/api/match/suggestions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                search_result: currentMatchingData.searchResult,
-                context: 'artist',
-                is_album: currentMatchingData.isAlbumDownload,
-                album_result: currentMatchingData.albumResult
-            })
-        });
-
-        const data = await response.json();
-        if (data.suggestions) {
-            renderArtistSuggestions(data.suggestions);
-        } else {
-            showNoResultsMessage('artist-suggestions', 'No artist suggestions found');
-        }
-    } catch (error) {
-        console.error('Error fetching artist suggestions:', error);
-        showNoResultsMessage('artist-suggestions', 'Error loading suggestions');
-    }
-}
-
-async function fetchAlbumSuggestions() {
-    if (!currentMatchingData.selectedArtist) return;
-
-    try {
-        showLoadingCards('album-suggestions', 'Finding album...');
-
-        const response = await fetch('/api/match/suggestions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                search_result: currentMatchingData.searchResult,
-                context: 'album',
-                selected_artist: currentMatchingData.selectedArtist
-            })
-        });
-
-        const data = await response.json();
-        if (data.suggestions) {
-            renderAlbumSuggestions(data.suggestions);
-        } else {
-            showNoResultsMessage('album-suggestions', 'No album suggestions found');
-        }
-    } catch (error) {
-        console.error('Error fetching album suggestions:', error);
-        showNoResultsMessage('album-suggestions', 'Error loading suggestions');
-    }
-}
-
-function renderArtistSuggestions(suggestions) {
-    const container = document.getElementById('artist-suggestions');
-    container.innerHTML = '';
-
-    if (!suggestions.length) {
-        showNoResultsMessage('artist-suggestions', 'No artist matches found');
-        return;
-    }
-
-    suggestions.forEach(suggestion => {
-        const card = createArtistCard(suggestion.artist, suggestion.confidence);
-        container.appendChild(card);
-    });
-}
-
-function renderAlbumSuggestions(suggestions) {
-    const container = document.getElementById('album-suggestions');
-    container.innerHTML = '';
-
-    if (!suggestions.length) {
-        showNoResultsMessage('album-suggestions', 'No album matches found');
-        return;
-    }
-
-    suggestions.forEach(suggestion => {
-        const card = createAlbumCard(suggestion.album, suggestion.confidence);
-        container.appendChild(card);
-    });
-}
-
-function createArtistCard(artist, confidence) {
-    const card = document.createElement('div');
-    card.className = 'suggestion-card';
-    card.onclick = () => selectArtist(artist);
-
-    const imageUrl = artist.image_url || '';
-    const confidencePercent = Math.round(confidence * 100);
-
-    // Add data attribute for lazy loading
-    card.dataset.artistId = artist.id;
-    card.dataset.needsImage = imageUrl ? 'false' : 'true';
-
-    card.innerHTML = `
-        <div class="suggestion-card-overlay"></div>
-        <div class="suggestion-card-content">
-            <div class="suggestion-card-name" title="${escapeHtml(artist.name)}">${escapeHtml(artist.name)}</div>
-            <div class="suggestion-card-details">
-                ${artist.genres && artist.genres.length ? escapeHtml(artist.genres.slice(0, 2).join(', ')) : 'Artist'}
-            </div>
-            <div class="suggestion-card-confidence">${confidencePercent}% match</div>
-        </div>
-    `;
-
-    // Set background image if available
-    if (imageUrl) {
-        card.style.backgroundImage = `url(${imageUrl})`;
-        card.style.backgroundSize = 'cover';
-        card.style.backgroundPosition = 'center';
-    }
-
-    return card;
-}
-
-function createAlbumCard(album, confidence) {
-    const card = document.createElement('div');
-    card.className = 'suggestion-card';
-    card.onclick = () => selectAlbum(album);
-
-    const imageUrl = album.image_url || '';
-    const confidencePercent = Math.round(confidence * 100);
-    const year = album.release_date ? album.release_date.split('-')[0] : '';
-
-    card.innerHTML = `
-        <div class="suggestion-card-overlay"></div>
-        <div class="suggestion-card-content">
-            <div class="suggestion-card-name" title="${escapeHtml(album.name)}">${escapeHtml(album.name)}</div>
-            <div class="suggestion-card-details">
-                ${album.album_type ? escapeHtml(album.album_type.charAt(0).toUpperCase() + album.album_type.slice(1)) : 'Album'}${year ? ` • ${year}` : ''}
-            </div>
-            <div class="suggestion-card-confidence">${confidencePercent}% match</div>
-        </div>
-    `;
-
-    // Set background image if available
-    if (imageUrl) {
-        card.style.backgroundImage = `url(${imageUrl})`;
-        card.style.backgroundSize = 'cover';
-        card.style.backgroundPosition = 'center';
-    }
-
-    return card;
-}
-
-function selectArtist(artist) {
-    // Clear previous selections
-    document.querySelectorAll('#artist-suggestions .suggestion-card').forEach(card => {
-        card.classList.remove('selected');
-    });
-    document.querySelectorAll('#artist-manual-results .suggestion-card').forEach(card => {
-        card.classList.remove('selected');
-    });
-
-    // Mark new selection
-    event.currentTarget.classList.add('selected');
-
-    // Store selection
-    currentMatchingData.selectedArtist = artist;
-
-    console.log('🎯 Selected artist:', artist.name);
-
-    if (currentMatchingData.isAlbumDownload) {
-        // Transition to album selection stage
-        transitionToAlbumStage();
-    } else {
-        // Enable confirm button for single downloads
-        document.getElementById('confirm-match-btn').disabled = false;
-    }
-}
-
-function selectAlbum(album) {
-    // Clear previous selections
-    document.querySelectorAll('#album-suggestions .suggestion-card').forEach(card => {
-        card.classList.remove('selected');
-    });
-    document.querySelectorAll('#album-manual-results .suggestion-card').forEach(card => {
-        card.classList.remove('selected');
-    });
-
-    // Mark new selection
-    event.currentTarget.classList.add('selected');
-
-    // Store selection
-    currentMatchingData.selectedAlbum = album;
-
-    console.log('🎯 Selected album:', album.name);
-
-    // Enable confirm button
-    document.getElementById('confirm-match-btn').disabled = false;
-}
-
-function transitionToAlbumStage() {
-    // Hide artist stage
-    document.getElementById('artist-selection-stage').classList.add('hidden');
-
-    // Show album stage
-    const albumStage = document.getElementById('album-selection-stage');
-    albumStage.classList.remove('hidden');
-
-    // Update selected artist name
-    document.getElementById('selected-artist-name').textContent = currentMatchingData.selectedArtist.name;
-
-    // Update current stage
-    currentMatchingData.currentStage = 'album';
-
-    // Fetch album suggestions
-    fetchAlbumSuggestions();
-}
-
-function handleArtistSearch(event) {
-    const query = event.target.value.trim();
-
-    // Clear previous timer
-    if (searchTimers.artist) {
-        clearTimeout(searchTimers.artist);
-    }
-
-    if (query.length < 2) {
-        document.getElementById('artist-manual-results').innerHTML = '';
-        return;
-    }
-
-    // Debounce search
-    searchTimers.artist = setTimeout(() => {
-        performArtistSearch(query);
-    }, 400);
-}
-
-function handleAlbumSearch(event) {
-    const query = event.target.value.trim();
-
-    // Clear previous timer
-    if (searchTimers.album) {
-        clearTimeout(searchTimers.album);
-    }
-
-    if (query.length < 2) {
-        document.getElementById('album-manual-results').innerHTML = '';
-        return;
-    }
-
-    // Debounce search
-    searchTimers.album = setTimeout(() => {
-        performAlbumSearch(query);
-    }, 400);
-}
-
-async function performArtistSearch(query) {
-    try {
-        showLoadingCards('artist-manual-results', 'Searching artists...');
-
-        const requestBody = {
-            query: query,
-            context: 'artist'
-        };
-        console.log('Manual search request:', requestBody);
-
-        const response = await fetch('/api/match/search', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody)
-        });
-
-        const data = await response.json();
-        console.log('Manual search response:', data);
-        if (data.provider) currentMatchingData.provider = data.provider;
-        if (data.results) {
-            console.log('Results array:', data.results);
-            renderArtistSearchResults(data.results);
-        } else {
-            showNoResultsMessage('artist-manual-results', 'No artists found');
-        }
-    } catch (error) {
-        console.error('Error searching artists:', error);
-        showNoResultsMessage('artist-manual-results', 'Error searching artists');
-    }
-}
-
-async function performAlbumSearch(query) {
-    if (!currentMatchingData.selectedArtist) return;
-
-    try {
-        showLoadingCards('album-manual-results', 'Searching albums...');
-
-        const response = await fetch('/api/match/search', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                query: query,
-                context: 'album',
-                artist_id: currentMatchingData.selectedArtist.id
-            })
-        });
-
-        const data = await response.json();
-        if (data.results) {
-            renderAlbumSearchResults(data.results);
-        } else {
-            showNoResultsMessage('album-manual-results', 'No albums found');
-        }
-    } catch (error) {
-        console.error('Error searching albums:', error);
-        showNoResultsMessage('album-manual-results', 'Error searching albums');
-    }
-}
-
-function renderArtistSearchResults(results) {
-    const container = document.getElementById('artist-manual-results');
-    container.innerHTML = '';
-
-    results.forEach((result, index) => {
-        console.log(`Manual search result ${index}:`, result);
-        console.log(`  result.artist:`, result.artist);
-        console.log(`  result.confidence:`, result.confidence);
-        try {
-            const card = createArtistCard(result.artist, result.confidence);
-            console.log(`createArtistCard returned:`, card, typeof card, card instanceof Element);
-            if (card && card instanceof Element) {
-                container.appendChild(card);
-            } else {
-                console.error(`Invalid card returned for result ${index}:`, card);
-            }
-        } catch (error) {
-            console.error(`Error calling createArtistCard for result ${index}:`, error);
-        }
-    });
-
-    // Lazy load missing artist images
-    console.log('🖼️ Starting lazy load for artist images in matching modal...');
-    if (typeof lazyLoadArtistImages === 'function') {
-        lazyLoadArtistImages(container);
-    } else if (typeof window.lazyLoadArtistImages === 'function') {
-        window.lazyLoadArtistImages(container);
-    } else {
-        console.error('❌ lazyLoadArtistImages function not found!');
-    }
-}
-
-function renderAlbumSearchResults(results) {
-    const container = document.getElementById('album-manual-results');
-    container.innerHTML = '';
-
-    results.forEach(result => {
-        const card = createAlbumCard(result.album, result.confidence);
-        container.appendChild(card);
-    });
-}
-
-function showLoadingCards(containerId, message) {
-    const container = document.getElementById(containerId);
-    container.innerHTML = `<div class="loading-card">${message}</div>`;
-}
-
-function showNoResultsMessage(containerId, message) {
-    const container = document.getElementById(containerId);
-    container.innerHTML = `<div class="loading-card" style="color: rgba(255,255,255,0.5)">${message}</div>`;
-}
-
-function skipMatching() {
-    console.log('🎯 Skipping matching, proceeding with normal download');
-
-    // Close modal
-    closeMatchingModal();
-
-    // Start normal download
-    if (currentMatchingData.isAlbumDownload) {
-        // For albums, we need to download each track
-        showToast('⬇️ Starting album download (unmatched)', 'info');
-        // This would need to be implemented to download all album tracks
-    } else {
-        // Single track download
-        startDownload(window.currentSearchResults.indexOf(currentMatchingData.searchResult));
-    }
-}
-
-function matchSlskdTracksToSpotify(slskdTracks, spotifyTracks) {
-    /**
-     * Matches Soulseek tracks to Spotify tracks based on filename analysis.
-     * Returns enhanced tracks with full Spotify metadata.
-     */
-    console.log(`🎯 Starting track matching: ${slskdTracks.length} Soulseek tracks vs ${spotifyTracks.length} Spotify tracks`);
-
-    const matched = [];
-    const unmatched = [];
-
-    for (const slskdTrack of slskdTracks) {
-        const filename = slskdTrack.filename || slskdTrack.title || '';
-        const parsedMeta = parseTrackFilename(filename);
-
-        console.log(`🔍 Matching: "${filename}" -> parsed as: "${parsedMeta.title}" (track #${parsedMeta.trackNumber})`);
-
-        // Find best matching Spotify track
-        let bestMatch = null;
-        let bestScore = 0;
-
-        for (const spotifyTrack of spotifyTracks) {
-            let score = 0;
-
-            // Match by track number (highest priority if available)
-            if (parsedMeta.trackNumber && spotifyTrack.track_number === parsedMeta.trackNumber) {
-                score += 50;
-                console.log(`   ✓ Track number match: ${parsedMeta.trackNumber} == ${spotifyTrack.track_number} (+50)`);
-            }
-
-            // Match by title similarity
-            const titleScore = calculateStringSimilarity(
-                parsedMeta.title.toLowerCase(),
-                spotifyTrack.name.toLowerCase()
-            );
-            score += titleScore * 50; // Max 50 points for perfect title match
-
-            console.log(`   Spotify track "${spotifyTrack.name}" (${spotifyTrack.track_number}): score ${score.toFixed(2)}`);
-
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = spotifyTrack;
-            }
-        }
-
-        // Accept match if score is above threshold (70/100)
-        if (bestMatch && bestScore >= 70) {
-            console.log(`✅ MATCHED: "${filename}" -> "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
-            matched.push({
-                slskd_track: slskdTrack,
-                spotify_track: bestMatch,
-                confidence: bestScore / 100
-            });
-        } else {
-            console.log(`❌ NO MATCH: "${filename}" (best score: ${bestScore.toFixed(2)})`);
-            unmatched.push(slskdTrack);
-        }
-    }
-
-    console.log(`🎯 Matching complete: ${matched.length} matched, ${unmatched.length} unmatched`);
-
-    return {
-        matched: matched,
-        unmatched: unmatched,
-        total: slskdTracks.length
-    };
-}
-
-function parseTrackFilename(filename) {
-    /**
-     * Parse track metadata from filename.
-     * Handles common patterns like:
-     * - "01 - Title.flac"
-     * - "01. Title.flac"
-     * - "Artist - Title.flac"
-     * - "Title.flac"
-     * - YouTube: "video_id||title" (extract title part)
-     */
-    // YouTube special handling: Extract title from encoded format
-    if (filename && filename.includes('||')) {
-        const parts = filename.split('||');
-        const youtubeTitle = parts[1] || parts[0];  // Use title part, fallback to video_id
-        // Remove common YouTube suffixes
-        const cleanTitle = youtubeTitle
-            .replace(/\s*\[.*?\]\s*/g, '')  // Remove [Official Video], [Lyrics], etc.
-            .replace(/\s*\(.*?\)\s*/g, '')  // Remove (Official), (Audio), etc.
-            .trim();
-        return { title: cleanTitle, trackNumber: null };
-    }
-
-    // Remove file extension and path
-    let basename = filename.split('/').pop().split('\\').pop();
-    basename = basename.replace(/\.(flac|mp3|m4a|ogg|wav)$/i, '');
-
-    let trackNumber = null;
-    let title = basename;
-
-    // Pattern 1: "01 - Title" or "01. Title"
-    const pattern1 = /^(\d{1,2})\s*[-\.]\s*(.+)$/;
-    const match1 = basename.match(pattern1);
-    if (match1) {
-        trackNumber = parseInt(match1[1]);
-        title = match1[2].trim();
-        return { title, trackNumber };
-    }
-
-    // Pattern 2: "Artist - Title" (extract title only)
-    const pattern2 = /^.+?\s*[-–]\s*(.+)$/;
-    const match2 = basename.match(pattern2);
-    if (match2) {
-        title = match2[1].trim();
-        return { title, trackNumber };
-    }
-
-    // Fallback: use whole basename as title
-    return { title: basename.trim(), trackNumber };
-}
-
-function calculateStringSimilarity(str1, str2) {
-    /**
-     * Calculate similarity between two strings (0-1 range).
-     * Uses Levenshtein distance for fuzzy matching.
-     */
-    // Normalize strings
-    str1 = str1.trim().toLowerCase();
-    str2 = str2.trim().toLowerCase();
-
-    if (str1 === str2) return 1.0;
-
-    // Simple contains check
-    if (str1.includes(str2) || str2.includes(str1)) {
-        return 0.9;
-    }
-
-    // Levenshtein distance calculation
-    const matrix = [];
-    const len1 = str1.length;
-    const len2 = str2.length;
-
-    for (let i = 0; i <= len1; i++) {
-        matrix[i] = [i];
-    }
-
-    for (let j = 0; j <= len2; j++) {
-        matrix[0][j] = j;
-    }
-
-    for (let i = 1; i <= len1; i++) {
-        for (let j = 1; j <= len2; j++) {
-            const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
-            matrix[i][j] = Math.min(
-                matrix[i - 1][j] + 1,      // deletion
-                matrix[i][j - 1] + 1,      // insertion
-                matrix[i - 1][j - 1] + cost // substitution
-            );
-        }
-    }
-
-    const maxLen = Math.max(len1, len2);
-    const distance = matrix[len1][len2];
-    const similarity = 1 - (distance / maxLen);
-
-    return Math.max(0, similarity);
-}
-
-async function confirmMatch() {
-    if (!currentMatchingData.selectedArtist) {
-        showToast('⚠️ Please select an artist first', 'error');
-        return;
-    }
-
-    if (currentMatchingData.isAlbumDownload && !currentMatchingData.selectedAlbum) {
-        showToast('⚠️ Please select an album first', 'error');
-        return;
-    }
-
-    const confirmBtn = document.getElementById('confirm-match-btn');
-    const originalText = confirmBtn.textContent;
-
-    try {
-        console.log('🎯 Confirming match with:', {
-            artist: currentMatchingData.selectedArtist.name,
-            album: currentMatchingData.selectedAlbum?.name
-        });
-
-        confirmBtn.disabled = true;
-        confirmBtn.textContent = 'Starting...';
-
-        // Determine the correct data to send
-        const downloadPayload = currentMatchingData.isAlbumDownload
-            ? currentMatchingData.albumResult
-            : currentMatchingData.searchResult;
-
-        // --- NEW: For album downloads, fetch Spotify tracklist and match tracks ---
-        if (currentMatchingData.isAlbumDownload && currentMatchingData.selectedAlbum) {
-            confirmBtn.textContent = 'Matching tracks...';
-            console.log('🎵 Fetching Spotify tracklist for album:', currentMatchingData.selectedAlbum.name);
-
-            try {
-                // Fetch album tracks (pass name/artist for Hydrabase support)
-                const artistId = currentMatchingData.selectedArtist.id;
-                const albumId = currentMatchingData.selectedAlbum.id;
-                const _aat3 = new URLSearchParams({ name: currentMatchingData.selectedAlbum.name || '', artist: currentMatchingData.selectedArtist.name || '' });
-                const albumSource = currentMatchingData.selectedAlbum?.source || currentMatchingData.selectedArtist?.source || null;
-                if (albumSource) {
-                    _aat3.set('source', albumSource);
-                }
-                const tracksResponse = await fetch(`/api/album/${albumId}/tracks?${_aat3}`);
-
-                if (!tracksResponse.ok) {
-                    throw new Error(`Failed to fetch Spotify tracks: ${tracksResponse.status}`);
-                }
-
-                const tracksData = await tracksResponse.json();
-                const spotifyTracks = tracksData.tracks || [];
-
-                console.log(`✅ Fetched ${spotifyTracks.length} Spotify tracks for matching`);
-
-                // Match each Soulseek track to a Spotify track
-                const enhancedTracks = matchSlskdTracksToSpotify(
-                    downloadPayload.tracks || [],
-                    spotifyTracks
-                );
-
-                console.log(`🎯 Matched ${enhancedTracks.matched.length}/${enhancedTracks.total} tracks to Spotify`);
-
-                // Send enhanced data with full Spotify track objects
-                confirmBtn.textContent = 'Downloading...';
-                const response = await fetch('/api/download/matched', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        search_result: downloadPayload,
-                        spotify_artist: currentMatchingData.selectedArtist,
-                        spotify_album: currentMatchingData.selectedAlbum,
-                        enhanced_tracks: enhancedTracks.matched, // Send matched tracks with full Spotify data
-                        unmatched_tracks: enhancedTracks.unmatched // Send unmatched tracks for basic processing
-                    })
-                });
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showToast(`🎯 Matched ${enhancedTracks.matched.length} tracks to Spotify`, 'success');
-                    closeMatchingModal();
-                } else {
-                    throw new Error(data.error || 'Failed to start matched download');
-                }
-
-            } catch (trackMatchError) {
-                console.error('❌ Track matching failed, falling back to simple matching:', trackMatchError);
-                showToast('⚠️ Track matching failed, using basic matching', 'warning');
-
-                // Fallback to simple matching (current behavior)
-                const response = await fetch('/api/download/matched', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        search_result: downloadPayload,
-                        spotify_artist: currentMatchingData.selectedArtist,
-                        spotify_album: currentMatchingData.selectedAlbum || null
-                    })
-                });
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showToast(`🎯 Matched download started for "${currentMatchingData.selectedArtist.name}"`, 'success');
-                    closeMatchingModal();
-                } else {
-                    throw new Error(data.error || 'Failed to start matched download');
-                }
-            }
-        } else {
-            // Single track download - fetch release data for full details
-            confirmBtn.textContent = 'Searching release data...';
-
-            try {
-                // Parse track name from Soulseek filename
-                const filename = downloadPayload.filename || downloadPayload.title || '';
-                const parsedMeta = parseTrackFilename(filename);
-
-                console.log(`🔍 Searching release data for: "${parsedMeta.title}" by ${currentMatchingData.selectedArtist.name}`);
-
-                // Search the configured provider for this track
-                const searchQuery = `track:${parsedMeta.title} artist:${currentMatchingData.selectedArtist.name}`;
-                const searchResponse = await fetch(`/api/spotify/search?q=${encodeURIComponent(searchQuery)}&type=track&limit=5`);
-
-                if (!searchResponse.ok) {
-                    throw new Error('Failed to search Spotify for track');
-                }
-
-                const searchData = await searchResponse.json();
-                const spotifyTracks = searchData.tracks?.items || [];
-
-                if (spotifyTracks.length === 0) {
-                    throw new Error('No Spotify tracks found for this search');
-                }
-
-                // Find best match (prefer exact artist match)
-                let bestMatch = spotifyTracks.find(track =>
-                    track.artists.some(artist => artist.id === currentMatchingData.selectedArtist.id)
-                ) || spotifyTracks[0];
-
-                console.log(`✅ Found Spotify track: "${bestMatch.name}" (${bestMatch.id})`);
-
-                // Get full track details with album info
-                const trackResponse = await fetch(`/api/spotify/track/${bestMatch.id}`);
-                if (!trackResponse.ok) {
-                    throw new Error('Failed to fetch Spotify track details');
-                }
-
-                const fullTrack = await trackResponse.json();
-
-                // Send with full Spotify metadata (single track enhanced)
-                confirmBtn.textContent = 'Downloading...';
-                const response = await fetch('/api/download/matched', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        search_result: downloadPayload,
-                        spotify_artist: currentMatchingData.selectedArtist,
-                        spotify_album: null,  // Singles don't have album context
-                        spotify_track: fullTrack,  // Full Spotify track object
-                        is_single_track: true  // Flag for single track processing
-                    })
-                });
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showToast(`🎯 Matched single: "${fullTrack.name}"`, 'success');
-                    closeMatchingModal();
-                } else {
-                    throw new Error(data.error || 'Failed to start matched download');
-                }
-
-            } catch (singleMatchError) {
-                console.error('❌ Release matching failed, falling back to basic:', singleMatchError);
-                showToast('⚠️ Release matching failed, using basic track data', 'warning');
-
-                // Fallback to basic matching (current behavior)
-                const response = await fetch('/api/download/matched', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        search_result: downloadPayload,
-                        spotify_artist: currentMatchingData.selectedArtist,
-                        spotify_album: currentMatchingData.selectedAlbum || null
-                    })
-                });
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showToast(`🎯 Matched download started for "${currentMatchingData.selectedArtist.name}"`, 'success');
-                    closeMatchingModal();
-                } else {
-                    throw new Error(data.error || 'Failed to start matched download');
-                }
-            }
-        }
-
-    } catch (error) {
-        console.error('Error starting matched download:', error);
-        showToast(`❌ Error starting matched download: ${error.message}`, 'error');
-
-        // Re-enable confirm button on failure
-        confirmBtn.disabled = false;
-        confirmBtn.textContent = originalText;
-    }
-}
-
-
-
-
-function matchedDownloadTrack(trackIndex) {
-    const results = window.currentSearchResults;
-    if (!results || !results[trackIndex]) {
-        console.error('Could not find track for matched download:', trackIndex);
-        showToast('Error preparing matched download.', 'error');
-        return;
-    }
-    const trackData = results[trackIndex];
-    // It's a single track, so isAlbumDownload is false and there's no album context.
-    openMatchingModal(trackData, false, null);
-}
-
-function matchedDownloadAlbum(albumIndex) {
-    const results = window.currentSearchResults;
-    if (!results || !results[albumIndex]) {
-        console.error('Could not find album for matched download:', albumIndex);
-        showToast('Error preparing matched download.', 'error');
-        return;
-    }
-    const albumData = results[albumIndex];
-    // The first track is used as a reference for the initial artist search.
-    const firstTrack = albumData.tracks ? albumData.tracks[0] : albumData;
-    openMatchingModal(firstTrack, true, albumData);
-}
-
-function matchedDownloadAlbumTrack(albumIndex, trackIndex) {
-    const results = window.currentSearchResults;
-    if (!results || !results[albumIndex] || !results[albumIndex].tracks || !results[albumIndex].tracks[trackIndex]) {
-        console.error('Could not find album track for matched download:', albumIndex, trackIndex);
-        showToast('Error preparing matched download.', 'error');
-        return;
-    }
-    const albumData = results[albumIndex];
-    const trackData = albumData.tracks[trackIndex];
-
-    // This is the definitive fix.
-    // The second argument MUST be 'false' to treat this as a single track download,
-    // which prevents the modal from asking for an album selection.
-    openMatchingModal(trackData, false, albumData);
-}
+// The basic-search filter/sort controls lived here: initializeFilters,
+// handleFilterClick, resetFilters, applyFiltersAndSort and
+// calculateRelevanceScore. They are React's now
+// (webui/src/routes/search/-basic.helpers.ts), where four defects in them were
+// fixed rather than carried over — see that file's header.
+
+// the matched-download modal that lived here is gone: basic search's
+// enriched download is a React modal now (webui/src/routes/search/-ui/enriched-modal.tsx)
 
 // ===========================================
 // == DASHBOARD DATABASE UPDATER FUNCTIONALITY ==
@@ -2713,11 +1661,13 @@ async function handleReconcileIdsButtonClick() {
     if (!button) return;
     if (button.textContent.trim() !== 'Scan Library') return; // already running
 
-    const ok = confirm(
-        'Scan every library file for embedded provider IDs and fill any that are ' +
-        'missing in the database?\n\nEach file is read once. Existing matches are ' +
-        'never overwritten. This can take a while on large libraries.'
-    );
+    const ok = await showConfirmDialog({
+        title: 'Import IDs from File Tags',
+        message: 'Scan every library file for embedded provider IDs and fill any that are ' +
+            'missing in the database?\n\nEach file is read once. Existing matches are ' +
+            'never overwritten. This can take a while on large libraries.',
+        confirmText: 'Scan Library'
+    });
     if (!ok) return;
 
     try {
@@ -3191,8 +2141,10 @@ async function loadLibraryHistory() {
         // Update tab counts
         const dlCount = document.getElementById('history-download-count');
         const imCount = document.getElementById('history-import-count');
+        const pcCount = document.getElementById('history-podcast-count');
         if (dlCount) dlCount.textContent = data.stats?.downloads || 0;
         if (imCount) imCount.textContent = data.stats?.imports || 0;
+        if (pcCount) pcCount.textContent = data.stats?.podcasts || 0;
 
         // Source breakdown bar (downloads tab only)
         const sourceBar = document.getElementById('history-source-bar');
@@ -3200,7 +2152,7 @@ async function loadLibraryHistory() {
             const sc = data.stats?.source_counts || {};
             const srcEntries = Object.entries(sc).sort((a, b) => b[1] - a[1]);
             if (srcEntries.length > 0 && tab === 'download') {
-                const _srcColors = { Soulseek: '#4caf50', Tidal: '#000', YouTube: '#ff0000', Qobuz: '#4285f4', HiFi: '#00bcd4', Deezer: '#a238ff', Lidarr: '#5dade2', Amazon: '#ff9900', SoundCloud: '#ff7700', Torrent: '#5dade2', Usenet: '#a78bfa', Staging: '#888', 'Auto-Import': '#888' };
+                const _srcColors = { Soulseek: '#4caf50', Tidal: '#000', YouTube: '#ff0000', Qobuz: '#4285f4', HiFi: '#00bcd4', Deezer: '#a238ff', Lidarr: '#5dade2', Amazon: '#ff9900', SoundCloud: '#ff7700', Torrent: '#5dade2', Usenet: '#a78bfa', Staging: '#888', 'Auto-Import': '#888', Podcast: '#c084fc' };
                 sourceBar.innerHTML = srcEntries.map(([src, cnt]) =>
                     `<span class="history-source-chip" style="border-color:${_srcColors[src] || '#888'};color:${_srcColors[src] || '#888'}">${src}: ${cnt}</span>`
                 ).join('');
@@ -3211,10 +2163,12 @@ async function loadLibraryHistory() {
         }
 
         if (!data.entries || data.entries.length === 0) {
-            const emptyIcon = tab === 'download' ? '📥' : '📚';
+            const emptyIcon = tab === 'download' ? '📥' : (tab === 'podcast' ? '🎙️' : '📚');
             const emptyText = tab === 'download'
                 ? 'No downloads recorded yet. Completed downloads will appear here.'
-                : 'No server imports recorded yet. New tracks from library scans will appear here.';
+                : (tab === 'podcast'
+                    ? 'No podcast downloads recorded yet. Downloaded episodes will appear here.'
+                    : 'No server imports recorded yet. New tracks from library scans will appear here.');
             list.innerHTML = `<div class="library-history-empty">${emptyIcon}<br><br>${emptyText}</div>`;
             return;
         }
@@ -3233,10 +2187,11 @@ async function loadLibraryHistory() {
 
 function renderHistoryEntry(entry) {
     // Server import thumb_urls are relative paths (e.g. /library/metadata/...) — use placeholder
+    const placeholderIcon = entry.event_type === 'download' ? '📥' : (entry.event_type === 'podcast' ? '🎙️' : '📚');
     const hasValidThumb = entry.thumb_url && (entry.thumb_url.startsWith('http://') || entry.thumb_url.startsWith('https://'));
     const thumb = hasValidThumb
-        ? `<img src="${escapeHtml(entry.thumb_url)}" class="library-history-thumb" loading="lazy" onerror="this.outerHTML='<div class=\\'library-history-thumb-placeholder\\'>${entry.event_type === 'download' ? '📥' : '📚'}</div>'">`
-        : `<div class="library-history-thumb-placeholder">${entry.event_type === 'download' ? '📥' : '📚'}</div>`;
+        ? `<img src="${escapeHtml(entry.thumb_url)}" class="library-history-thumb" loading="lazy" onerror="this.outerHTML='<div class=\\'library-history-thumb-placeholder\\'>${placeholderIcon}</div>'">`
+        : `<div class="library-history-thumb-placeholder">${placeholderIcon}</div>`;
 
     let badge = '';
     if (entry.event_type === 'download') {
@@ -3247,6 +2202,11 @@ function renderHistoryEntry(entry) {
             const cls = String(p || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
             return `<span class="library-history-badge download source-${escapeHtml(cls)}">${escapeHtml(p)}</span>`;
         }).join('');
+    } else if (entry.event_type === 'podcast') {
+        badge = `<span class="library-history-badge podcast">Podcast</span>`;
+        if (entry.quality) {
+            badge += ` <span class="library-history-badge download">${escapeHtml(entry.quality)}</span>`;
+        }
     } else if (entry.event_type === 'import' && entry.server_source) {
         const sourceName = { plex: 'Plex', jellyfin: 'Jellyfin', navidrome: 'Navidrome' }[entry.server_source] || entry.server_source;
         badge = `<span class="library-history-badge import">${escapeHtml(sourceName)}</span>`;
@@ -3287,6 +2247,20 @@ function renderHistoryEntry(entry) {
             if (entry.source_filename) fileParts.push(`<span class="lh-prov-label">File:</span> ${escapeHtml(entry.source_filename)}`);
             if (entry.source_track_id) fileParts.push(`<span class="lh-prov-label">${entry.source_filename ? '' : 'Source '}ID:</span> ${escapeHtml(entry.source_track_id)}`);
             lines.push(fileParts.join(` <span class="lh-prov-dim">·</span> `));
+        }
+        if (lines.length > 0) {
+            sourceDetail = `<div class="library-history-entry-source">${lines.join('<br>')}</div>`;
+        }
+    } else if (entry.event_type === 'podcast') {
+        const lines = [];
+        if (entry.title) {
+            lines.push(`<span class="lh-prov-label">Episode:</span> ${escapeHtml(entry.title)}`);
+        }
+        if (entry.artist_name || entry.album_name) {
+            lines.push(`<span class="lh-prov-label">Podcast:</span> ${escapeHtml(entry.artist_name || entry.album_name)}`);
+        }
+        if (entry.source_filename || entry.file_path) {
+            lines.push(`<span class="lh-prov-label">File:</span> ${escapeHtml(entry.source_filename || entry.file_path)}`);
         }
         if (lines.length > 0) {
             sourceDetail = `<div class="library-history-entry-source">${lines.join('<br>')}</div>`;
@@ -4313,7 +3287,15 @@ async function _startSyncHistoryResync(entryId, entry) {
         }
 
         // Store active re-sync state
-        _activeSyncHistoryResyncs[entryId] = { syncPlaylistId, entryId };
+        _activeSyncHistoryResyncs[entryId] = { syncPlaylistId, entryId, playlistName: entry.playlist_name };
+        if (typeof updateMusicSyncTask === 'function') {
+            updateMusicSyncTask({
+                playlist_id: syncPlaylistId,
+                playlist_name: entry.playlist_name,
+                status: 'starting',
+                progress: { progress: 0, total_tracks: tracks.length, playlist_name: entry.playlist_name },
+            });
+        }
 
         // Start polling for progress
         _pollSyncHistoryProgress(entryId, syncPlaylistId);
@@ -4328,6 +3310,7 @@ async function _startSyncHistoryResync(entryId, entry) {
 function _pollSyncHistoryProgress(entryId, syncPlaylistId) {
     const pollInterval = setInterval(async () => {
         try {
+            const active = _activeSyncHistoryResyncs[entryId];
             const resp = await fetch(`/api/sync/status/${syncPlaylistId}`);
             if (!resp.ok) {
                 clearInterval(pollInterval);
@@ -4335,6 +3318,9 @@ function _pollSyncHistoryProgress(entryId, syncPlaylistId) {
                 return;
             }
             const state = await resp.json();
+            const syncFrame = { playlist_id: syncPlaylistId, playlist_name: active?.playlistName || '', ...state };
+            window.dispatchEvent(new CustomEvent('ss:sync-progress', { detail: syncFrame }));
+            if (typeof updateMusicSyncTask === 'function') updateMusicSyncTask(syncFrame);
 
             if (state.status === 'syncing' || state.status === 'starting') {
                 const progress = state.progress || {};
@@ -5010,7 +3996,7 @@ async function openMetadataCacheDetail(source, entityType, entityId) {
             addRow('Disc Number', data.disc_number);
             addRow('Explicit', data.explicit ? 'Yes' : 'No');
             addRow('ISRC', data.isrc);
-            if (data.preview_url) addRow('Preview', `<a href="${data.preview_url}" target="_blank" style="color:var(--accent,#6d5dfc)">Listen</a>`);
+            if (data.preview_url) addRow('Preview', `<a href="${data.preview_url}" target="_blank" style="color:var(--accent)">Listen</a>`);
         }
 
         fieldsHtml += '</table>';
@@ -5079,7 +4065,12 @@ function toggleMcacheClearDropdown(event) {
 }
 
 async function clearMetadataCache() {
-    if (!confirm('Clear ALL cached metadata? This removes all cached API responses.')) return;
+    if (!await showConfirmDialog({
+        title: 'Clear Metadata Cache',
+        message: 'Clear ALL cached metadata? This removes every cached API response — lookups will have to be made again.',
+        confirmText: 'Clear All',
+        destructive: true
+    })) return;
     document.getElementById('mcache-clear-dropdown-menu').style.display = 'none';
 
     try {
@@ -5099,7 +4090,12 @@ async function clearMetadataCache() {
 }
 
 async function clearMetadataCacheBySource(source) {
-    if (!confirm(`Clear all ${source} cached metadata?`)) return;
+    if (!await showConfirmDialog({
+        title: 'Clear Cache by Source',
+        message: `Clear all ${source} cached metadata?`,
+        confirmText: 'Clear',
+        destructive: true
+    })) return;
     document.getElementById('mcache-clear-dropdown-menu').style.display = 'none';
 
     try {
@@ -5120,7 +4116,12 @@ async function clearMetadataCacheBySource(source) {
 
 async function clearMusicBrainzCache(failedOnly = false) {
     const label = failedOnly ? 'failed MusicBrainz lookups' : 'ALL MusicBrainz cache entries';
-    if (!confirm(`Clear ${label}?`)) return;
+    if (!await showConfirmDialog({
+        title: 'Clear MusicBrainz Cache',
+        message: `Clear ${label}?`,
+        confirmText: 'Clear',
+        destructive: !failedOnly
+    })) return;
     document.getElementById('mcache-clear-dropdown-menu').style.display = 'none';
 
     try {
@@ -5217,6 +4218,34 @@ const TOOL_HELP_CONTENT = {
             <p>Available for <strong>Plex</strong> and <strong>Jellyfin</strong> media servers. Each enrichment worker only runs if its service is authenticated.</p>
         `
     },
+    'reconcile-ids': {
+        title: 'Import IDs from File Tags',
+        content: `
+            <h4>What does this tool do?</h4>
+            <p>Reads provider IDs that are already embedded in your audio files — Spotify, MusicBrainz, iTunes, Deezer and friends — and fills them into the database where they're missing.</p>
+
+            <h4>Why it's worth running</h4>
+            <p>Every ID it recovers is one the enrichment workers no longer have to go looking for. On a large library that's a lot of API calls skipped, and matches that were already correct in your tags get used instead of being re-guessed.</p>
+
+            <h4>How safe is it?</h4>
+            <ul>
+                <li><strong>Only fills blanks.</strong> An existing match is never overwritten.</li>
+                <li><strong>Read-only on your files.</strong> Each file is opened once to read tags; nothing is written back to disk.</li>
+                <li><strong>Conflicts are skipped, not applied.</strong> If a tag disagrees with a stored ID, the row is counted under Conflicts and left alone.</li>
+            </ul>
+
+            <h4>The counters</h4>
+            <ul>
+                <li><strong>IDs Filled:</strong> individual provider IDs written</li>
+                <li><strong>Rows Updated:</strong> database rows touched (a row can gain several IDs)</li>
+                <li><strong>Conflicts:</strong> tag disagreed with an existing match — skipped</li>
+                <li><strong>Unreadable:</strong> files whose tags could not be parsed</li>
+            </ul>
+
+            <h4>Note</h4>
+            <p>Reads every file in the library, so it can take a while on large collections. Safe to re-run — a second pass only picks up what's still blank.</p>
+        `
+    },
     'duplicate-cleaner': {
         title: 'Duplicate Cleaner',
         content: `
@@ -5240,7 +4269,7 @@ const TOOL_HELP_CONTENT = {
             </ol>
 
             <h4>Where do deleted files go?</h4>
-            <p>Removed files are moved to <code>Transfer/deleted/</code> folder (not permanently deleted). You can review and recover them if needed.</p>
+            <p>Removed files are moved to <code>Transfer/.deleted/</code> folder (not permanently deleted). You can review and recover them if needed.</p>
 
             <h4>Safety Features</h4>
             <ul>
@@ -5637,17 +4666,17 @@ const TOOL_HELP_CONTENT = {
 
             <h4>Good for</h4>
             <ul>
-                <li>Auto-discovering new tracks after a playlist updates</li>
+                <li>Auto-identifying new tracks after a playlist updates</li>
                 <li>Auto-syncing the playlist to your media server</li>
                 <li>Getting notified when your followed playlists change</li>
             </ul>
         `
     },
     'auto-discovery_completed': {
-        title: 'Discovery Complete',
+        title: 'Identification Complete',
         content: `
             <h4>What is this trigger?</h4>
-            <p>Fires when Spotify/iTunes metadata discovery finishes for a mirrored playlist. Discovery is the process of matching playlist tracks to official Spotify or iTunes metadata.</p>
+            <p>Fires when Spotify/iTunes metadata identification finishes for a mirrored playlist. Identification is the process of matching playlist tracks to official Spotify or iTunes metadata.</p>
 
             <h4>Conditions</h4>
             <ul>
@@ -5659,8 +4688,8 @@ const TOOL_HELP_CONTENT = {
 
             <h4>Good for</h4>
             <ul>
-                <li>Auto-syncing a playlist after discovery completes</li>
-                <li>Getting notified about discovery results (how many matched vs failed)</li>
+                <li>Auto-syncing a playlist after identification completes</li>
+                <li>Getting notified about identification results (how many matched vs failed)</li>
             </ul>
         `
     },
@@ -5958,22 +4987,22 @@ const TOOL_HELP_CONTENT = {
         `
     },
     'auto-discover_playlist': {
-        title: 'Discover Playlist',
+        title: 'Identify Playlist Tracks',
         content: `
             <h4>What does this action do?</h4>
             <p>Finds official Spotify or iTunes metadata for tracks in a mirrored playlist. This is required before syncing — it matches each track to a known release so it can be found in your library.</p>
 
             <h4>Configuration</h4>
             <ul>
-                <li><strong>Playlist:</strong> Select a specific playlist, or check "Discover all" to process all mirrored playlists</li>
+                <li><strong>Playlist:</strong> Select a specific playlist, or check "Identify all" to process all mirrored playlists</li>
             </ul>
 
             <h4>How it works</h4>
             <ol>
                 <li>Takes each track name and artist from the mirror</li>
                 <li>Searches Spotify (or iTunes as fallback) for a match</li>
-                <li>Stores the best match with confidence score in the discovery cache</li>
-                <li>Already-discovered tracks are skipped for efficiency</li>
+                <li>Stores the best match with confidence score in the identification cache</li>
+                <li>Already-identified tracks are skipped for efficiency</li>
             </ol>
         `
     },
@@ -5984,7 +5013,7 @@ const TOOL_HELP_CONTENT = {
             <p>Runs the full playlist lifecycle in one automation — no signal wiring needed. Executes four phases sequentially:</p>
             <ol>
                 <li><strong>Refresh</strong> — Re-fetches playlist tracks from the source platform (Spotify, Tidal, YouTube, Deezer)</li>
-                <li><strong>Discover</strong> — Matches each track to official metadata (Spotify/iTunes/Deezer IDs)</li>
+                <li><strong>Identify</strong> — Matches each track to official metadata (Spotify/iTunes/Deezer IDs)</li>
                 <li><strong>Sync</strong> — Pushes the playlist to your media server (Plex, Jellyfin, Navidrome)</li>
                 <li><strong>Download Missing</strong> — Queues unmatched tracks to the wishlist for automatic download</li>
             </ol>
@@ -5999,7 +5028,7 @@ const TOOL_HELP_CONTENT = {
             <p>Set this on a schedule (e.g., every 6 hours). Between runs, the wishlist processor downloads missing tracks in the background. On the next pipeline run, those newly downloaded tracks will match during the sync phase — so your server playlist gets more complete with each cycle until fully synced.</p>
 
             <h4>Replaces</h4>
-            <p>This single automation replaces the 4-automation signal chain pattern (Refresh → signal → Discover → signal → Sync → signal → Download). No signals, no chaining, no room for misconfiguration.</p>
+            <p>This single automation replaces the 4-automation signal chain pattern (Refresh → signal → Identify → signal → Sync → signal → Download). No signals, no chaining, no room for misconfiguration.</p>
         `
     },
     'auto-notify_only': {
@@ -6035,7 +5064,7 @@ const TOOL_HELP_CONTENT = {
             <p>Scans your output folder for duplicate audio files (same filename, different format) and removes the lower-quality version. For example, if you have both <code>Song.flac</code> and <code>Song.mp3</code>, the MP3 is removed.</p>
 
             <h4>Safety</h4>
-            <p>Removed files are moved to a <code>deleted/</code> subfolder, not permanently deleted. You can recover them if needed.</p>
+            <p>Removed files are moved to a hidden <code>.deleted/</code> subfolder your media server ignores, not permanently deleted. You can recover them if needed.</p>
         `
     },
     'auto-clear_quarantine': {
@@ -6046,6 +5075,19 @@ const TOOL_HELP_CONTENT = {
 
             <h4>Warning</h4>
             <p>This permanently deletes files. Make sure you've reviewed quarantined files before setting up an automation for this.</p>
+        `
+    },
+    'auto-library_cleanup': {
+        title: 'Clear Quarantine + Empty Recycle Bin',
+        content: `
+            <h4>What does this action do?</h4>
+            <p>Two bins in one sweep. First it deletes everything in the download quarantine (downloads that failed verification). Then it empties the recycle bin, where the duplicate cleaner and repair tools put files they removed. Either half can be switched off in the action's settings.</p>
+
+            <h4>The recycle bin keep window</h4>
+            <p>The Recycle Bin tab on the Downloads page has a keep window. When one is set, this action only deletes files older than it. When it is on "keep forever", switching this automation on means you want the bin emptied, so it deletes everything in it.</p>
+
+            <h4>Warning</h4>
+            <p>This permanently deletes files. The seeded "Weekly Cleanup" automation runs it and ships switched off for that reason.</p>
         `
     },
     'auto-cleanup_wishlist': {
@@ -6424,22 +5466,30 @@ const TOOL_HELP_CONTENT = {
     }
 };
 
+// Called from initializeToolsPage() on EVERY visit to the Tools page, so every
+// binding here has to be idempotent. It used to add a fresh listener per call —
+// including a document-level keydown — so N visits left N keydown handlers and N
+// click handlers per help button. Guarded the same way the tool buttons in
+// initializeToolsPage are (`_toolsWired`).
 function initializeToolHelpButtons() {
-    const helpButtons = document.querySelectorAll('.tool-help-button');
-    const modal = document.getElementById('tool-help-modal');
-    const closeButton = modal.querySelector('.tool-help-modal-close');
-
-    // Attach click handlers to all help buttons
-    helpButtons.forEach(button => {
+    document.querySelectorAll('.tool-help-button').forEach(button => {
+        if (button._toolsWired) return;
         button.addEventListener('click', (e) => {
             e.stopPropagation();
-            const toolId = button.getAttribute('data-tool');
-            openToolHelpModal(toolId);
+            openToolHelpModal(button.getAttribute('data-tool'));
         });
+        button._toolsWired = true;
     });
 
-    // Close modal when clicking close button
-    closeButton.addEventListener('click', closeToolHelpModal);
+    // The modal itself lives outside #tools-page (index.html), so it survives
+    // navigation — bind it once and never again. Also guard the lookup: a throw
+    // here used to abort initializeToolsPage before the DB/cache/pool stats and
+    // switchRepairTab('jobs') ever ran.
+    const modal = document.getElementById('tool-help-modal');
+    if (!modal || modal._toolsWired) return;
+
+    const closeButton = modal.querySelector('.tool-help-modal-close');
+    if (closeButton) closeButton.addEventListener('click', closeToolHelpModal);
 
     // Close modal when clicking outside content
     modal.addEventListener('click', (e) => {
@@ -6448,12 +5498,7 @@ function initializeToolHelpButtons() {
         }
     });
 
-    // Close modal on Escape key
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && modal.classList.contains('active')) {
-            closeToolHelpModal();
-        }
-    });
+    modal._toolsWired = true;
 }
 
 function openToolHelpModal(toolId) {
@@ -7061,8 +6106,6 @@ function stopWishlistCountPolling() {
     }
 }
 
-
-
 function resetWishlistModalToIdleState() {
     // Reset wishlist modal to idle state after background processing completes
     const playlistId = 'wishlist';
@@ -7196,38 +6239,14 @@ async function initializeToolsPage() {
     await checkAndUpdateDbProgress();
     await checkAndUpdateDuplicateCleanProgress();
 
-    // Initialize library maintenance section
+    // Initialize library maintenance section. switchRepairTab('jobs') was here
+    // and its renderer is gone: 'tools' is a React route, this whole function
+    // has had no callers since that flip, and the vanilla repair-tab renderers
+    // it was the sole path to were deleted with it. updateRepairStatus stays —
+    // it is still reached from openRepairModal.
     updateRepairStatus();
-    switchRepairTab('jobs');
 
     toolsPageState.isInitialized = true;
-}
-
-async function loadDashboardData() {
-    // Start periodic refreshers up front (independent of the initial loads).
-    stopWishlistCountPolling(); // Ensure no duplicates
-    wishlistCountInterval = setInterval(updateWishlistCount, 10000);
-    setInterval(fetchAndUpdateSystemStats, 10000);   // dashboard-specific (service status polled globally)
-    setInterval(fetchAndUpdateActivityFeed, 2000);   // responsive activity feed
-    setInterval(checkForActivityToasts, 3000);
-
-    // Fire all independent initial loads in parallel instead of sequentially.
-    // Sequential awaits meant 6 back-to-back round-trips, each triggering its own
-    // reflow — the layout kept shifting for ~1-2s, which made the page feel
-    // unscrollable. Concurrent loads collapse that into a single settle.
-    await Promise.all([
-        updateWishlistCount(),
-        fetchAndUpdateServiceStatus(),
-        fetchAndUpdateSystemStats(),
-        fetchAndUpdateDbStats(),
-        fetchAndUpdateActivityFeed(),
-        checkForActiveProcesses(),
-    ]);
-
-    // Render existing downloads once active processes are known.
-    updateDashboardDownloads();
-
-    // Automatic wishlist processing now runs server-side
 }
 
 // --- Data Fetching and UI Updates ---
@@ -7240,330 +6259,20 @@ async function fetchAndUpdateDbStats() {
 
         const stats = await response.json();
 
-        // This function updates the stat cards in the top grid
-        updateDashboardStatCards(stats);
-
-        // This function updates the info within the DB Updater tool card
-        updateDbUpdaterCardInfo(stats);
+        // Re-broadcast on the socket handler's channel (the poller-twin rule,
+        // same as fetchAndUpdateServiceStatus): the React dashboard Library
+        // card consumes ss:dashboard-db-stats, and the vanilla DOM halves this
+        // used to call (updateDashboardStatCards / updateDbUpdaterCardInfo)
+        // wrote what is React DOM now. Exactly one of the two dispatchers runs
+        // at a time — this one early-returns while the socket is connected.
+        window.dispatchEvent(new CustomEvent('ss:dashboard-db-stats', { detail: stats }));
 
     } catch (error) {
         console.warn('Could not fetch DB stats:', error);
     }
 }
 
-function updateDashboardStatCards(stats) {
-    // Update the Library Status card on the dashboard
-    updateLibraryStatusCard(stats);
-}
-
-/**
- * Smart Library Status card on the Dashboard.
- * Shows different states: no server, empty library, healthy library, scanning.
- */
-function updateLibraryStatusCard(dbStats) {
-    const card = document.getElementById('library-status-card');
-    if (!card) return;
-
-    const title = document.getElementById('library-status-title');
-    const subtitle = document.getElementById('library-status-subtitle');
-    const statsRow = document.getElementById('library-status-stats');
-    const scanBtn = document.getElementById('library-status-scan-btn');
-    const scanLabel = document.getElementById('library-status-scan-label');
-    const deepBtn = document.getElementById('library-status-deep-btn');
-    const progressDiv = document.getElementById('library-status-progress');
-    const messageDiv = document.getElementById('library-status-message');
-
-    const artists = dbStats ? (dbStats.artists || 0) : 0;
-    const albums = dbStats ? (dbStats.albums || 0) : 0;
-    const tracks = dbStats ? (dbStats.tracks || 0) : 0;
-    const sizeMb = dbStats ? (dbStats.database_size_mb || 0) : 0;
-    const lastUpdate = dbStats ? dbStats.last_update : null;
-    const serverSource = dbStats ? dbStats.server_source : null;
-
-    // Check if a scan is in progress
-    const isScanning = window._libraryStatusScanning || false;
-
-    // Determine state
-    const serverConnected = _lastStatusPayload && _lastStatusPayload.media_server && _lastStatusPayload.media_server.connected;
-    const serverType = _lastStatusPayload && _lastStatusPayload.active_media_server;
-    const hasData = tracks > 0;
-    const hasServer = !!serverType && serverType !== 'none';
-
-    // Reset classes
-    card.className = 'library-status-card';
-
-    if (isScanning) {
-        // State: Scanning
-        card.classList.add('scanning');
-        if (title) title.textContent = 'Library Scan';
-        if (subtitle) subtitle.textContent = 'Updating library database...';
-        if (scanBtn) {
-            scanBtn.style.display = '';
-            scanBtn.classList.add('scanning');
-            scanLabel.textContent = 'Stop';
-            scanBtn.disabled = false;
-        }
-        if (deepBtn) deepBtn.style.display = 'none';
-        if (statsRow) statsRow.style.display = hasData ? '' : 'none';
-        if (progressDiv) progressDiv.style.display = '';
-        if (messageDiv) messageDiv.style.display = 'none';
-
-    } else if (!hasServer) {
-        // State: No server configured
-        card.classList.add('needs-setup');
-        if (title) title.textContent = 'No Media Server';
-        if (subtitle) subtitle.textContent = 'Connect a server to get started';
-        if (scanBtn) scanBtn.style.display = 'none';
-        if (deepBtn) deepBtn.style.display = 'none';
-        if (statsRow) statsRow.style.display = 'none';
-        if (progressDiv) progressDiv.style.display = 'none';
-        if (messageDiv) {
-            messageDiv.style.display = '';
-            messageDiv.innerHTML = 'SoulSync needs a media server to manage your library. '
-                + 'Go to <span class="link" onclick="navigateToPage(\'settings\')">Settings</span> '
-                + 'to connect Plex, Jellyfin, or Navidrome.';
-        }
-
-    } else if (!serverConnected) {
-        // State: Server configured but not connected
-        card.classList.add('needs-setup');
-        const serverName = _capitalize(serverType);
-        if (title) title.textContent = `${serverName} — Disconnected`;
-        if (subtitle) subtitle.textContent = 'Cannot reach your media server';
-        if (scanBtn) scanBtn.style.display = 'none';
-        if (deepBtn) deepBtn.style.display = 'none';
-        if (statsRow) statsRow.style.display = 'none';
-        if (progressDiv) progressDiv.style.display = 'none';
-        if (messageDiv) {
-            messageDiv.style.display = '';
-            messageDiv.innerHTML = `Your ${serverName} server is configured but not responding. `
-                + 'Check that it\'s running and the connection details are correct in '
-                + '<span class="link" onclick="navigateToPage(\'settings\')">Settings</span>.';
-        }
-
-    } else if (!hasData) {
-        // State: Server connected but library is empty
-        card.classList.add('empty-library');
-        const serverName = _capitalize(serverType);
-        if (title) title.textContent = `${serverName} Connected`;
-        if (subtitle) subtitle.textContent = 'Library database is empty';
-        if (scanBtn) {
-            scanBtn.style.display = '';
-            scanBtn.classList.remove('scanning');
-            scanLabel.textContent = 'Scan Now';
-            scanBtn.disabled = false;
-        }
-        if (deepBtn) deepBtn.style.display = 'none';
-        if (statsRow) statsRow.style.display = 'none';
-        if (progressDiv) progressDiv.style.display = 'none';
-        if (messageDiv) {
-            messageDiv.style.display = '';
-            messageDiv.innerHTML = 'Your server is connected but SoulSync hasn\'t imported your library yet. '
-                + 'Click <strong>Scan Now</strong> to pull your artists, albums, and tracks into SoulSync.';
-        }
-
-    } else {
-        // State: Healthy library with data
-        card.classList.add('has-data');
-        const serverName = _capitalize(serverType);
-        let lastRefreshText = 'Never';
-        if (lastUpdate) {
-            const d = new Date(lastUpdate);
-            if (!isNaN(d.getTime())) {
-                lastRefreshText = typeof _formatTimeAgo === 'function' ? _formatTimeAgo(d) : d.toLocaleDateString();
-            }
-        }
-        if (title) title.textContent = `${serverName} Library`;
-        if (subtitle) subtitle.textContent = `Last refreshed ${lastRefreshText}`;
-        if (scanBtn) {
-            scanBtn.style.display = '';
-            scanBtn.classList.remove('scanning');
-            scanLabel.textContent = 'Refresh';
-            scanBtn.disabled = false;
-        }
-        if (deepBtn) deepBtn.style.display = '';
-        if (statsRow) {
-            statsRow.style.display = '';
-            document.getElementById('library-status-artists').textContent = artists.toLocaleString();
-            document.getElementById('library-status-albums').textContent = albums.toLocaleString();
-            document.getElementById('library-status-tracks').textContent = tracks.toLocaleString();
-            document.getElementById('library-status-size').textContent = sizeMb < 1 ? `${Math.round(sizeMb * 1024)} KB` : `${sizeMb.toFixed(1)} MB`;
-        }
-        if (progressDiv) progressDiv.style.display = 'none';
-        if (messageDiv) messageDiv.style.display = 'none';
-    }
-}
-
 // _lastStatusPayload and _isSoulsyncStandalone are declared in core.js
-const _origFetchServiceStatus = typeof fetchAndUpdateServiceStatus === 'function' ? fetchAndUpdateServiceStatus : null;
-
-function _capitalize(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
-
-/**
- * Dashboard library scan button handler — triggers incremental DB update.
- */
-async function dashboardLibraryScan(fullRefresh = false) {
-    const scanBtn = document.getElementById('library-status-scan-btn');
-    const scanLabel = document.getElementById('library-status-scan-label');
-
-    // If already scanning, stop it
-    if (window._libraryStatusScanning) {
-        try {
-            await fetch('/api/database/update/stop', { method: 'POST' });
-            window._libraryStatusScanning = false;
-            showToast('Library scan stopped', 'info');
-            // Refresh the card
-            try {
-                const r = await fetch('/api/database/stats');
-                if (r.ok) updateLibraryStatusCard(await r.json());
-            } catch (e) {}
-        } catch (e) {
-            showToast('Failed to stop scan', 'error');
-        }
-        return;
-    }
-
-    // Start scan
-    try {
-        window._libraryStatusScanning = true;
-        updateLibraryStatusCard(null); // Update to scanning state
-
-        const response = await fetch('/api/database/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ full_refresh: fullRefresh })
-        });
-        const data = await response.json();
-        if (!data.success) {
-            window._libraryStatusScanning = false;
-            showToast(data.error || 'Failed to start scan', 'error');
-            return;
-        }
-
-        showToast('Library scan started', 'success');
-
-        // Poll for progress
-        const pollInterval = setInterval(async () => {
-            try {
-                const statusResp = await fetch('/api/database/update/status');
-                if (!statusResp.ok) return;
-                const status = await statusResp.json();
-
-                const phase = document.getElementById('library-status-phase');
-                const barFill = document.getElementById('library-status-bar-fill');
-                const detail = document.getElementById('library-status-progress-detail');
-
-                if (phase) phase.textContent = status.phase || 'Scanning...';
-                if (barFill) barFill.style.width = `${status.progress || 0}%`;
-                if (detail && status.processed !== undefined) {
-                    detail.textContent = `${status.processed} / ${status.total || '?'}`;
-                }
-
-                if (status.status === 'completed' || status.status === 'finished' || status.status === 'error' || status.status === 'idle') {
-                    clearInterval(pollInterval);
-                    window._libraryStatusScanning = false;
-
-                    if (status.status === 'completed' || status.status === 'finished') {
-                        showToast('Library scan complete', 'success');
-                    } else if (status.status === 'error') {
-                        showToast(`Scan error: ${status.error_message || 'Unknown'}`, 'error');
-                    }
-
-                    // Refresh stats
-                    try {
-                        const r = await fetch('/api/database/stats');
-                        if (r.ok) updateLibraryStatusCard(await r.json());
-                    } catch (e) {}
-                }
-            } catch (e) {
-                clearInterval(pollInterval);
-                window._libraryStatusScanning = false;
-            }
-        }, 2000);
-
-    } catch (e) {
-        window._libraryStatusScanning = false;
-        showToast(`Scan failed: ${e.message}`, 'error');
-    }
-}
-
-/**
- * Dashboard deep scan — finds new tracks, removes stale ones, preserves enrichment data.
- */
-async function dashboardLibraryDeepScan() {
-    if (window._libraryStatusScanning) {
-        showToast('A scan is already running', 'warning');
-        return;
-    }
-
-    if (!await showConfirmDialog({
-        title: 'Deep Scan Library',
-        message: 'A deep scan re-checks every track in your media server library.\n\n' +
-                 '• Adds any new tracks that were missed\n' +
-                 '• Removes tracks no longer on your server\n' +
-                 '• Preserves all existing metadata and enrichment data\n\n' +
-                 'This may take a while for large libraries. Continue?',
-    })) return;
-
-    // Use the same scan flow as dashboardLibraryScan but with deep_scan flag
-    try {
-        window._libraryStatusScanning = true;
-        updateLibraryStatusCard(null);
-
-        const response = await fetch('/api/database/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ deep_scan: true })
-        });
-        const data = await response.json();
-        if (!data.success) {
-            window._libraryStatusScanning = false;
-            showToast(data.error || 'Failed to start deep scan', 'error');
-            try { const r = await fetch('/api/database/stats'); if (r.ok) updateLibraryStatusCard(await r.json()); } catch (e) {}
-            return;
-        }
-
-        showToast('Deep scan started — this may take a while', 'success');
-
-        const pollInterval = setInterval(async () => {
-            try {
-                const statusResp = await fetch('/api/database/update/status');
-                if (!statusResp.ok) return;
-                const status = await statusResp.json();
-
-                const phase = document.getElementById('library-status-phase');
-                const barFill = document.getElementById('library-status-bar-fill');
-                const detail = document.getElementById('library-status-progress-detail');
-
-                if (phase) phase.textContent = status.phase || 'Deep scanning...';
-                if (barFill) barFill.style.width = `${status.progress || 0}%`;
-                if (detail && status.processed !== undefined) {
-                    detail.textContent = `${status.processed} / ${status.total || '?'}`;
-                }
-
-                if (status.status === 'completed' || status.status === 'finished' || status.status === 'error' || status.status === 'idle') {
-                    clearInterval(pollInterval);
-                    window._libraryStatusScanning = false;
-
-                    if (status.status === 'completed' || status.status === 'finished') {
-                        showToast('Deep scan complete', 'success');
-                    } else if (status.status === 'error') {
-                        showToast(`Deep scan error: ${status.error_message || 'Unknown'}`, 'error');
-                    }
-
-                    try { const r = await fetch('/api/database/stats'); if (r.ok) updateLibraryStatusCard(await r.json()); } catch (e) {}
-                }
-            } catch (e) {
-                clearInterval(pollInterval);
-                window._libraryStatusScanning = false;
-            }
-        }, 2000);
-
-    } catch (e) {
-        window._libraryStatusScanning = false;
-        showToast(`Deep scan failed: ${e.message}`, 'error');
-    }
-}
 
 /**
  * Update the Active Downloads section on the dashboard.
@@ -7712,38 +6421,6 @@ function createDashboardDiscoverBubble(playlistId) {
     `;
 }
 
-
-
-function updateDbUpdaterCardInfo(stats) {
-    // Update the detailed stats within the DB Updater tool card
-    const lastRefreshEl = document.getElementById('db-last-refresh');
-    const artistsStatEl = document.getElementById('db-stat-artists');
-    const albumsStatEl = document.getElementById('db-stat-albums');
-    const tracksStatEl = document.getElementById('db-stat-tracks');
-    const sizeStatEl = document.getElementById('db-stat-size');
-
-    if (lastRefreshEl) {
-        if (stats.last_full_refresh) {
-            const date = new Date(stats.last_full_refresh);
-            lastRefreshEl.textContent = date.toLocaleString();
-        } else {
-            lastRefreshEl.textContent = 'Never';
-        }
-    }
-
-    if (artistsStatEl) artistsStatEl.textContent = stats.artists.toLocaleString() || '0';
-    if (albumsStatEl) albumsStatEl.textContent = stats.albums.toLocaleString() || '0';
-    if (tracksStatEl) tracksStatEl.textContent = stats.tracks.toLocaleString() || '0';
-    if (sizeStatEl) sizeStatEl.textContent = `${stats.database_size_mb.toFixed(2)} MB`;
-
-    // Update the title of the tool card to show which server is active
-    const toolCardTitle = document.querySelector('#db-updater-card .tool-card-title');
-    if (toolCardTitle && stats.server_source) {
-        const serverName = stats.server_source.charAt(0).toUpperCase() + stats.server_source.slice(1);
-        toolCardTitle.textContent = `${serverName} Database Updater`;
-    }
-}
-
 // --- Wishlist Count Functions ---
 
 async function updateWishlistCount() {
@@ -7755,22 +6432,14 @@ async function updateWishlistCount() {
         const data = await response.json();
         const count = data.count || 0;
 
-        _updateHeroBtnCount('wishlist-button', 'wishlist-badge', count);
-        // Update sidebar nav badge
+        // Only the SIDEBAR badge survives the dashboard flip — the hero
+        // button, its badge and the active/inactive classes are React-rendered
+        // (dashboard-header.tsx fetches this same endpoint on mount and
+        // consumes the socket dispatch afterwards).
         const wlNavBadge = document.getElementById('wishlist-nav-badge');
         if (wlNavBadge) {
             wlNavBadge.textContent = count;
             wlNavBadge.classList.toggle('hidden', count === 0);
-        }
-        const wishlistButton = document.getElementById('wishlist-button');
-        if (wishlistButton) {
-            if (count === 0) {
-                wishlistButton.classList.remove('wishlist-active');
-                wishlistButton.classList.add('wishlist-inactive');
-            } else {
-                wishlistButton.classList.remove('wishlist-inactive');
-                wishlistButton.classList.add('wishlist-active');
-            }
         }
 
         // Check for auto-initiated wishlist processes that user should see immediately

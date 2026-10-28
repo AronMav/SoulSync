@@ -75,6 +75,17 @@ ALBUM_SEARCH_ARTIST_WEIGHT = 0.2
 ALBUM_SEARCH_TRACK_COUNT_WEIGHT = 0.3
 ALBUM_SEARCH_THRESHOLD = 0.4
 
+# M7: minimum artist similarity a result must clear before its title score
+# can pass. Without this, an exact title match (0.5) clears the 0.4
+# threshold on a completely wrong artist. Calibrated against the real
+# similarity engine (Sep 2026):
+#   "Target Artist" vs "Some Other Band": 0.143 -> reject
+#   "Metallica" vs "Metallica Tribute Band": 0.581 -> reject
+#   Beatles variant 0.778, Kendrick Lamar & SZA 0.875, AC/DC vs ACDC 0.889
+#   -> accept. Applies only when BOTH sides name an artist; album-only
+#   searches and artist-less results keep the old behavior.
+ALBUM_SEARCH_ARTIST_MIN_SIMILARITY = 0.6
+
 _FORMAT_QUALITY_RANK = {
     '.flac': 10, '.wav': 9, '.aiff': 9, '.aif': 9, '.ape': 8,
     '.m4a': 7, '.ogg': 6, '.opus': 6, '.mp3': 5, '.wma': 3, '.aac': 5,
@@ -104,7 +115,13 @@ def score_album_search_result(
         r_artist = artists[0] if artists else ''
         if isinstance(r_artist, dict):
             r_artist = r_artist.get('name', '')
-        score += artist_similarity(target_artist, str(r_artist)) * ALBUM_SEARCH_ARTIST_WEIGHT
+        r_artist = str(r_artist)
+        artist_sim = artist_similarity(target_artist, r_artist)
+        if r_artist and artist_sim < ALBUM_SEARCH_ARTIST_MIN_SIMILARITY:
+            # M7: clearly the wrong artist — no title score can rescue it.
+            # An exact title (0.5) used to clear the 0.4 threshold alone.
+            return 0.0
+        score += artist_sim * ALBUM_SEARCH_ARTIST_WEIGHT
 
     r_tracks = getattr(album_result, 'total_tracks', 0) or 0
     if r_tracks > 0 and file_count > 0:
@@ -573,7 +590,10 @@ def match_files_to_tracks(
     - ``matches``: list of ``{'track': dict, 'file': str, 'confidence': float}``;
       exact-id matches additionally carry ``'match_type'``.
     - ``unmatched_files``: files left over after every track found its
-      best (or none).
+      best (or none) — quality-dedup losers included.
+    - ``duplicate_files``: the dedup-loser subset of ``unmatched_files``,
+      so a caller can distinguish "a lower-quality copy of a track that
+      imported" from "a song nothing claimed".
 
     Each file matches at most one track. Each track matches at most one
     file. Pure function — no side effects, no I/O, no metadata client.
@@ -594,17 +614,23 @@ def match_files_to_tracks(
         remaining_files, file_tags, quality_rank=quality_rank, similarity=similarity)
 
     # Phase 3 — fuzzy scoring on remaining tracks.
+    # #1289: was greedy per-track in tracklist order — an early track with a
+    # mediocre score (0.402) could permanently claim a file that a later
+    # track would match at 1.0 (the Give Up Deluxe cover mislabeling). Now
+    # collect all candidate scores first and claim in descending-score order,
+    # so the best match always wins regardless of track order.
+    # Note: descending-greedy is not globally optimal (Hungarian assignment
+    # could match more tracks in adversarial score matrices), but it is a
+    # strict improvement over track-order greedy for the reported bug class.
     duration_rejected = 0     # diagnostics for the "no matches" case
-    below_threshold = 0
     sample_rejection_logged = False
+    scored: list[tuple[float, int, str]] = []  # (score, track_idx, file)
+    below_threshold_tracks: set[int] = set()
     for i, track in enumerate(tracks):
         if i in used_track_indices:
             continue
 
         track_duration = _track_duration_ms(track)
-
-        best_file = None
-        best_score = 0.0
 
         for f in deduped:
             if f in used_files:
@@ -646,19 +672,24 @@ def match_files_to_tracks(
                 target_album=target_album,
                 similarity=similarity,
             )
-            if score > best_score and score >= MATCH_THRESHOLD:
-                best_score = score
-                best_file = f
+            if score >= MATCH_THRESHOLD:
+                scored.append((score, i, f))
+            else:
+                below_threshold_tracks.add(i)
 
-        if best_file:
-            used_files.add(best_file)
-            matches.append({
-                'track': track,
-                'file': best_file,
-                'confidence': round(best_score, 3),
-            })
-        elif deduped:
-            below_threshold += 1
+    # Claim in descending-score order. A track/file already claimed by a
+    # higher-scoring pair is skipped.
+    scored.sort(key=lambda t: t[0], reverse=True)
+    for best_score, i, best_file in scored:
+        if i in used_track_indices or best_file in used_files:
+            continue
+        used_files.add(best_file)
+        used_track_indices.add(i)
+        matches.append({
+            'track': tracks[i],
+            'file': best_file,
+            'confidence': round(best_score, 3),
+        })
 
     # Diagnostic surface — when the matcher returns 0 matches against
     # a non-trivial input, it's nearly always one of: duration gate too
@@ -671,15 +702,25 @@ def match_files_to_tracks(
             "%d duration-rejected pairs, %d tracks below threshold. "
             "Album: %r",
             len(audio_files), len(tracks),
-            duration_rejected, below_threshold, target_album,
+            duration_rejected, len(below_threshold_tracks), target_album,
         )
 
     # Final unmatched list: every file that didn't get used in any
     # phase. Includes quality-dedup losers (lower-quality copies of
     # files we already matched) so the caller can see the full picture.
+    # `duplicate_files` names that subset, because the two halves mean
+    # opposite things to an importer: a dedup loser is the expected
+    # outcome of a healthy album, while an unclaimed file is a song
+    # nobody imported. Callers that cannot tell them apart either mark
+    # healthy albums 'partial' or silently abandon real songs.
+    deduped_set = set(deduped)
     return {
         'matches': matches,
         'unmatched_files': [f for f in audio_files if f not in used_files],
+        'duplicate_files': [
+            f for f in remaining_files
+            if f not in deduped_set and f not in used_files
+        ],
     }
 
 

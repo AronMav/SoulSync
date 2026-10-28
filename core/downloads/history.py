@@ -13,12 +13,14 @@ a failure here must never break a real download.
 from __future__ import annotations
 
 import json
-import logging
+import time
+
+from utils.logging_config import get_logger
 from typing import Optional
 
 from core.runtime_state import download_tasks
 
-logger = logging.getLogger(__name__)
+logger = get_logger("downloads.history")
 
 
 _SOURCE_PREFIX_MAP = [
@@ -34,6 +36,30 @@ _SOURCE_PREFIX_MAP = [
     ('beatport_top100_', 'beatport'), ('beatport_hype100_', 'beatport'),
     ('beatport_sync_', 'beatport'),
 ]
+
+
+# downloads that ride the playlist pipeline but aren't playlists. the client
+# only flags some of them is_album_download, so a single track from search
+# was recorded as a playlist and showed up on the dashboard's playlist card
+# (#1591). the id prefix is the one thing every caller sets.
+SINGLE_TRACK_PREFIXES = ('enhanced_search_track_', 'gsearch_track_')
+ALBUM_PREFIXES = (
+    'artist_album_', 'discover_album_', 'enhanced_search_album_',
+    'seasonal_album_', 'spotify_library_', 'beatport_release_',
+    'discover_cache_', 'issue_download_', 'library_redownload_',
+)
+
+
+def detect_sync_type(playlist_id: str, is_album_download: bool) -> str:
+    """wishlist, album, track or playlist, for the sync_history row."""
+    playlist_id = str(playlist_id or '')
+    if playlist_id == 'wishlist':
+        return 'wishlist'
+    if is_album_download or playlist_id.startswith(ALBUM_PREFIXES):
+        return 'album'
+    if playlist_id.startswith(SINGLE_TRACK_PREFIXES):
+        return 'track'
+    return 'playlist'
 
 
 def detect_sync_source(playlist_id: str) -> str:
@@ -96,12 +122,7 @@ def record_sync_history_start(
         if quality_profile_id is None:
             quality_profile_id = quality_profile_id_for_tracks(tracks)
         source = detect_sync_source(playlist_id)
-        if playlist_id == 'wishlist':
-            sync_type = 'wishlist'
-        elif is_album_download:
-            sync_type = 'album'
-        else:
-            sync_type = 'playlist'
+        sync_type = detect_sync_type(playlist_id, is_album_download)
 
         # Extract thumb URL from album context or first track
         thumb_url = None
@@ -174,6 +195,65 @@ def record_sync_history_start(
         logger.warning(f"Failed to record sync history start: {e}")
 
 
+def record_sync_history_noop(
+    database,
+    playlist_id: str,
+    playlist_name: str,
+    tracks: list,
+    *,
+    profile_id=None,
+    quality_profile_id=None,
+    thumb_url: str = '',
+) -> None:
+    """Record a sync run that had nothing to do, as a FINISHED run.
+
+    The sync step skips when the track list is unchanged and everything already
+    matched, which is correct as work: there is nothing to download. But it used
+    to skip the bookkeeping with it, so a person who clicked Run got no run
+    recorded at all. The dashboard card then had nothing to show, said "no runs
+    yet", and would not open, while the pipeline had in fact completed
+    (Boulder, Aug 2026: Discover Weekly, 58 completed pipeline runs, zero recent
+    sync history).
+
+    "Ran, everything was already here" is a real outcome and the UI should be
+    able to say so. Written already-complete because it IS complete: every track
+    is present, none were downloaded, none failed.
+    """
+    try:
+        n = len(tracks or [])
+        record_sync_history_start(
+            database,
+            batch_id=f"noop_{playlist_id}_{int(time.time())}",
+            playlist_id=playlist_id,
+            playlist_name=playlist_name,
+            tracks=tracks or [],
+            is_album_download=False,
+            album_context=None,
+            artist_context=None,
+            playlist_folder_mode=False,
+            profile_id=profile_id,
+            quality_profile_id=quality_profile_id,
+        )
+        row = database.get_latest_sync_history_by_playlist(playlist_id, profile_id=profile_id)
+        if not row:
+            return
+        conn = database._get_connection()
+        try:
+            conn.execute(
+                "UPDATE sync_history SET completed_at = CURRENT_TIMESTAMP, "
+                "tracks_found = ?, tracks_downloaded = 0, tracks_failed = 0 "
+                "WHERE id = ?",
+                (n, row['id']),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info("Recorded no-op sync for '%s' (%d track(s) already present)",
+                    playlist_name, n)
+    except Exception as e:  # noqa: BLE001 - bookkeeping must never fail a sync
+        logger.warning("Could not record no-op sync history for '%s': %s", playlist_name, e)
+
+
 def record_sync_history_completion(database, batch_id: str, batch: dict) -> None:
     """Update sync_history with completion stats + per-track results.
 
@@ -182,7 +262,11 @@ def record_sync_history_completion(database, batch_id: str, batch: dict) -> None
     """
     try:
         analysis_results = batch.get('analysis_results', [])
-        tracks_found = sum(1 for r in analysis_results if r.get('found'))
+        # a batch that ran no analysis of its own has nothing to say about how
+        # many tracks matched; the sync that created the row already wrote
+        # that, and writing 0 over it is what made the dashboard read
+        # "0/240 in library" against a modal listing 236 matched
+        tracks_found = sum(1 for r in analysis_results if r.get('found')) if analysis_results else None
         queue = batch.get('queue', [])
         completed_count = 0
         failed_count = len(batch.get('permanently_failed_tracks', []))

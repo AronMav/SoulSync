@@ -34,6 +34,14 @@ def register_routes(bp):
         body = request.get_json(silent=True) or {}
         enabled = bool(body.get("enabled", not w.master_enabled()))
         w.set_master(enabled)
+        # #1289 item 12: bridge to the automation engine's metadata so
+        # scheduled video jobs honor the master toggle.
+        try:
+            from web_server import get_database
+            get_database().set_metadata('automation_master_video_enabled',
+                                        '1' if enabled else '0')
+        except Exception:
+            pass
         return jsonify({"enabled": enabled})
 
     @bp.route("/repair/pause", methods=["POST"])
@@ -59,6 +67,16 @@ def register_routes(bp):
         body = request.get_json(silent=True) or {}
         enabled = bool(body.get("enabled", not cfg["enabled"]))
         w.set_job_config(job_id, enabled=enabled)
+        # #1289 item 12: bridge to the system automation row so the engine's
+        # scheduler honors the toggle. Without this a disabled video job keeps
+        # running on its schedule.
+        try:
+            import web_server
+            from core.automation.migrate_repair_jobs import set_system_job_enabled
+            set_system_job_enabled(web_server.get_database(), web_server.automation_engine,
+                                   job_id, enabled, "video_run_repair_job")
+        except Exception:
+            logger.debug("Could not bridge video job toggle for %s", job_id, exc_info=True)
         return jsonify({"job_id": job_id, "enabled": enabled})
 
     @bp.route("/repair/jobs/<job_id>/settings", methods=["PUT"])

@@ -13,14 +13,6 @@ If the expected and matched versions disagree, return FAIL — the
 fingerprint did identify a real song, just not the version the caller
 asked for.
 
-Fork note (83a7fe56): the one-sided ``original -> instrumental/remix``
-direction was later relaxed into an annotation-error valve — with
-fingerprint >= 0.90 and agreeing title/artist the download is
-accepted, because AcoustID/MB mis-annotate the linked recording often
-enough that the strict gate produced ~387/530 false quarantines on a
-real discography scan.  The tests below pin the FORK contract
-(accepting the annotation error); the reverse direction stays strict.
-
 Reuses ``MusicMatchingEngine.detect_version_type`` so the same patterns
 that the pre-download Soulseek matcher uses also drive post-download
 verification (no duplicated regex tables).
@@ -66,22 +58,22 @@ def _stub_lookup(verifier, *, recordings, best_score=0.95):
 # ---------------------------------------------------------------------------
 
 
-def test_instrumental_annotation_with_high_confidence_passes(verifier):
-    """User asked for the bare cut; the fingerprint matched an
-    "(Instrumental)"-annotated recording with fp 0.95 and agreeing
-    title/artist.  Fork contract (83a7fe56): AcoustID/MB annotation
-    errors are accepted rather than quarantined — the track PASSES the
-    version gate.  Below fp 0.90 the mismatch stays strict."""
+def test_instrumental_returned_for_vocal_request_fails(verifier):
+    """User asked for a vocal track; file's fingerprint matched an
+    instrumental version of the same song. Old normalizer stripped
+    "(Instrumental)" and let it pass. Must FAIL now."""
     _stub_lookup(verifier, recordings=[
         {"title": "In My Feelings (Instrumental)", "artist": "Drake"},
     ])
 
-    result, _ = verifier.verify_audio_file(
+    result, msg = verifier.verify_audio_file(
         "/fake/path.flac",
         "In My Feelings",
         "Drake",
     )
-    assert result == VerificationResult.PASS
+    assert result == VerificationResult.FAIL
+    assert "version mismatch" in msg.lower()
+    assert "instrumental" in msg.lower()
 
 
 def test_instrumental_request_with_vocal_file_fails(verifier):
@@ -161,15 +153,22 @@ def test_matching_versions_pass(verifier):
 # ---------------------------------------------------------------------------
 
 
-def test_instrumental_annotation_accepted_with_distractor_recording(verifier):
-    """Same fork contract (83a7fe56) with a distractor in the list: the
-    best-scoring recording is the requested song carrying an
-    "(Instrumental)" annotation (fp 0.95, agreeing title/artist), and a
-    different track is also present.  The annotation is treated as an
-    MB/AcoustID metadata error — the track PASSES rather than being
-    quarantined for the version tag."""
+def test_secondary_scan_skips_wrong_version_recordings(verifier):
+    """When the best AcoustID recording's title doesn't match strongly
+    enough, verify scans through the rest of the recordings list looking
+    for a better candidate. That fallback path must also reject
+    wrong-version variants — otherwise an instrumental from the same
+    fingerprint cluster could win the scan and pass verification."""
     _stub_lookup(verifier, recordings=[
+        # Best by combined score: a different track entirely. Same
+        # artist, completely different title. Original version (no
+        # version mismatch on this one).
         {"title": "Some Other Song", "artist": "Drake"},
+        # Fallback candidate: instrumental version of the requested
+        # song. Without the scan-loop version gate, this would PASS
+        # (title matches after stripping "(Instrumental)", artist
+        # matches). With the gate, it gets skipped and the loop falls
+        # through.
         {"title": "In My Feelings (Instrumental)", "artist": "Drake"},
     ])
 
@@ -178,4 +177,10 @@ def test_instrumental_annotation_accepted_with_distractor_recording(verifier):
         "In My Feelings",
         "Drake",
     )
-    assert result == VerificationResult.PASS
+    # Best-recording version check passes (both 'original'), then the
+    # main pass/fail bucket misses (title doesn't match), fallback scan
+    # skips the instrumental, no other valid recording → falls through
+    # to the final unmatched logic. Either FAIL or SKIP is acceptable
+    # here; the critical assertion is "did NOT pass via the
+    # instrumental-version recording".
+    assert result != VerificationResult.PASS

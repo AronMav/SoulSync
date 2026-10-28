@@ -29,6 +29,16 @@ def _server():
         return None
 
 
+def _profile() -> int:
+    """The requesting profile: the video watchlist/wishlist are per-profile
+    (like the music side) — a non-admin must never see the admin's lists."""
+    try:
+        from core.profile_context import get_current_profile_id
+        return int(get_current_profile_id() or 1)
+    except Exception:
+        return 1
+
+
 def _annotate_live_state(db, kind, items):
     """Stamp reality onto the page's rows: ``downloading`` (an active download
     row exists for the item) and ``upgrade_from`` (owned below the profile
@@ -92,6 +102,24 @@ def _annotate_live_state(db, kind, items):
         logger.exception("wishlist live-state annotation failed")
 
 
+def _annotate_trouble(kind, items):
+    """Stamp each movie / episode row with ``trouble``: which kind of stuck its
+    last search was (see core.video.wishlist_evidence.row_trouble), so the page
+    can group by cause without re-implementing the refusal classifier in JS.
+    Best-effort like the live state: a bad receipt must not break the page."""
+    try:
+        from core.video.wishlist_evidence import row_trouble
+        if kind == "movie":
+            rows = items
+        else:
+            rows = [ep for show in items for season in show.get("seasons") or []
+                    for ep in season.get("episodes") or []]
+        for row in rows:
+            row["trouble"] = row_trouble(row.get("search_snapshot"))
+    except Exception:   # noqa: BLE001
+        logger.exception("wishlist trouble annotation failed")
+
+
 def register_routes(bp):
     @bp.route("/wishlist", methods=["GET"])
     def video_wishlist_list():
@@ -100,13 +128,22 @@ def register_routes(bp):
         from . import get_video_db
         try:
             db = get_video_db()
-            counts = db.wishlist_counts()
+            counts = db.wishlist_counts(profile_id=_profile())
             kind = request.args.get("kind")
             if kind in _KINDS:
                 res = db.query_wishlist(
                     kind, search=request.args.get("search", ""), sort=request.args.get("sort", "added"),
-                    page=request.args.get("page", 1), limit=request.args.get("limit", 60))
+                    page=request.args.get("page", 1), limit=request.args.get("limit", 60),
+                    profile_id=_profile())
                 _annotate_live_state(db, kind, res.get("items") or [])
+                _annotate_trouble(kind, res.get("items") or [])
+                from .kids import filter_tmdb_items, video_cap
+                cap = video_cap()
+                if cap is not None:
+                    tagged = [dict(it, kind=it.get("kind") if it.get("kind") in ("movie", "show")
+                                   else ("movie" if kind == "movie" else "show"))
+                              for it in res.get("items") or []]
+                    res = {**res, "items": filter_tmdb_items(db, tagged, cap)}
                 return jsonify({"success": True, "kind": kind, "counts": counts, **res})
             return jsonify({"success": True, "counts": counts})
         except Exception:
@@ -118,8 +155,8 @@ def register_routes(bp):
         from . import get_video_db
         try:
             db = get_video_db()
-            counts = db.wishlist_counts()                 # {movie, show, episode, total(movie+ep)}
-            yt = db.youtube_wishlist_counts()             # {channel, video}  (its own table-shape)
+            counts = db.wishlist_counts(profile_id=_profile())  # {movie, show, episode, total(movie+ep)}
+            yt = db.youtube_wishlist_counts(profile_id=_profile())  # {channel, video}  (its own table-shape)
             counts["video"] = yt.get("video", 0)
             counts["channel"] = yt.get("channel", 0)
             # The header/sidebar badge is the WHOLE wishlist — movies + episodes + YouTube
@@ -148,11 +185,73 @@ def register_routes(bp):
             from core.video.wishlist_search import manual_search
             res = manual_search(scope, tmdb_id,
                                 season_number=data.get("season_number"),
-                                episode_number=data.get("episode_number"))
+                                episode_number=data.get("episode_number"),
+                                profile_id=_profile())
             return jsonify({"success": True, **res})
         except Exception:
             logger.exception("wishlist manual search failed")
             return jsonify({"success": False, "error": "Search failed to start"}), 500
+
+    @bp.route("/wishlist/diagnostics", methods=["GET"])
+    def video_wishlist_diagnostics():
+        """Everything known about ONE stuck row, in one call.
+
+        The row's tooltip could say how often it had been searched and the
+        headline refusal. It could not say where the file would land, which
+        external ids the search was keyed on, whether something was already
+        downloading, or WHY any individual release lost - which is what turns
+        "why is this stuck" from a guess into an answer.
+        """
+        from . import get_video_db
+        kind = str(request.args.get("kind") or "").lower()
+        if kind not in ("movie", "episode"):
+            return jsonify({"success": False, "error": "kind must be movie|episode"}), 400
+        try:
+            tmdb_id = int(request.args.get("tmdb_id"))
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "tmdb_id required"}), 400
+
+        def _opt(name):
+            v = request.args.get(name)
+            try:
+                return int(v) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+
+        data = get_video_db().wishlist_row_diagnostics(
+            kind, tmdb_id, season_number=_opt("season_number"),
+            episode_number=_opt("episode_number"), profile_id=_profile())
+        if not data.get("row"):
+            return jsonify({"success": False, "error": "No such wishlist row."}), 404
+        return jsonify({"success": True, **data})
+
+    @bp.route("/wishlist/retry", methods=["POST"])
+    def video_wishlist_retry_all_sources():
+        """User-forced retry for a stale row: clear backoff/evidence and search every source."""
+        try:
+            data = request.get_json(silent=True) or {}
+            scope = str(data.get("scope") or "").lower()
+            tmdb_id = data.get("tmdb_id")
+            if scope not in _SCOPES or not tmdb_id:
+                return jsonify({"success": False, "error": "scope + tmdb_id required"}), 400
+            from . import get_video_db
+            from core.automation.handlers.video_process_wishlist import reset_source_cooldowns
+            from core.video.wishlist_search import manual_search
+            kind = "movie" if scope == "movie" else "episode"
+            reset = get_video_db().reset_wishlist_search_state(
+                kind, tmdb_id,
+                season_number=data.get("season_number"),
+                episode_number=data.get("episode_number"),
+                profile_id=_profile())
+            reset_source_cooldowns()
+            res = manual_search(scope, tmdb_id,
+                                season_number=data.get("season_number"),
+                                episode_number=data.get("episode_number"),
+                                all_sources=True, profile_id=_profile())
+            return jsonify({"success": True, "reset": reset, **res})
+        except Exception:
+            logger.exception("wishlist retry-all-sources failed")
+            return jsonify({"success": False, "error": "Retry failed to start"}), 500
 
     @bp.route("/wishlist/search-all", methods=["POST"])
     def video_wishlist_search_all():
@@ -165,6 +264,14 @@ def register_routes(bp):
         except Exception:
             logger.exception("wishlist search-all failed")
             return jsonify({"success": False, "error": "Search failed to start"}), 500
+
+    @bp.route("/wishlist/search-stop", methods=["POST"])
+    def video_wishlist_search_stop():
+        """Cancel all's other half: stop running wishlist searches so they don't
+        keep grabbing after the download rows are cancelled."""
+        from core.video.wishlist_search import stop_all
+        stop_all()
+        return jsonify({"success": True})
 
     @bp.route("/wishlist/add", methods=["POST"])
     def video_wishlist_add():
@@ -182,8 +289,10 @@ def register_routes(bp):
                 ok = db.add_movie_to_wishlist(
                     int(movie["tmdb_id"]), movie["title"].strip(), year=movie.get("year"),
                     poster_url=movie.get("poster_url") or None,
-                    library_id=movie.get("library_id") or None, server_source=srv)
-                return jsonify({"success": ok, "added": 1 if ok else 0, "counts": db.wishlist_counts()})
+                    library_id=movie.get("library_id") or None, server_source=srv,
+                    profile_id=_profile())
+                return jsonify({"success": ok, "added": 1 if ok else 0,
+                                "counts": db.wishlist_counts(profile_id=_profile())})
 
             show = body.get("show")
             episodes = body.get("episodes") or []
@@ -191,8 +300,15 @@ def register_routes(bp):
                 n = db.add_episodes_to_wishlist(
                     int(show["tmdb_id"]), show["title"].strip(), episodes,
                     poster_url=show.get("poster_url") or None,
-                    library_id=show.get("library_id") or None, server_source=srv)
-                return jsonify({"success": n > 0, "added": n, "counts": db.wishlist_counts()})
+                    library_id=show.get("library_id") or None, server_source=srv,
+                    profile_id=_profile())
+                if n > 0:
+                    # a show not in any library yet: store its type (TMDB's
+                    # suggestion) so its episodes are filed in the right folder
+                    from core.video.anime_hint import note_show_wanted
+                    note_show_wanted(get_video_db, show["tmdb_id"])
+                return jsonify({"success": n > 0, "added": n,
+                                "counts": db.wishlist_counts(profile_id=_profile())})
 
             return jsonify({"success": False, "error": "movie or show+episodes required"}), 400
         except Exception:
@@ -212,11 +328,71 @@ def register_routes(bp):
             db = get_video_db()
             removed = db.remove_from_wishlist(
                 scope, tmdb_id=int(tmdb_id),
-                season_number=body.get("season_number"), episode_number=body.get("episode_number"))
-            return jsonify({"success": True, "removed": removed, "counts": db.wishlist_counts()})
+                season_number=body.get("season_number"), episode_number=body.get("episode_number"),
+                profile_id=_profile())
+            return jsonify({"success": True, "removed": removed,
+                            "counts": db.wishlist_counts(profile_id=_profile())})
         except Exception:
             logger.exception("Failed to remove from video wishlist")
             return jsonify({"success": False, "error": "Failed"}), 500
+
+    @bp.route("/wishlist/youtube/download-all", methods=["POST"])
+    def video_wishlist_youtube_download_all():
+        """Queue every waiting YouTube video NOW — the tab's missing bulk action.
+
+        "Search all missing" is hidden on the YouTube tab because there is nothing
+        to search: the video IS the release. But the tab still needs a way to say
+        "stop waiting and fetch these", which is what the hourly drain does. This
+        is that verb, and it is the YouTube twin of search-all: same enqueue path
+        the drain uses, same concurrency cap, and the user's click out-ranks the
+        retry backoff exactly as a manual search out-ranks the release gate.
+
+        Permanently unavailable videos (deleted / private / members-only) are
+        still skipped and reported — the per-row button covers the one case where
+        the user believes a video is back.
+        """
+        from . import get_video_db
+        from core.automation.handlers.video_process_youtube_wishlist import (
+            slots_free, videos_for_manual_run)
+        from core.video.youtube_download import start_next_queued
+        try:
+            db = get_video_db()
+            root = db.get_setting("youtube_path") or ""
+            if not root:
+                return jsonify({"success": False,
+                                "error": "Set the YouTube library folder on Settings → Downloads first."}), 400
+
+            wanted = db.youtube_wishlist_to_download(profile_id=_profile()) or []
+            already = [d.get("media_id") for d in db.get_active_video_downloads()
+                       if d.get("source") == "youtube" and d.get("media_id")]
+            states = db.youtube_retry_state()
+            todo = videos_for_manual_run(wanted, already, states)
+
+            from core.automation.handlers.video_process_youtube_wishlist import _default_enqueue
+            queued = refused = 0
+            for v in todo:
+                try:
+                    if _default_enqueue(v, root) is not None:
+                        queued += 1
+                    else:
+                        refused += 1      # disk guard
+                except Exception:   # noqa: BLE001 - one bad row must not stop the rest
+                    logger.exception("youtube download-all: could not queue %r", v.get("video_id"))
+
+            started = 0
+            for _ in range(slots_free(db.count_active_youtube_downloads(), 3)):
+                if start_next_queued(get_video_db) is None:
+                    break
+                started += 1
+
+            unavailable = sum(1 for v in wanted
+                              if (states.get(v.get("video_id")) or {}).get("permanent"))
+            return jsonify({"success": True, "queued": queued, "started": started,
+                            "refused": refused, "unavailable": unavailable,
+                            "already": len(already), "total": len(wanted)})
+        except Exception:
+            logger.exception("youtube wishlist download-all failed")
+            return jsonify({"success": False, "error": "Could not start the downloads"}), 500
 
     @bp.route("/wishlist/clear", methods=["POST"])
     def video_wishlist_clear():
@@ -228,9 +404,10 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "kind must be movie|show|youtube"}), 400
         try:
             db = get_video_db()
-            removed = db.clear_wishlist(kind)
+            removed = db.clear_wishlist(kind, profile_id=_profile())
             return jsonify({"success": True, "removed": removed,
-                            "counts": db.wishlist_counts(), "youtube_counts": db.youtube_wishlist_counts()})
+                            "counts": db.wishlist_counts(profile_id=_profile()),
+                             "youtube_counts": db.youtube_wishlist_counts(profile_id=_profile())})
         except Exception:
             logger.exception("Failed to clear video wishlist")
             return jsonify({"success": False, "error": "Failed"}), 500
@@ -299,11 +476,12 @@ def register_routes(bp):
         try:
             db = get_video_db()
             st = db.wishlist_state(
-                movie_ids=body.get("movie_ids") or [], show_tmdb_id=body.get("show_tmdb_id"))
+                movie_ids=body.get("movie_ids") or [], show_tmdb_id=body.get("show_tmdb_id"),
+                profile_id=_profile())
             out = {"success": True, "movies": sorted(st["movies"]), "episodes": sorted(st["episodes"])}
             shows = body.get("shows")   # multi-show membership for the calendar button
             if shows:
-                keys = db.wishlist_keys_for_shows(shows)
+                keys = db.wishlist_keys_for_shows(shows, profile_id=_profile())
                 out["by_show"] = {str(tid): sorted(ks) for tid, ks in keys.items()}
             return jsonify(out)
         except Exception:

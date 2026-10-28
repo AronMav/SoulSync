@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Protocol, runtime_checkable
 
+from core.async_utils import run_blocking
+
 
 def normalize_client_url(raw: str) -> str:
     """Clean a user-entered WebUI URL into something ``requests`` accepts.
@@ -78,6 +80,42 @@ class TorrentStatus:
     # back to their own clock when None.
     ratio: Optional[float] = None
     seeding_time: Optional[int] = None
+    # the v1 info-hash, for clients whose ``id`` is not the hash (aria2's gid).
+    # None means ``id`` already is the hash.
+    info_hash: Optional[str] = None
+    # the client's own category for the torrent (qbittorrent category,
+    # transmission's first label, deluge's label plugin). set on every torrent
+    # in the client, soulsync's or not, so the clients tab can filter by it.
+    # None when the client has none (aria2) or the torrent has none.
+    category: Optional[str] = None
+
+
+class AdoptedRef(str):
+    """A torrent ref for a torrent the client ALREADY had.
+
+    Still a plain str to every caller. One that cares (the audiobook grab) can
+    tell the user the existing download was picked up rather than added.
+    """
+
+
+async def find_existing_torrent(adapter: "TorrentClientAdapter", info_hash: str) -> Optional[str]:
+    """The client's own id for the torrent with this info-hash, or None.
+
+    Lists rather than asks by hash, because not every client keys on the hash
+    (aria2 tracks a gid). A client that cannot be listed answers None, so the
+    caller falls through to a normal add.
+    """
+    wanted = str(info_hash or '').lower()
+    if not wanted:
+        return None
+    try:
+        statuses = await adapter.get_all()
+    except Exception:  # noqa: BLE001 - an unlistable client is just "not found"
+        return None
+    for status in statuses or []:
+        if str(status.info_hash or status.id or '').lower() == wanted:
+            return status.id
+    return None
 
 
 @runtime_checkable
@@ -180,32 +218,118 @@ def fetch_torrent_payload(url: str, timeout: int = 30):
         return None, None
 
 
+async def _fetch_torrent_payload_async(url: str):
+    """Run the blocking indexer fetch without an event-loop default executor.
+
+    Python 3.14.6 can lose the cross-thread selector wakeup used while
+    ``asyncio.run()`` shuts its default executor down in a long-lived process.
+    Polling a bounded shared worker Future from the owner loop needs no foreign
+    thread to wake that loop and avoids creating an executor Runner.close()
+    must later join.
+    """
+    return await run_blocking(fetch_torrent_payload, url)
+
+
+class ReleaseRejected(Exception):
+    """The fetched .torrent describes something the caller will not accept.
+
+    Raised instead of returning None so the caller can tell "the client
+    refused it" apart from "we refused it, and here is why" — the second
+    needs to reach the user and let the hybrid chain try the next source.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 async def add_torrent_smart(
     adapter: "TorrentClientAdapter",
     url_or_magnet: str,
-    category: str = "soulsync",
+    category: Optional[str] = None,
     save_path: Optional[str] = None,
+    fallback_magnet: Optional[str] = None,
+    verify_files=None,
+    adopt_existing: bool = False,
 ) -> Optional[str]:
     """Add a release the way Sonarr/Radarr do: magnets go straight to the
     client; HTTP download links are fetched server-side and handed over as
     file bytes via ``add_torrent_file``. Falls back to the legacy URL handoff
     only when the server-side fetch fails, so setups where the client CAN
-    reach the indexer keep working."""
+    reach the indexer keep working.
+
+    ``fallback_magnet`` is the magnet for the SAME release, when the indexer
+    offered both. Callers now prefer the .torrent URL (#1139: a magnet gives
+    the client nothing but an info-hash, so a swarm it can't reach leaves it
+    parked on "downloading metadata" forever), and this is what keeps that
+    preference from being a downgrade — if the server-side fetch fails we use
+    the magnet we already had instead of handing over a URL this process just
+    proved it cannot reach.
+
+    ``verify_files`` (#1149) is called with the .torrent's file-name list
+    before the release is handed over, and raises ``ReleaseRejected`` when it
+    says no. It runs HERE because this is where the payload already exists —
+    checking in the caller would mean fetching the same .torrent twice. It is
+    skipped when the payload never materialises (a magnet, or a fetch that
+    failed): no file list is no evidence, and the caller's title-level check
+    has already had its say.
+    """
     from utils.logging_config import get_logger
     logger = get_logger('torrent.add')
 
+    async def _adopt(info_hash):
+        """``adopt_existing``: a torrent the client already holds is tracked,
+        not re-added. clients refuse the duplicate, which read as a failed grab
+        while the finished files sat in the client."""
+        if not adopt_existing or not info_hash:
+            return None
+        found = await find_existing_torrent(adapter, info_hash)
+        if found:
+            logger.info("Torrent client already holds %s — adopting it", str(info_hash)[:12])
+            return AdoptedRef(found)
+        return None
+
+    from core.torrent_clients.qbittorrent import _magnet_hash
+
     if not str(url_or_magnet or '').lower().startswith(('http://', 'https://')):
+        adopted = await _adopt(_magnet_hash(url_or_magnet))
+        if adopted:
+            return adopted
         return await adapter.add_torrent(url_or_magnet, category=category, save_path=save_path)
 
-    import asyncio
-    loop = asyncio.get_event_loop()
-    file_bytes, magnet = await loop.run_in_executor(
-        None, fetch_torrent_payload, url_or_magnet
-    )
+    file_bytes, magnet = await _fetch_torrent_payload_async(url_or_magnet)
     if magnet:
+        adopted = await _adopt(_magnet_hash(magnet))
+        if adopted:
+            return adopted
         return await adapter.add_torrent(magnet, category=category, save_path=save_path)
     if file_bytes is not None:
+        if verify_files is not None:
+            from core.quality.torrent_contents import torrent_file_names
+            names = torrent_file_names(file_bytes)
+            # None means the payload could not be parsed, which is not
+            # evidence of anything — do not turn a decoder failure into a
+            # blocked download.
+            if names is not None:
+                ok, reason = verify_files(names)
+                if not ok:
+                    raise ReleaseRejected(reason)
+        from core.quality.torrent_contents import torrent_info_hash
+        adopted = await _adopt(torrent_info_hash(file_bytes))
+        if adopted:
+            return adopted
         return await adapter.add_torrent_file(file_bytes, category=category, save_path=save_path)
+
+    if fallback_magnet:
+        logger.warning(
+            "Could not fetch the .torrent server-side from %s — falling back to the "
+            "release's magnet link",
+            _strip_query(url_or_magnet),
+        )
+        adopted = await _adopt(_magnet_hash(fallback_magnet))
+        if adopted:
+            return adopted
+        return await adapter.add_torrent(fallback_magnet, category=category, save_path=save_path)
 
     logger.warning(
         "Could not fetch the .torrent server-side from %s — handing the URL to the "

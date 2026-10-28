@@ -87,6 +87,61 @@ def _first(table, text) -> Any:
 _YEAR = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 
 
+# audio language tags, the way the scene writes them. a bare release with no
+# tag is the original audio. subs-only tags (VOSTFR, SUBFRENCH, FRENCH.SUBS)
+# are not audio and never count.
+_LANG_TAGS = (
+    ("fr", r"truefrench|french|vff|vfq|vfi|vf2|vof|vf"),
+    ("de", r"german|deutsch"),
+    ("it", r"italian|ita"),
+    ("es", r"spanish|castellano|latino|esp|spa"),
+    ("pt", r"portuguese|dublado|nacional|pt-?br"),
+    ("ja", r"japanese|jpn"),
+    ("ko", r"korean|kor"),
+    ("zh", r"chinese|mandarin|cantonese"),
+    ("ru", r"russian|rus"),
+    ("pl", r"polish|pldub"),
+    ("nl", r"dutch|flemish"),
+    ("sv", r"swedish"),
+    ("da", r"danish"),
+    ("no", r"norwegian"),
+    ("fi", r"finnish"),
+    ("hi", r"hindi"),
+    ("tr", r"turkish"),
+    ("cs", r"czech"),
+    ("hu", r"hungarian"),
+    ("ar", r"arabic"),
+    ("uk", r"ukrainian"),
+    ("en", r"english|eng"),
+)
+_EDGE_L, _EDGE_R = r"(?<![a-z0-9])", r"(?![a-z0-9])"
+_LANG_RX = [(code, re.compile(_EDGE_L + "(?:" + words + ")" + _EDGE_R
+                              + r"(?![ ._-]?(?:subs?|subbed|subtitles?)" + _EDGE_R + ")", re.I))
+            for code, words in _LANG_TAGS]
+# MULTi / DUAL / Dual Audio, and the german 'GERMAN.DL' (dual language)
+_MULTI_RX = re.compile(_EDGE_L + r"(?:multi|dual(?:[ ._-]?audio)?"
+                       r"|(?<=german[ ._-]|french[ ._-])dl|(?<=italian[ ._-]|deutsch[ ._-])dl)"
+                       + _EDGE_R, re.I)
+
+
+def parse_languages(title: Any) -> tuple:
+    """(audio language codes, multi) from a release name's tags. only the part
+    after the title counts, so 'The.French.Dispatch.2021...' isn't french."""
+    t = str(title or "")
+    cut = None
+    years = list(_YEAR_TOKEN.finditer(t))
+    if years and _spaces(t[:years[-1].start()]):
+        cut = years[-1].start()
+    m = _META_BOUNDARY.search(t)
+    if m and _spaces(t[:m.start()]) and (cut is None or m.start() < cut):
+        cut = m.start()
+    if cut is None:
+        return [], False
+    tail = t[cut:]
+    codes = [code for code, rx in _LANG_RX if rx.search(tail)]
+    return codes, bool(_MULTI_RX.search(tail))
+
+
 def parse_release(title: Any) -> dict:
     """Parse a release name into quality + scope fields. Never raises."""
     t = str(title or "")
@@ -111,6 +166,12 @@ def parse_release(title: Any) -> dict:
         "is_season_pack": False,
         "is_series_pack": False,
     }
+    out["languages"], out["multi"] = parse_languages(t)
+    # a DVD remux ('Duckman S01 NTSC DVD REMUX') is a disc at SD, not a
+    # resolution-less blu-ray remux: read as remux it had no tier at all
+    if (out["source"] == "remux" and not out["resolution"]
+            and re.search(r"\b(dvd|ntsc|pal)\b", t, re.I)):
+        out["source"] = "dvd"
     g = _GROUP.search(t)
     if g:
         out["group"] = g.group(1)
@@ -217,10 +278,16 @@ def normalize_title(s: Any) -> str:
     """Fold a title to a comparable key: strip accents, lowercase, '&'→'and',
     punctuation → space, drop a single leading article. 'The Dark Knight' and
     'dark.knight' both fold to 'dark knight'."""
-    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii")
+    raw = str(s or "")
+    s = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
     s = s.lower().replace("&", " and ")
     s = re.sub(r"[^a-z0-9]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        # #1306: a title in a non-latin script folded to nothing, and a
+        # wanted title of nothing let ANY release through. keep its letters.
+        from core.text.fold import fold_title
+        return fold_title(raw.replace("&", " and "), drop_brackets=False)
     return _ARTICLE.sub("", s, count=1)
 
 
@@ -234,6 +301,41 @@ def acceptable_titles(want_title: Any) -> set:
         return set()
     items = [want_title] if isinstance(want_title, str) else list(want_title)
     return {n for n in (normalize_title(x) for x in items) if n}
+
+
+# a wanted title that ends in its year: "Big Brother (2023)", "Dark Matter 2024"
+_WANT_YEAR_SUFFIX = re.compile(r"^(.*?\S)[\s.]*\(?((?:19|20)\d{2})\)?\s*$")
+
+
+def _year_qualified_wants(want_title: Any) -> list:
+    """(normalized base title, year) for every wanted title that ends in a year.
+    a title that IS a year ("1917") has no base and isn't one."""
+    if want_title is None:
+        return []
+    items = [want_title] if isinstance(want_title, str) else list(want_title)
+    out = []
+    for raw in items:
+        m = _WANT_YEAR_SUFFIX.match(str(raw or "").strip())
+        if not m:
+            continue
+        base = normalize_title(m.group(1))
+        if base:
+            out.append((base, int(m.group(2))))
+    return out
+
+
+def title_region_year(cand: Any):
+    """public name for the year in a release's title region, see below"""
+    return _release_title_year(str(cand or ""))
+
+
+def _release_title_year(cand: str):
+    """the year a release name carries right after its title, or None:
+    'Big.Brother.2023.S03E16' -> 2023, 'Blade Runner 2049 2017 1080p' -> 2017"""
+    m = _META_BOUNDARY.search(cand)
+    head = cand[:m.start()] if m else cand
+    years = list(_YEAR_TOKEN.finditer(head))
+    return int(years[-1].group()) if years else None
 
 
 def titles_match(release_name: Any, want_title: Any) -> bool:
@@ -250,6 +352,14 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     wants = acceptable_titles(want_title)
     if not wants:
         return True
+    # "Big Brother (2023)" is how a library names a show to tell it from the
+    # others, and the scene writes it 'Big.Brother.2023.S03E16', whose title
+    # parses as "Big Brother" with the year cut off. that never equals
+    # "big brother 2023", so every release for the show was "Wrong title". a
+    # year-qualified title matches its bare base when the release carries the
+    # same year (one either way). a release WITHOUT a year still doesn't, so
+    # "Avatar: The Last Airbender (2024)" never takes the 2005 show's files.
+    year_wants = _year_qualified_wants(want_title)
     raw = str(release_name or "")
     cands = [raw]
     segs = [s for s in re.split(r"[\\/]+", raw) if s.strip()]
@@ -261,6 +371,11 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
         if not got:
             continue
         saw_any = True
+        if year_wants:
+            rel_year = _release_title_year(cand)
+            if rel_year and any(got == base and abs(rel_year - year) <= 1
+                                for base, year in year_wants):
+                return True
         for want in wants:
             if got == want:
                 return True
@@ -273,5 +388,21 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     return not saw_any
 
 
-__all__ = ["parse_release", "extract_title", "normalize_title",
-           "acceptable_titles", "titles_match", "has_absolute_episode"]
+def search_title(release_name: Any) -> str:
+    """The title to PREFILL a metadata search with, from a raw release name.
+
+    extract_title plus a trailing-punctuation trim, because a cut that lands right
+    after a separator ("Silo S03E08 ..." -> "Silo", but "The.Bear.S03..." -> "The.Bear.")
+    leaves a dot/dash the metadata search then treats as part of the name. Falls back
+    to the raw name when nothing can be isolated, so the box is never empty.
+
+    Shared by the Fresh Releases and Basic Search identify modals so the same release
+    prefills the same way in both.
+    """
+    value = extract_title(release_name) or str(release_name or "")
+    value = re.sub(r"[\s(\[{._-]+$", "", value).strip()
+    return value or str(release_name or "")
+
+
+__all__ = ["parse_release", "extract_title", "normalize_title", "title_region_year",
+           "acceptable_titles", "titles_match", "has_absolute_episode", "search_title"]

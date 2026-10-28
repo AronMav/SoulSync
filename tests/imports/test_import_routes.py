@@ -442,6 +442,7 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
     refresh_calls = []
     automation = _FakeAutomationEngine()
     runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
         resolve_album_artist_context=lambda album, source="": {"name": "Artist"},
         build_album_import_context=lambda album, track, **kwargs: {"album": album, "track": track, **kwargs},
         post_process_matched_download=lambda key, context, path: processed_contexts.append((key, context, path)),
@@ -475,6 +476,23 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
         "processed": 1,
         "total": 2,
         "errors": ["File not found: missing.flac"],
+        # existing-library pre-check: per-track dispositions + summary.
+        "dispositions": [
+            {
+                "track_name": "Good Track",
+                "file_name": "good.flac",
+                "decision": "imported",
+                "reason": "paired by fuzzy scoring (no match type) — "
+                          "cannot prove identity, proceeding",
+            },
+            {
+                "track_name": "Missing Track",
+                "file_name": "missing.flac",
+                "decision": "error",
+                "reason": "File not found: missing.flac",
+            },
+        ],
+        "summary": {"imported": 1, "skipped_owned": 0, "upgraded": 0},
     }
     assert len(processed_contexts) == 1
     key, context, path = processed_contexts[0]
@@ -486,7 +504,7 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
     # explicit user match — quality profile has no veto (#1017)
     assert context["_skip_quarantine_check"] == ["quality", "bit_depth"]
     assert path == str(good_file)
-    assert activity == [("", "Album Imported", "Album by Artist (1/2 tracks)", "Now")]
+    assert activity == [("", "Album Imported", "Album by Artist (1 imported)", "Now")]
     assert refresh_calls == ["refresh"]
     assert automation.events == [
         (
@@ -497,6 +515,7 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
             "batch_complete",
             {
                 "playlist_name": "Import: Album",
+                "artist": "Artist",
                 "total_tracks": "2",
                 "completed_tracks": "1",
                 "failed_tracks": "1",
@@ -566,6 +585,7 @@ def test_process_single_import_file_resolves_and_posts_context(tmp_path):
     _touch(audio_file)
     post_calls = []
     runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
         parse_filename_metadata=lambda filename: {"title": "Song", "artist": "Artist"},
         get_single_track_import_context=lambda title, artist, **kwargs: {
             "source": "deezer",
@@ -590,10 +610,237 @@ def test_process_single_import_file_resolves_and_posts_context(tmp_path):
     assert post_calls[0][2] == str(audio_file)
 
 
+def test_process_single_import_file_from_own_tags_skips_catalogue_match(tmp_path):
+    """#1772: "No track picked" must reach the resolver as an explicit
+    own-tags request (with the file's tag fields), not as a bare title/artist
+    the resolver is free to rematch to an unrelated catalogue track."""
+    audio_file = tmp_path / "Dj StarSunglasses - Live Mix.mp3"
+    _touch(audio_file)
+    captured = {}
+    post_calls = []
+
+    def fake_context(title, artist, **kwargs):
+        captured.update(kwargs)
+        captured["title"] = title
+        captured["artist"] = artist
+        return {
+            "source": None,
+            "context": {
+                "track_info": {"name": title, "_manual_metadata": True},
+                "artist": {"name": artist},
+                "album": {"name": kwargs.get("album") or ""},
+                "_manual_metadata": True,
+            },
+        }
+
+    from core.imports.context import normalize_import_context as _real_normalize
+
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
+        get_single_track_import_context=fake_context,
+        # the REAL normalizer, not an identity stub: this pins that the
+        # manual flag survives the normalization the production runtime runs
+        normalize_import_context=_real_normalize,
+        get_import_context_artist=lambda context: context["artist"],
+        get_import_track_info=lambda context: context["track_info"],
+        post_process_matched_download=lambda key, context, path: post_calls.append((key, context, path)),
+        logger=_FakeLogger(),
+    )
+
+    outcome = process_single_import_file(
+        runtime,
+        {
+            "full_path": str(audio_file),
+            "filename": audio_file.name,
+            "title": "Live Mix",
+            "artist": "Dj StarSunglasses",
+            "album": "Live Mix",
+            "track_number": 1,
+            "disc_number": 1,
+            "duration_ms": 2_880_000,
+            "from_own_tags": True,
+        },
+    )
+
+    assert outcome == ("ok", "Live Mix")
+    assert captured["from_own_tags"] is True
+    assert captured["override_id"] is None
+    assert captured["album"] == "Live Mix"
+    assert captured["duration_ms"] == 2_880_000
+    assert len(post_calls) == 1
+    assert post_calls[0][1]["_manual_metadata"] is True
+    assert post_calls[0][1]["track_info"]["_manual_metadata"] is True
+
+
+def test_process_single_import_file_from_own_tags_requires_a_real_true(tmp_path):
+    """The flag is parsed strictly: the string "false" from a raw API
+    caller must not turn own-tags mode ON."""
+    audio_file = tmp_path / "Song.flac"
+    _touch(audio_file)
+    captured = {}
+
+    def fake_context(title, artist, **kwargs):
+        captured.update(kwargs)
+        return {
+            "source": "deezer",
+            "context": {"track_info": {"name": "Song"}, "artist": {"name": "Artist"}},
+        }
+
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
+        get_single_track_import_context=fake_context,
+        normalize_import_context=lambda context: context,
+        get_import_context_artist=lambda context: context["artist"],
+        get_import_track_info=lambda context: context["track_info"],
+        post_process_matched_download=lambda *_args: None,
+        logger=_FakeLogger(),
+    )
+
+    outcome = process_single_import_file(
+        runtime,
+        {
+            "full_path": str(audio_file),
+            "filename": audio_file.name,
+            "title": "Song",
+            "artist": "Artist",
+            "from_own_tags": "false",
+        },
+    )
+
+    assert outcome == ("ok", "Song")
+    assert captured["from_own_tags"] is False
+
+
+def test_process_single_import_file_nonstring_title_artist_falls_back_to_filename(tmp_path):
+    """If title and artist are non-strings (e.g. invalid JSON data from an
+    external caller), process_single_import_file treats them as absent and
+    parses the filename instead of passing non-strings into the pipeline."""
+    audio_file = tmp_path / "Parsed Artist - Parsed Title.mp3"
+    _touch(audio_file)
+    captured = {}
+
+    def fake_context(title, artist, **kwargs):
+        captured.update(title=title, artist=artist)
+        return {
+            "source": None,
+            "context": {"track_info": {"name": title}, "artist": {"name": artist}},
+        }
+
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
+        get_single_track_import_context=fake_context,
+        normalize_import_context=lambda context: context,
+        get_import_context_artist=lambda context: context["artist"],
+        get_import_track_info=lambda context: context["track_info"],
+        post_process_matched_download=lambda *_args: None,
+        logger=_FakeLogger(),
+    )
+
+    outcome = process_single_import_file(
+        runtime,
+        {
+            "full_path": str(audio_file),
+            "filename": audio_file.name,
+            "title": 12345,
+            "artist": ["invalid"],
+            "from_own_tags": True,
+        },
+    )
+
+    assert outcome == ("ok", "Parsed Title")
+    assert captured["title"] == "Parsed Title"
+    assert captured["artist"] == "Parsed Artist"
+
+
+def test_process_single_import_file_empty_manual_match_counts_as_no_pick(tmp_path):
+    """An empty manual_match dict is "no match picked" (its pre-flag
+    meaning), so the own-tags flag still applies and no override is sent."""
+    audio_file = tmp_path / "Song.flac"
+    _touch(audio_file)
+    captured = {}
+
+    def fake_context(title, artist, **kwargs):
+        captured.update(kwargs)
+        return {
+            "source": None,
+            "context": {"track_info": {"name": "Song"}, "artist": {"name": "Artist"}},
+        }
+
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
+        get_single_track_import_context=fake_context,
+        normalize_import_context=lambda context: context,
+        get_import_context_artist=lambda context: context["artist"],
+        get_import_track_info=lambda context: context["track_info"],
+        post_process_matched_download=lambda *_args: None,
+        logger=_FakeLogger(),
+    )
+
+    outcome = process_single_import_file(
+        runtime,
+        {
+            "full_path": str(audio_file),
+            "filename": audio_file.name,
+            "title": "Song",
+            "artist": "Artist",
+            "from_own_tags": True,
+            "manual_match": {},
+        },
+    )
+
+    assert outcome == ("ok", "Song")
+    assert captured["from_own_tags"] is True
+    assert captured["override_id"] is None
+
+
+def test_process_single_import_file_manual_match_wins_over_from_own_tags(tmp_path):
+    audio_file = tmp_path / "Song.flac"
+    _touch(audio_file)
+    captured = {}
+
+    def fake_context(title, artist, **kwargs):
+        captured.update(kwargs)
+        return {
+            "source": "deezer",
+            "context": {"track_info": {"name": "Picked Song"}, "artist": {"name": "Picked Artist"}},
+        }
+
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
+        get_single_track_import_context=fake_context,
+        normalize_import_context=lambda context: context,
+        get_import_context_artist=lambda context: context["artist"],
+        get_import_track_info=lambda context: context["track_info"],
+        post_process_matched_download=lambda *_args: None,
+        logger=_FakeLogger(),
+    )
+
+    outcome = process_single_import_file(
+        runtime,
+        {
+            "full_path": str(audio_file),
+            "filename": audio_file.name,
+            "title": "Song",
+            "artist": "Artist",
+            "from_own_tags": True,
+            "manual_match": {"id": "track-9", "source": "deezer"},
+        },
+    )
+
+    assert outcome == ("ok", "Picked Song")
+    assert captured["from_own_tags"] is False
+    assert captured["override_id"] == "track-9"
+    assert captured["override_source"] == "deezer"
+
+
 def test_process_single_import_file_rejects_malformed_manual_match(tmp_path):
     audio_file = tmp_path / "Song.flac"
     _touch(audio_file)
-    runtime = ImportRouteRuntime(post_process_matched_download=lambda *_args: None, logger=_FakeLogger())
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
+        post_process_matched_download=lambda *_args: None,
+        logger=_FakeLogger(),
+    )
 
     outcome = process_single_import_file(
         runtime,
@@ -601,6 +848,65 @@ def test_process_single_import_file_rejects_malformed_manual_match(tmp_path):
     )
 
     assert outcome == ("error", "Malformed manual match for file: Song.flac")
+
+
+@pytest.mark.parametrize("path_kind", ["outside", "traversal", "symlink"])
+def test_single_import_rejects_paths_escaping_allowed_roots(tmp_path, path_kind):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    outside = tmp_path / "outside.flac"
+    _touch(outside)
+    if path_kind == "outside":
+        supplied = outside
+    elif path_kind == "traversal":
+        supplied = staging / ".." / outside.name
+    else:
+        supplied = staging / "escape.flac"
+        supplied.symlink_to(outside)
+    calls = []
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(staging)],
+        post_process_matched_download=lambda *args: calls.append(args),
+        logger=_FakeLogger(),
+    )
+
+    outcome = process_single_import_file(
+        runtime, {"full_path": str(supplied), "filename": supplied.name},
+    )
+
+    assert outcome[0] == "error"
+    assert "outside the allowed import folders" in outcome[1]
+    assert calls == []
+
+
+def test_album_import_rejects_forged_match_path_outside_allowed_root(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    outside = tmp_path / "outside.flac"
+    _touch(outside)
+    calls = []
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(staging)],
+        resolve_album_artist_context=lambda *_args, **_kwargs: {"name": "Artist"},
+        post_process_matched_download=lambda *args: calls.append(args),
+        is_active_media_server_ready=lambda: (True, ""),
+        logger=_FakeLogger(),
+    )
+
+    payload, status = album_process(runtime, {
+        "album": {"id": "album-1", "name": "Album"},
+        "matches": [{
+            "staging_file": {"full_path": str(outside), "filename": outside.name},
+            "track": {"name": "Track", "track_number": 1},
+        }],
+    })
+
+    assert status == 200
+    assert payload["processed"] == 0
+    assert payload["errors"] == [
+        "File is outside the allowed import folders: outside.flac",
+    ]
+    assert calls == []
 
 
 def test_singles_process_aggregates_worker_results_and_side_effects():
@@ -641,6 +947,7 @@ def test_singles_process_aggregates_worker_results_and_side_effects():
             "batch_complete",
             {
                 "playlist_name": "Import: Singles",
+                "artist": "Various",
                 "total_tracks": "2",
                 "completed_tracks": "1",
                 "failed_tracks": "1",
@@ -710,3 +1017,66 @@ def test_staging_scan_is_shared_across_files_groups_hints(tmp_path):
 
     # 2 files × ONE shared scan = 2 reads — not 6 (which is 2 files × 3 endpoints).
     assert sorted(reads) == [os.path.join("Album", "01.mp3"), os.path.join("Album", "02.mp3")]
+
+
+class TestBackfillStaleHistory:
+    """#1289 Bug 2: a stale terminal history row older than the 200-row
+    get_results window must still attach to its candidate."""
+
+    def _cand(self, path, folder_hash):
+        c = type('C', (), {})()
+        c.path = path
+        c.folder_hash = folder_hash
+        c.audio_files = []
+        return c
+
+    def _worker(self, db_rows):
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE auto_import_history (id INTEGER PRIMARY KEY, folder_hash TEXT, folder_path TEXT, status TEXT, created_at TEXT)")
+        for r in db_rows:
+            conn.execute("INSERT INTO auto_import_history (folder_hash, folder_path, status, created_at) VALUES (?,?,?,?)", r)
+        conn.commit()
+        w = type('W', (), {})()
+        w.database = type('D', (), {'_get_connection': lambda self: conn})()
+        return w
+
+    def test_stale_partial_row_backfilled(self):
+        from core.imports.routes import _backfill_stale_history
+        w = self._worker([('oldhash', '/staging/Old', 'partial', '2020-01-01')])
+        cand = self._cand('/staging/Old', 'oldhash')
+        out = _backfill_stale_history(w, [cand], [])
+        assert len(out) == 1
+        assert out[0]['status'] == 'partial'
+        assert out[0]['folder_hash'] == 'oldhash'
+
+    def test_window_row_not_duplicated(self):
+        from core.imports.routes import _backfill_stale_history
+        w = self._worker([('h1', '/staging/A', 'completed', '2024-01-01')])
+        cand = self._cand('/staging/A', 'h1')
+        window = [{'folder_hash': 'h1', 'folder_path': '/staging/A', 'status': 'completed'}]
+        out = _backfill_stale_history(w, [cand], window)
+        assert out == window
+
+    def test_none_path_does_not_crash(self):
+        from core.imports.routes import _backfill_stale_history
+        w = self._worker([])
+        cand = self._cand(None, None)
+        # must not raise TypeError from os.path.normpath(None)
+        assert _backfill_stale_history(w, [cand], []) == []
+
+    def test_path_fallback_when_hash_missing(self):
+        from core.imports.routes import _backfill_stale_history
+        w = self._worker([(None, '/staging/ByPath', 'failed', '2020-01-01')])
+        cand = self._cand('/staging/ByPath', 'newhash')
+        out = _backfill_stale_history(w, [cand], [])
+        assert len(out) == 1
+        assert out[0]['status'] == 'failed'
+
+
+def test_partial_rows_kept_without_files():
+    """#1289 Bug 3: partial history rows must survive even with no staged files
+    (regression guard for _KEEP_WITHOUT_FILES)."""
+    from core.imports.inbox import _KEEP_WITHOUT_FILES
+    assert 'partial' in _KEEP_WITHOUT_FILES

@@ -126,6 +126,77 @@ If omitted, defaults to profile 1 (admin). Profile scoping applies to: watchlist
 
 ---
 
+## MCP for AI clients
+
+SoulSync can act as an MCP server, so an AI app like Claude can search for music, check what you already own, and download things for you.
+
+### Turn it on
+
+Go to **Settings > Advanced > SoulSync API > MCP for AI Clients** and tick **Answer MCP requests at /mcp**. While it's off, `/mcp` answers `404`.
+
+### Connect a client
+
+Add `http://<host>:8008/mcp` as a remote (streamable HTTP) MCP server and send a SoulSync API key as a Bearer token. For Claude Code:
+
+```bash
+claude mcp add --transport http soulsync http://localhost:8008/mcp --header "Authorization: Bearer sk_..."
+```
+
+Both protocol styles work: `2026-07-28` (no handshake) and `2025-03-26` through `2025-11-25` (initialize first). Requests from a browser page on another site are refused, so a key that leaks into a web page can't be used from there.
+
+### What a key can do
+
+Every tool call runs as the matching `/api/v1` request with your key, so the usual rules apply: the same scope checks, the same profile, and the same 60 requests a minute.
+
+- An **admin** key gets all 35 tools.
+- A **read** key only gets the tools that look things up. A write tool still answers `403` if one is ever called with a read key.
+- Settings, API keys, profiles, cancel-all and blocklist clears are never tools, whatever the key.
+
+### Tools
+
+| Group | Tools |
+|-------|-------|
+| Status | `get_server_status`, `get_recent_activity`, `get_library_stats` |
+| Your library | `search_library_artists`, `get_library_artist`, `list_artist_albums`, `search_library_albums`, `get_album_tracks`, `search_library_tracks`, `recently_added`, `recently_played` |
+| Queues | `list_wishlist`, `list_watchlist`, `list_downloads`, `list_playlists`, `get_request_status` |
+| Discovery | `recent_releases`, `similar_artists` |
+| Video | `video_search`, `video_library`, `video_wishlist`, `video_downloads`, `video_calendar` |
+| Getting music | `search_music`, `find_album`, `request_album`, `request_track`, `process_wishlist`, `remove_from_wishlist`, `watch_artist`, `unwatch_artist`, `scan_watchlist`, `cancel_download` |
+| Getting video | `video_wishlist_add`, `video_follow` |
+
+To get a whole album, the client calls `find_album` with "Artist - Album" and then `request_album` with the id it returns. Every track goes on the wishlist and tracks you already own are skipped. For one track, `request_track` takes "Artist - Title".
+
+---
+
+## Lidarr compatible API
+
+Some request apps only know how to talk to Lidarr. SoulSync can answer as Lidarr, so those apps send their album requests to SoulSync instead. Built for **Singarr** and **MusicSeerr 1.x**. MusicSeerr 2.0 and newer dropped Lidarr support, so it can't connect.
+
+### Turn it on
+
+Go to **Settings > Advanced > SoulSync API > Lidarr Compatible API**:
+
+1. Tick **Answer as Lidarr at /lidarr**. While it's off, every `/lidarr` route answers `404`.
+2. Pick **Requests go to profile**. Requested albums land on that profile's wishlist.
+
+### Connect the app
+
+In the request app, set the Lidarr URL to `http://<host>:8008/lidarr` and paste a SoulSync **admin** API key as the Lidarr API key. A read key gets `401`. The app talks to `/lidarr/api/v1` like it would to a real Lidarr.
+
+### What happens
+
+- Artist and album lookups come from MusicBrainz.
+- When the app asks for an album to be searched (on add, or with an album or artist search), every track of that album goes on the profile's wishlist and downloads like any other wishlist item. Tracks you already own are skipped.
+- If the profile can't download on its own, every request waits for approval on the **Requests** page first.
+- The app's "do we have it" view checks your SoulSync library.
+- Deleting an artist or album in the app only removes it from SoulSync's Lidarr list. Files on disk are never touched.
+
+### Supported routes
+
+All under `/lidarr/api/v1`: `system/status`, `qualityprofile`, `metadataprofile`, `rootfolder`, `tag`, `artist` (list, lookup, add, edit, editor, delete), `album` (list, lookup, add, edit, monitor, delete), `track`, `trackfile`, `command` (`AlbumSearch`, `ArtistSearch`, `RefreshArtist`; other commands are accepted and do nothing), `queue`, `history` and `wanted/missing`.
+
+---
+
 ## Endpoints
 
 ### System
@@ -210,7 +281,7 @@ List library artists with search, letter filtering, and pagination.
   "data": {
     "artists": [
       {
-        "id": 42,
+        "id": "42",
         "name": "Radiohead",
         "thumb_url": null,
         "banner_url": null,
@@ -248,7 +319,7 @@ List library artists with search, letter filtering, and pagination.
 }
 ```
 
-> **Note:** The list endpoint returns a subset of metadata fields. Some fields like `summary`, `style`, `mood`, `label`, `banner_url`, and all `*_match_status` / `*_last_attempted` timestamps may be `null` in list view. Use the detail endpoint below for the complete record.
+> **Note:** The list endpoint returns a subset of metadata fields. Some fields like `summary`, `style`, `mood`, `label`, `banner_url`, and most `*_match_status` / `*_last_attempted` timestamps may be `null` in list view (the Discogs, Amazon, and JioSaavn statuses and timestamps are included). Use the detail endpoint below for the complete record.
 
 #### `GET /api/v1/library/artists/<artist_id>`
 
@@ -258,7 +329,7 @@ Get a single artist by ID with **all metadata** and their album list.
 {
   "data": {
     "artist": {
-      "id": 42,
+      "id": "42",
       "name": "Radiohead",
       "thumb_url": "https://i.scdn.co/image/abc123...",
       "banner_url": "https://www.theaudiodb.com/images/media/artist/fanart/...",
@@ -288,8 +359,8 @@ Get a single artist by ID with **all metadata** and their album list.
     },
     "albums": [
       {
-        "id": 87,
-        "artist_id": 42,
+        "id": "87",
+        "artist_id": "42",
         "title": "OK Computer",
         "year": 1997,
         "...": "..."
@@ -303,7 +374,7 @@ Get a single artist by ID with **all metadata** and their album list.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | int | Internal database ID |
+| `id` | string | Internal database ID (text; usually numeric, standalone libraries may use opaque IDs containing `::soulsync`) |
 | `name` | string | Artist name |
 | `thumb_url` | string? | Artist thumbnail/profile image URL |
 | `banner_url` | string? | Artist banner/fanart image URL (from AudioDB) |
@@ -330,6 +401,23 @@ Get a single artist by ID with **all metadata** and their album list.
 | `itunes_last_attempted` | string? | ISO 8601 timestamp of last iTunes lookup |
 | `audiodb_last_attempted` | string? | ISO 8601 timestamp of last AudioDB lookup |
 | `deezer_last_attempted` | string? | ISO 8601 timestamp of last Deezer lookup |
+| `soul_id` | string? | Cross-install identity used by the MetaSync network |
+| `soul_id_path` | string? | How the `soul_id` was derived (`canonical`, `album`, or `name`) |
+| `aliases` | string[] | Alternate artist names (from MusicBrainz) |
+| `discogs_id` | string? | Discogs artist ID |
+| `discogs_bio` | string? | Artist biography (from Discogs) |
+| `discogs_members` | string[] | Band member names (from Discogs) |
+| `discogs_urls` | string[] | External links (from Discogs) |
+| `discogs_match_status` | string? | Discogs enrichment status |
+| `discogs_last_attempted` | string? | ISO 8601 timestamp of last Discogs lookup |
+| `amazon_id` | string? | Amazon artist ID |
+| `amazon_match_status` | string? | Amazon enrichment status |
+| `amazon_last_attempted` | string? | ISO 8601 timestamp of last Amazon lookup |
+| `jiosaavn_id` | string? | JioSaavn artist ID |
+| `jiosaavn_match_status` | string? | JioSaavn enrichment status |
+| `jiosaavn_last_attempted` | string? | ISO 8601 timestamp of last JioSaavn lookup |
+| `art_locked` | bool? | Custom artwork lock: scans keep the current artwork |
+| `genres_locked` | bool? | Genre lock: scans keep the current genres |
 
 > Fields marked `?` may be `null` if the data hasn't been enriched from that provider yet.
 
@@ -348,7 +436,7 @@ List/search all albums with pagination and optional filters.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `search` | string | | Filter by album title |
-| `artist_id` | int | | Filter by artist ID |
+| `artist_id` | string | | Filter by artist ID (text; may be opaque). An empty value means no filter |
 | `year` | int | | Filter by release year |
 | `page` | int | 1 | Page number |
 | `limit` | int | 50 | Items per page (max 200) |
@@ -362,8 +450,8 @@ Get a single album by ID with **all metadata** and embedded track list.
 {
   "data": {
     "album": {
-      "id": 87,
-      "artist_id": 42,
+      "id": "87",
+      "artist_id": "42",
       "title": "OK Computer",
       "year": 1997,
       "thumb_url": "https://i.scdn.co/image/...",
@@ -396,7 +484,7 @@ Get a single album by ID with **all metadata** and embedded track list.
     },
     "tracks": [
       {
-        "id": 510,
+        "id": "510",
         "title": "Airbag",
         "track_number": 1,
         "...": "..."
@@ -410,8 +498,8 @@ Get a single album by ID with **all metadata** and embedded track list.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | int | Internal database ID |
-| `artist_id` | int | Parent artist ID |
+| `id` | string | Internal database ID (text; may be opaque) |
+| `artist_id` | string | Parent artist ID |
 | `title` | string | Album title |
 | `year` | int? | Release year |
 | `thumb_url` | string? | Album cover art URL |
@@ -441,6 +529,40 @@ Get a single album by ID with **all metadata** and embedded track list.
 | `itunes_last_attempted` | string? | ISO 8601 timestamp |
 | `audiodb_last_attempted` | string? | ISO 8601 timestamp |
 | `deezer_last_attempted` | string? | ISO 8601 timestamp |
+| `release_date` | string? | Full release date when known (alongside the extracted `year`) |
+| `soul_id` | string? | Cross-install identity used by the MetaSync network |
+| `discogs_id` | string? | Discogs release ID |
+| `discogs_genres` | string[] | Genres (from Discogs) |
+| `discogs_styles` | string[] | Styles (from Discogs) |
+| `discogs_label` | string? | Label (from Discogs) |
+| `discogs_catno` | string? | Catalog number (from Discogs) |
+| `discogs_country` | string? | Release country (from Discogs) |
+| `discogs_rating` | float? | Community rating (from Discogs) |
+| `discogs_rating_count` | int? | Number of community ratings (from Discogs) |
+| `discogs_match_status` | string? | Discogs enrichment status |
+| `discogs_last_attempted` | string? | ISO 8601 timestamp |
+| `amazon_id` | string? | Amazon album ID |
+| `amazon_match_status` | string? | Amazon enrichment status |
+| `amazon_last_attempted` | string? | ISO 8601 timestamp |
+| `jiosaavn_id` | string? | JioSaavn album ID |
+| `jiosaavn_match_status` | string? | JioSaavn enrichment status |
+| `jiosaavn_last_attempted` | string? | ISO 8601 timestamp |
+| `bandcamp_id` | string? | Bandcamp release ID |
+| `bandcamp_url` | string? | Bandcamp release URL |
+| `bandcamp_tags` | string[] | Tags (from Bandcamp) |
+| `bandcamp_label` | string? | Label (from Bandcamp) |
+| `bandcamp_match_status` | string? | Bandcamp enrichment status |
+| `bandcamp_last_attempted` | string? | ISO 8601 timestamp |
+| `api_track_count` | int? | Track count of the canonical release, when resolved |
+| `canonical_track_count` | int? | Track count fetched for the selected canonical release |
+| `canonical_source` | string? | Provider that supplied the canonical release |
+| `canonical_album_id` | string? | Provider ID of the canonical release |
+| `canonical_score` | float? | Confidence score of the canonical match |
+| `canonical_resolved_at` | string? | ISO 8601 timestamp of canonical resolution |
+| `canonical_locked` | bool? | Canonical selection was locked by hand |
+| `art_locked` | bool? | Custom artwork lock: scans keep the current artwork |
+| `genres_locked` | bool? | Genre lock: scans keep the current genres |
+| `metadata_locked` | bool? | Metadata lock: the row was hand-tagged and scans keep it |
 
 #### `GET /api/v1/library/albums/<album_id>/tracks`
 
@@ -458,9 +580,9 @@ Get a single track by ID with **all metadata**.
 {
   "data": {
     "track": {
-      "id": 512,
-      "album_id": 87,
-      "artist_id": 42,
+      "id": "512",
+      "album_id": "87",
+      "artist_id": "42",
       "title": "Paranoid Android",
       "artist_name": "Radiohead",
       "album_title": "OK Computer",
@@ -501,15 +623,15 @@ Get a single track by ID with **all metadata**.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | int | Internal database ID |
-| `album_id` | int | Parent album ID |
-| `artist_id` | int | Parent artist ID |
+| `id` | string | Internal database ID (text; may be opaque) |
+| `album_id` | string | Parent album ID |
+| `artist_id` | string | Parent artist ID |
 | `title` | string | Track title |
 | `artist_name` | string? | Artist name (joined from artists table) |
 | `album_title` | string? | Album title (joined from albums table) |
 | `track_number` | int? | Track number on the album |
 | `duration` | int? | Duration in milliseconds |
-| `file_path` | string? | File path on the media server |
+| `file_path` | string? | SoulSync's local file path for the track |
 | `bitrate` | int? | Audio bitrate in kbps |
 | `bpm` | float? | Beats per minute |
 | `explicit` | bool? | Whether track contains explicit content |
@@ -535,6 +657,27 @@ Get a single track by ID with **all metadata**.
 | `itunes_last_attempted` | string? | ISO 8601 timestamp |
 | `audiodb_last_attempted` | string? | ISO 8601 timestamp |
 | `deezer_last_attempted` | string? | ISO 8601 timestamp |
+| `disc_number` | int? | Disc number for multi-disc releases |
+| `year` | int? | Per-track release year from file tags |
+| `track_artist` | string? | Track performer credit (e.g. on compilations) |
+| `recording_disambiguation` | string? | MusicBrainz recording comment distinguishing versions (e.g. live, acoustic) |
+| `server_path` | string? | File path as reported by the media server |
+| `file_size` | int? | File size in bytes |
+| `soul_id` | string? | Cross-install song identity used by the MetaSync network |
+| `album_soul_id` | string? | Cross-install identity of this track's specific release |
+| `amazon_id` | string? | Amazon track ID |
+| `amazon_match_status` | string? | Amazon enrichment status |
+| `amazon_last_attempted` | string? | ISO 8601 timestamp |
+| `jiosaavn_id` | string? | JioSaavn track ID |
+| `jiosaavn_match_status` | string? | JioSaavn enrichment status |
+| `jiosaavn_last_attempted` | string? | ISO 8601 timestamp |
+| `bandcamp_id` | string? | Bandcamp track ID |
+| `bandcamp_url` | string? | Bandcamp track URL |
+| `bandcamp_tags` | string[] | Tags (from Bandcamp) |
+| `bandcamp_label` | string? | Label (from Bandcamp) |
+| `bandcamp_match_status` | string? | Bandcamp enrichment status |
+| `bandcamp_last_attempted` | string? | ISO 8601 timestamp |
+| `metadata_locked` | bool? | Metadata lock: the row was hand-tagged and scans keep it |
 
 #### `GET /api/v1/library/tracks`
 
@@ -593,8 +736,8 @@ Get recently added content, ordered by creation date.
   "data": {
     "items": [
       {
-        "id": 4831,
-        "artist_id": 42,
+        "id": "4831",
+        "artist_id": "42",
         "title": "A Moon Shaped Pool",
         "year": 2016,
         "thumb_url": "https://...",
@@ -613,14 +756,16 @@ Get recently added content, ordered by creation date.
 
 #### `GET /api/v1/library/lookup`
 
-Look up a library entity by its external provider ID. Useful for cross-referencing with Spotify, MusicBrainz, iTunes, Deezer, or AudioDB.
+Look up a library entity by its external provider ID. Useful for cross-referencing with Spotify, MusicBrainz, iTunes, Deezer, AudioDB, Tidal, Qobuz, Genius, Discogs, Amazon, JioSaavn, or Bandcamp.
 
 | Param | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` | string | Yes | `artist`, `album`, or `track` |
-| `provider` | string | Yes | `spotify`, `musicbrainz`, `itunes`, `deezer`, or `audiodb` |
+| `provider` | string | Yes | `spotify`, `musicbrainz`, `itunes`, `deezer`, `audiodb`, `tidal`, `qobuz`, `genius`, `discogs`, `amazon`, `jiosaavn`, or `bandcamp` |
 | `id` | string | Yes | The external ID value |
 | `fields` | string | No | Comma-separated field list |
+
+Not every provider applies to every type: Genius IDs are not stored for albums, Bandcamp IDs are not stored for artists, and Discogs IDs are not stored for tracks. Those combinations return `400 BAD_REQUEST`.
 
 **Example — find an artist by Spotify ID:**
 
@@ -632,7 +777,7 @@ GET /api/v1/library/lookup?type=artist&provider=spotify&id=4Z8W4fKeB5YxbusRsdQVP
 {
   "data": {
     "artist": {
-      "id": 42,
+      "id": "42",
       "name": "Radiohead",
       "spotify_artist_id": "4Z8W4fKeB5YxbusRsdQVPb",
       "...": "..."
@@ -665,6 +810,59 @@ Library statistics (counts and database info).
     "tracks": 52100,
     "database_size_mb": 145.2,
     "last_update": "2026-03-04T09:00:00"
+  }
+}
+```
+
+---
+
+### Library — Download Activity
+
+#### `GET /api/v1/library/download-activity`
+
+Per-album completed-download aggregates, used by the MetaSync node to build its download-based signals. One row per library album that has at least one completed download, keyed by the album's MusicBrainz release ID (an opaque text identifier). Only IDs, counts, and timestamps are returned — no titles or file paths. Albums without a MusicBrainz release ID do not appear.
+
+**Parameters:**
+- `since` (optional): ISO-8601 timestamp. Each row's `completed_since` counts only downloads completed at or after this instant.
+- `until` (optional): ISO-8601 timestamp. `completed_since` counts only downloads completed before this instant, so `since` + `until` count one closed window. Without either, `completed_since` equals `completed_downloads`.
+
+```json
+{
+  "data": {
+    "albums": [
+      {
+        "musicbrainz_release_id": "b1392450-e666-3926-a536-22c65f834433",
+        "completed_downloads": 12,
+        "completed_since": 3,
+        "first_downloaded_at": "2026-08-02 14:03:11",
+        "last_downloaded_at": "2026-10-21 09:30:00"
+      }
+    ]
+  }
+}
+```
+
+#### `GET /api/v1/library/listening-activity`
+
+Per-album listening aggregates for one time window, used by the MetaSync node for its opt-in listening signal. One row per library album played in `[since, until)`, keyed by the album's MusicBrainz release ID: how many plays, how many distinct tracks, and on how many distinct (UTC) days. Only IDs and counts are returned — no titles, no individual play times, no profile or media-server details. Albums without a MusicBrainz release ID, and plays that matched no library track, do not appear.
+
+Only the **shared** listening history is read — the plays the admin's own stats show. A profile with its own ListenBrainz, Last.fm, or media-server account keeps its own history, and that history is never included here.
+
+**Parameters:**
+- `since` (required): ISO-8601 timestamp, window start (inclusive).
+- `until` (required): ISO-8601 timestamp, window end (exclusive). At most 31 days after `since`.
+
+```json
+{
+  "data": {
+    "albums": [
+      {
+        "musicbrainz_release_id": "b1392450-e666-3926-a536-22c65f834433",
+        "plays": 14,
+        "distinct_tracks": 9,
+        "distinct_days": 3
+      }
+    ]
   }
 }
 ```
@@ -924,7 +1122,7 @@ Remove a track from the wishlist by its Spotify track ID.
 
 #### `POST /api/v1/wishlist/process`
 
-Trigger wishlist download processing (retries all failed tracks).
+Trigger wishlist download processing (retries all failed tracks). `409 CONFLICT` while a run is already in progress.
 
 ---
 
@@ -957,7 +1155,8 @@ List all watched artists for the current profile.
         "include_live": false,
         "include_remixes": false,
         "include_acoustic": false,
-        "include_compilations": false
+        "include_compilations": false,
+        "follow_defaults": true
       }
     ]
   }
@@ -985,6 +1184,7 @@ List all watched artists for the current profile.
 | `include_remixes` | bool | Include remixes |
 | `include_acoustic` | bool | Include acoustic versions |
 | `include_compilations` | bool | Include compilations |
+| `follow_defaults` | bool | The artist uses the watchlist defaults. The `include_*` fields then show the defaults, which are the rules a scan applies |
 
 #### `POST /api/v1/watchlist`
 
@@ -1009,7 +1209,9 @@ Update content type filters for a watched artist without having to remove and re
 }
 ```
 
-Accepts any combination of: `include_albums`, `include_eps`, `include_singles`, `include_live`, `include_remixes`, `include_acoustic`, `include_compilations`.
+Accepts any combination of: `include_albums`, `include_eps`, `include_singles`, `include_live`, `include_remixes`, `include_acoustic`, `include_compilations`, `follow_defaults`.
+
+Send `"follow_defaults": true` to put an artist back on the watchlist defaults. Sending release rules for an artist that follows the defaults gives it its own rules, starting from the defaults it was getting, so the fields you leave out keep the values a scan was already using.
 
 **Response:**
 
@@ -2112,6 +2314,91 @@ Update settings (partial update). Uses dot-notation keys.
 
 ---
 
+### Video
+
+The movies and TV side. Every endpoint runs the same handler the web UI uses and wraps it in the v1 envelope. Returns `503 NOT_AVAILABLE` on a server with the video side disabled.
+
+#### `GET /api/v1/video/library`
+
+Titles in the video library. `kind=movies|shows` (default `movies`), plus `search`, `letter`, `sort`, `status`, `genre`, `resolution`, `page`, `limit`. When `kind=shows`, the response also includes `total_episodes` — the global episode count across all shows.
+
+#### `GET /api/v1/video/library/genres`
+
+#### `GET /api/v1/video/search?q=`
+
+TMDB multi-search over movies, shows and people.
+
+#### `GET /api/v1/video/trending`
+
+#### `GET /api/v1/video/wishlist`
+
+`kind=movie|show` for a page of items (`search`, `sort`, `page`, `limit`); no `kind` returns counts only.
+
+#### `GET /api/v1/video/wishlist/counts`
+
+#### `POST /api/v1/video/wishlist`
+
+Add a movie, or a set of a show's episodes:
+
+```json
+{"movie": {"tmdb_id": 603, "title": "The Matrix", "year": 1999}}
+```
+
+```json
+{"show": {"tmdb_id": 1396, "title": "Breaking Bad"},
+ "episodes": [{"season_number": 1, "episode_number": 1}, {"season_number": 1, "episode_number": 2}]}
+```
+
+#### `DELETE /api/v1/video/wishlist`
+
+Body: `{"scope": "movie|show|season|episode", "tmdb_id": 603, "season_number"?: 1, "episode_number"?: 1}`.
+
+#### `GET /api/v1/video/watchlist`
+
+Followed shows, people and studios.
+
+#### `POST /api/v1/video/watchlist`
+
+Body: `{"kind": "show|person|studio", "tmdb_id": 1396, "title": "Breaking Bad"}`.
+
+#### `DELETE /api/v1/video/watchlist`
+
+Body: `{"kind": "show", "tmdb_id": 1396}`.
+
+#### `POST /api/v1/video/scan`
+
+Ask for a library scan. Body: `{"mode"?: "incremental|deep|full"}`. `409 CONFLICT` while one is running.
+
+#### `GET /api/v1/video/scan/status`
+
+#### `GET /api/v1/video/stats`
+
+One call for a dashboard widget. `library` (`movies`, `shows`, `episodes` on disk, `episodes_missing` = monitored and aired with no file, `size_bytes`), scoped to the video server; `database` (`size_mb`, `last_update`, `last_scan`, ISO UTC); `downloads` (`active`, `failed`, `completed`, `cancelled`, `by_status`, `speed_bps`, `completed_all_time`); `wishlist` (`movies`, `episodes`, `videos`, `total`).
+
+#### `GET /api/v1/video/downloads`
+
+Video downloads, active rows first then newest (the latest 100). `status` filters by one status or a comma list: `queued`, `searching`, `downloading`, `importing`, `failed`, `import_failed`, `completed`, `cancelled`, plus `active` and `failed` as shorthand for their groups. A filtered answer adds `count`. An unknown status is `400 BAD_REQUEST`.
+
+#### `GET /api/v1/video/downloads/status`
+
+#### `GET /api/v1/video/downloads/history`
+
+#### `GET /api/v1/video/calendar`
+
+Upcoming and recent episodes and releases. `start` and `end` as ISO dates.
+
+#### `GET /api/v1/video/requests`
+
+#### `POST /api/v1/video/requests`
+
+File a request for an admin to approve. Body: `{"kind": "movie|show", "tmdb_id": 27205, "title": "Inception", "year"?: 2010, "note"?: "..."}`.
+
+#### `POST /api/v1/video/requests/<id>/approve`
+
+#### `POST /api/v1/video/requests/<id>/deny`
+
+---
+
 ### API Key Management
 
 #### `GET /api/v1/api-keys`
@@ -2426,6 +2713,29 @@ curl -H "Authorization: Bearer sk_..." \
 | GET | `/playlists` | List playlists |
 | GET | `/playlists/<id>` | Playlist detail + tracks |
 | POST | `/playlists/<id>/sync` | Trigger playlist sync |
+| **Video** | | |
+| GET | `/video/library` | Movies or shows in the library |
+| GET | `/video/library/genres` | Video genres |
+| GET | `/video/search` | TMDB multi-search |
+| GET | `/video/trending` | Trending titles |
+| GET | `/video/wishlist` | Wishlist page or counts |
+| GET | `/video/wishlist/counts` | Wishlist counts |
+| POST | `/video/wishlist` | Add a movie or episodes |
+| DELETE | `/video/wishlist` | Remove at any scope |
+| GET | `/video/watchlist` | Followed shows / people / studios |
+| POST | `/video/watchlist` | Follow |
+| DELETE | `/video/watchlist` | Unfollow |
+| POST | `/video/scan` | Ask for a library scan |
+| GET | `/video/scan/status` | Scan progress |
+| GET | `/video/stats` | Library, database, download and wishlist counts |
+| GET | `/video/downloads` | Downloads (`?status=` filter) |
+| GET | `/video/downloads/status` | Download status |
+| GET | `/video/downloads/history` | Download history |
+| GET | `/video/calendar` | Upcoming / recent releases |
+| GET | `/video/requests` | Requests |
+| POST | `/video/requests` | File a request |
+| POST | `/video/requests/<id>/approve` | Approve |
+| POST | `/video/requests/<id>/deny` | Deny |
 | **Settings** | | |
 | GET | `/settings` | Get settings (redacted) |
 | PATCH | `/settings` | Update settings |

@@ -20,6 +20,33 @@ def _int(val):
         return None
 
 
+def tmdb_certification(kind, dr, region="US"):
+    """the title's certification out of a tmdb detail response, or None.
+
+    movies carry it under release_dates (per country, per release type),
+    shows under content_ratings. the viewer's region first, then US, since
+    the kids caps are written in us terms.
+    """
+    order = [c for c in dict.fromkeys([(region or "US").upper(), "US"]) if c]
+    if kind == "show":
+        rows = {str(x.get("iso_3166_1") or "").upper(): (x.get("rating") or "").strip()
+                for x in ((dr.get("content_ratings") or {}).get("results") or [])}
+        for c in order:
+            if rows.get(c):
+                return rows[c]
+        return None
+    by_country = {}
+    for x in ((dr.get("release_dates") or {}).get("results") or []):
+        certs = [(d.get("certification") or "").strip() for d in (x.get("release_dates") or [])]
+        certs = [c for c in certs if c]
+        if certs:
+            by_country[str(x.get("iso_3166_1") or "").upper()] = certs[0]
+    for c in order:
+        if by_country.get(c):
+            return by_country[c]
+    return None
+
+
 class TMDBClient:
     BASE = "https://api.themoviedb.org/3"
     IMG = "https://image.tmdb.org/t/p/original"
@@ -229,6 +256,23 @@ class TMDBClient:
         out = self._parse_extras(kind, r.json() or {}, region)
         self._fill_collection(out)
         return out
+
+    def show_anime_hint(self, tmdb_id):
+        """Does TMDB suggest this TV show is anime? True / False, or None when
+        TMDB can't say (no key, not found). One small call: the show plus its
+        keywords -- the FULL keyword list, unlike the detail payload, which keeps
+        only the first 14. See core.video.anime_hint for the rule."""
+        if not self.api_key or tmdb_id is None:
+            return None
+        import requests
+        r = requests.get(self.BASE + "/tv/" + str(int(tmdb_id)), params={
+            "api_key": self.api_key, "append_to_response": "keywords"}, timeout=15)
+        r.raise_for_status()
+        raw = r.json() or {}
+        if not raw.get("id"):
+            return None
+        from core.video.anime_hint import tmdb_suggests_anime
+        return tmdb_suggests_anime(raw)
 
     def movie_release_dates(self, tmdb_id):
         """TMDB /movie/{id}/release_dates 'results' — per-country release dates by type
@@ -937,10 +981,12 @@ class TMDBClient:
         import requests
         path = ("/movie/" if kind == "movie" else "/tv/") + str(tmdb_id)
         agg = ",aggregate_credits" if kind == "show" else ""
+        # the certification rides the same call, kids profiles need it
+        cert = ",content_ratings" if kind == "show" else ",release_dates"
         r = requests.get(self.BASE + path, params={
             "api_key": self.api_key,
             "append_to_response": "external_ids,credits,images,videos,watch/providers,similar,"
-                                  "recommendations,keywords,reviews" + agg,
+                                  "recommendations,keywords,reviews" + agg + cert,
             "include_image_language": "en,null"}, timeout=15)
         r.raise_for_status()
         dr = r.json() or {}
@@ -966,6 +1012,7 @@ class TMDBClient:
             "crew": [{"name": p["name"], "job": p.get("job"), "tmdb_id": p.get("tmdb_id")}
                      for p in cmeta.get("crew") or []],
             "_extras": self._parse_extras(kind, dr, region),
+            "content_rating": tmdb_certification(kind, dr, region),
         }
         self._fill_collection(out["_extras"])
         if kind == "movie":

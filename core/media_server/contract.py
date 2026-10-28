@@ -85,10 +85,53 @@ REQUIRED_METHODS = {
 # Coverage today (audited 2026-05):
 #   search_tracks: Plex ✓, Navidrome ✓, Jellyfin ✗, SoulSync ✗
 #   get_recently_added_albums: Jellyfin ✓, Navidrome ✓, SoulSync ✓, Plex ✗ (uses recentlyAdded() on music library)
-#   trigger_library_scan / is_library_scanning: Plex ✓, Jellyfin ✓, Navidrome ✓, SoulSync ✗ (filesystem walks in-process)
+#   trigger_library_scan / is_library_scanning: Plex ✓, Jellyfin ✓, Navidrome ✓, SoulSync ✓ (background filesystem rescan)
 #   get_library_stats: Plex ✓, Jellyfin ✓, Navidrome ✓, SoulSync ✗
 #   create_playlist / update_playlist / get_all_playlists / etc: Plex ✓, Jellyfin ✓, Navidrome ✓, SoulSync ✗
 #   update_artist_*, update_album_poster, update_track_metadata: Plex ✓, Jellyfin partial, Navidrome stubs, SoulSync ✗
+class Capability:
+    """Names for what a server can do, declared per client on
+    ``MediaServerBase.CAPABILITIES``. Call sites ask the engine
+    ``active_supports(Capability.X)`` instead of comparing server names.
+    ``CAPABILITY_METHODS`` says which methods back each one; the
+    conformance test holds every declaration to it."""
+
+    SEARCH = 'search'                      # search_tracks
+    RECENTLY_ADDED = 'recently_added'      # get_recently_added_albums
+    SCAN_TRIGGER = 'scan_trigger'          # trigger_library_scan / is_library_scanning
+    LIBRARY_STATS = 'library_stats'        # get_library_stats
+    PLAYLISTS = 'playlists'                # create / update / append / list / get by name
+    PLAYLIST_IMAGE = 'playlist_image'      # set_playlist_image
+    PLAY_HISTORY = 'play_history'          # get_play_history / get_track_play_counts
+    CURATION_SIGNALS = 'curation_signals'  # get_curation_signals
+    METADATA_WRITE = 'metadata_write'      # update_artist_* / update_album_poster really write
+    TRACK_METADATA_WRITE = 'track_metadata_write'  # update_track_metadata
+    PER_USER_VIEWS = 'per_user_views'      # user_view(identity) returns an acting-as client
+    # The server picks up tag changes on disk by itself; nothing to push
+    # and no rescan to request after a tag write. No backing method.
+    TAGS_AUTODETECTED = 'tags_autodetected'
+
+
+CAPABILITY_METHODS = {
+    Capability.SEARCH: ('search_tracks',),
+    Capability.RECENTLY_ADDED: ('get_recently_added_albums',),
+    Capability.SCAN_TRIGGER: ('trigger_library_scan', 'is_library_scanning'),
+    Capability.LIBRARY_STATS: ('get_library_stats',),
+    Capability.PLAYLISTS: ('create_playlist', 'update_playlist', 'append_to_playlist',
+                           'get_all_playlists', 'get_playlist_by_name'),
+    Capability.PLAYLIST_IMAGE: ('set_playlist_image',),
+    Capability.PLAY_HISTORY: ('get_play_history', 'get_track_play_counts'),
+    Capability.CURATION_SIGNALS: ('get_curation_signals',),
+    Capability.METADATA_WRITE: ('update_artist_genres', 'update_artist_poster',
+                                'update_album_poster', 'update_artist_biography'),
+    Capability.TRACK_METADATA_WRITE: ('update_track_metadata',),
+    Capability.PER_USER_VIEWS: ('user_view',),
+    Capability.TAGS_AUTODETECTED: (),
+}
+
+ALL_CAPABILITIES = frozenset(CAPABILITY_METHODS)
+
+
 KNOWN_PER_SERVER_METHODS = (
     'search_tracks',
     'get_recently_added_albums',
@@ -103,6 +146,10 @@ KNOWN_PER_SERVER_METHODS = (
     'get_playlist_by_name',
     'get_play_history',
     'get_track_play_counts',
+    # Per-user favourites / ratings / playlist membership, for the Expired
+    # Download Cleaner's keep decision. Optional like the two above: a server
+    # that doesn't implement it simply contributes no signals.
+    'get_curation_signals',
     'update_artist_genres',
     'update_artist_poster',
     'update_album_poster',

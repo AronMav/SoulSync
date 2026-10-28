@@ -16,6 +16,51 @@ logger = get_logger("video_api.detail")
 
 
 def register_routes(bp):
+    @bp.route("/detail/tmdb/show/<int:tmdb_id>/series-type", methods=["GET"])
+    def video_tmdb_show_series_type(tmdb_id):
+        """The folder-routing type of a show, for the show page's Type chip and
+        the approve sheet: {owned, series_type, source, anime_folder}.
+
+        A show in a library reports its library's answer (source 'library').
+        A show in no library reports its stored hint ('hint-user' / 'hint-tmdb'),
+        or nothing yet. ``?suggest=1`` from an admin, with an anime folder set,
+        asks TMDB once and stores the suggestion first (the approve sheet)."""
+        from flask import g
+
+        from . import get_video_db
+        db = get_video_db()
+        anime_folder = bool(db.get_setting("anime_path"))
+        if db.owns_show(tmdb_id):
+            return jsonify({"owned": True, "series_type": db.routing_series_type(tmdb_id=tmdb_id),
+                            "source": "library", "anime_folder": anime_folder})
+        hint = db.show_type_hint(tmdb_id)
+        is_admin = bool(getattr(g, "is_admin", getattr(g, "profile_id", 1) == 1))
+        if not hint and anime_folder and is_admin and request.args.get("suggest") in ("1", "true"):
+            from core.video.anime_hint import ensure_show_type_hint
+            ensure_show_type_hint(db, tmdb_id)
+            hint = db.show_type_hint(tmdb_id)
+        return jsonify({"owned": False,
+                        "series_type": (hint or {}).get("series_type") or "standard",
+                        "source": ("hint-" + hint["source"]) if hint else None,
+                        "anime_folder": anime_folder})
+
+    @bp.route("/detail/tmdb/show/<int:tmdb_id>/series-type", methods=["PUT"])
+    def video_tmdb_show_series_type_set(tmdb_id):
+        """Set the type of a show in NO library yet (admin; the path's
+        '/series-type' suffix is admin-gated for writes). Body {series_type}.
+        A show already in a library is set in its Manage panel instead (409)."""
+        from . import get_video_db
+        db = get_video_db()
+        st = str((request.get_json(silent=True) or {}).get("series_type") or "").strip().lower()
+        if st not in ("standard", "daily", "anime"):
+            return jsonify({"success": False, "error": "series_type must be standard|daily|anime"}), 400
+        if db.owns_show(tmdb_id):
+            return jsonify({"success": False,
+                            "error": "This show is in your library: set its type in Manage."}), 409
+        if not db.set_show_type_hint(tmdb_id, st, source="user"):
+            return jsonify({"success": False, "error": "Could not save."}), 500
+        return jsonify({"success": True, "series_type": st, "source": "hint-user"})
+
     @bp.route("/monitor", methods=["POST"])
     def video_set_monitor():
         from . import get_video_db
@@ -27,6 +72,95 @@ def register_routes(bp):
         if not ok:
             return jsonify({"error": "not found"}), 404
         return jsonify({"success": True, "monitored": bool(body.get("monitored"))})
+
+    @bp.route("/detail/<kind>/<int:library_id>/overrides", methods=["PUT"])
+    def video_title_overrides(kind, library_id):
+        """Per-title acquisition overrides: which sources to try, which release
+        groups to insist on or refuse, and whether to reach for season packs.
+
+        Empty lists and 'auto' mean FOLLOW THE GLOBAL CONFIG. That is the only
+        safe reading of an unset override: an empty allow-list treated as a
+        filter would quietly stop the title being grabbed by anything."""
+        from . import get_video_db
+        if kind not in ("movie", "show"):
+            return jsonify({"success": False, "error": "kind must be movie|show"}), 400
+        body = request.get_json(silent=True) or {}
+        fields = {}
+        for key in ("preferred_sources", "release_group_allow", "release_group_block",
+                    "manual_aliases"):
+            if key in body:
+                if not isinstance(body[key], list):
+                    return jsonify({"success": False, "error": "%s must be a list" % key}), 400
+                fields[key] = body[key]
+        if kind == "show" and "pack_preference" in body:
+            if str(body["pack_preference"]) not in ("auto", "prefer", "never"):
+                return jsonify({"success": False,
+                                "error": "pack_preference must be auto|prefer|never"}), 400
+            fields["pack_preference"] = body["pack_preference"]
+        if not fields:
+            return jsonify({"success": False, "error": "nothing to set"}), 400
+        db = get_video_db()
+        if not db.set_title_overrides(kind, library_id, **fields):
+            return jsonify({"success": False, "error": "Title not found."}), 404
+        return jsonify({"success": True, **db.title_overrides(kind, library_id)})
+
+    @bp.route("/detail/<kind>/<int:item_id>/acquisition", methods=["GET"])
+    def video_title_acquisition(kind, item_id):
+        """This title's CURRENT acquisition state in one roll-up - owned, wanted,
+        queued, downloading, failed, ignored. The history endpoint above says what
+        already happened; this says where things stand."""
+        from . import get_video_db
+        if kind not in ("movie", "show"):
+            return jsonify({"error": "bad kind"}), 400
+        db = get_video_db()
+        detail = db.movie_detail(item_id) if kind == "movie" else db.show_detail(item_id)
+        if not detail:
+            return jsonify({"error": "not found"}), 404
+        try:
+            from core.profile_context import get_current_profile_id
+            _pid = int(get_current_profile_id() or 1)
+        except Exception:
+            _pid = 1
+        state = db.acquisition_state(kind, item_id, tmdb_id=detail.get("tmdb_id"), profile_id=_pid)
+        return jsonify({"success": True, **state})
+
+    @bp.route("/episode/monitor", methods=["POST"])
+    def video_set_episode_monitor():
+        """Monitor or unmonitor a single episode, addressed by show tmdb id +
+        season/episode. That is the identity the calendar carries; it never has
+        the local episode row id."""
+        from . import get_video_db
+        body = request.get_json(silent=True) or {}
+        try:
+            tmdb_id = int(body["tmdb_id"])
+            season = int(body["season_number"])
+            episode = int(body["episode_number"])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"success": False,
+                            "error": "tmdb_id, season_number and episode_number required"}), 400
+        if "monitored" not in body:
+            return jsonify({"success": False, "error": "monitored required"}), 400
+        moved = get_video_db().set_episode_monitored(
+            tmdb_id, season, episode, bool(body.get("monitored")))
+        if not moved:
+            return jsonify({"success": False, "error": "No such episode."}), 404
+        return jsonify({"success": True, "monitored": bool(body.get("monitored"))})
+
+    @bp.route("/detail/show/<int:library_id>/season/<int:season_number>/monitor",
+              methods=["POST"])
+    def video_set_season_monitor(library_id, season_number):
+        """Monitor or unmonitor a whole season at once. Unmonitoring is how you
+        tell the wishlist drain to stop hunting a season you don't want."""
+        from . import get_video_db
+        body = request.get_json(silent=True) or {}
+        if "monitored" not in body:
+            return jsonify({"success": False, "error": "monitored required"}), 400
+        moved = get_video_db().set_season_monitored(
+            library_id, season_number, bool(body.get("monitored")))
+        if not moved:
+            return jsonify({"success": False, "error": "No episodes in that season."}), 404
+        return jsonify({"success": True, "monitored": bool(body.get("monitored")),
+                        "episodes": moved})
 
     # ── Manage sidebar: metadata edits + field locks + watched ────────────────
     @bp.route("/detail/<kind>/<int:item_id>/metadata", methods=["PUT"])
@@ -105,17 +239,28 @@ def register_routes(bp):
     @bp.route("/detail/show/<int:show_id>", methods=["GET"])
     def video_show_detail(show_id):
         from . import get_video_db
+        from .kids import restricted_response, video_cap
+        from core.content_filter import title_allowed
         data = get_video_db().show_detail(show_id)
         if not data:
             return jsonify({"error": "not found"}), 404
+        # kids profiles: over the cap (or unrated) is a hard no
+        cap = video_cap()
+        if cap is not None and not title_allowed(data.get("content_rating"), cap):
+            return restricted_response()
         return jsonify(data)
 
     @bp.route("/detail/movie/<int:movie_id>", methods=["GET"])
     def video_movie_detail(movie_id):
         from . import get_video_db
+        from .kids import restricted_response, video_cap
+        from core.content_filter import title_allowed
         data = get_video_db().movie_detail(movie_id)
         if not data:
             return jsonify({"error": "not found"}), 404
+        cap = video_cap()
+        if cap is not None and not title_allowed(data.get("content_rating"), cap):
+            return restricted_response()
         return jsonify(data)
 
     @bp.route("/detail/show/<int:show_id>/sync", methods=["POST"])
@@ -135,6 +280,22 @@ def register_routes(bp):
         except Exception:
             logger.exception("show sync failed for %s", show_id)
             return jsonify({"success": False, "error": "Sync failed — see app.log"}), 500
+
+    @bp.route("/detail/movie/<int:movie_id>/sync", methods=["POST"])
+    def video_movie_sync(movie_id):
+        """Per-movie Synchronize: re-read THIS movie from the server, update
+        file/watch metadata, heal server re-keys, and remove the local row only
+        when the server positively says the movie is gone."""
+        from . import get_video_db
+        try:
+            from core.video.movie_sync import MovieSyncError, sync_movie
+            res = sync_movie(get_video_db(), movie_id)
+            return jsonify({"success": True, **res})
+        except MovieSyncError as e:
+            return jsonify({"success": False, "error": str(e)}), 409
+        except Exception:
+            logger.exception("movie sync failed for %s", movie_id)
+            return jsonify({"success": False, "error": "Sync failed - see app.log"}), 500
 
     @bp.route("/detail/show/<int:show_id>/refresh-art", methods=["POST"])
     def video_show_refresh_art(show_id):
@@ -173,11 +334,23 @@ def register_routes(bp):
             d = None
         if not d:
             return jsonify({"error": "not found"}), 404
+        # a redirect points at the library detail, which does its own check
+        if not d.get("redirect"):
+            from .kids import restricted_response, video_cap
+            from core.content_filter import title_allowed
+            cap = video_cap()
+            if cap is not None and not title_allowed(d.get("content_rating"), cap):
+                return restricted_response()
         return jsonify(d)
 
     @bp.route("/tmdb/show/<int:tv_id>/season/<int:season_number>", methods=["GET"])
     def video_tmdb_season(tv_id, season_number):
         """Lazy per-season episodes for a TMDB (un-owned) show detail."""
+        from . import get_video_db
+        from .kids import restricted_response, tmdb_title_allowed, video_cap
+        cap = video_cap()
+        if cap is not None and not tmdb_title_allowed(get_video_db(), "show", tv_id, cap):
+            return restricted_response()
         try:
             from core.video.enrichment.engine import get_video_enrichment_engine
             d = get_video_enrichment_engine().tmdb_season(tv_id, season_number)
@@ -191,6 +364,11 @@ def register_routes(bp):
     @bp.route("/episode/<int:tmdb_id>/<int:season>/<int:episode>", methods=["GET"])
     def video_episode_extra(tmdb_id, season, episode):
         """Episode expand: guest stars + bigger still (by the SHOW's tmdb id)."""
+        from . import get_video_db
+        from .kids import restricted_response, tmdb_title_allowed, video_cap
+        cap = video_cap()
+        if cap is not None and not tmdb_title_allowed(get_video_db(), "show", tmdb_id, cap):
+            return restricted_response()
         try:
             from core.video.enrichment.engine import get_video_enrichment_engine
             d = get_video_enrichment_engine().episode_extra(tmdb_id, season, episode)
@@ -212,6 +390,13 @@ def register_routes(bp):
             d = None
         if not d:
             return jsonify({"error": "not found"}), 404
+        # kids: the filmography keeps only what the profile's cap allows
+        from .kids import filter_tmdb_items, video_cap
+        cap = video_cap()
+        if cap is not None and d.get("credits"):
+            from . import get_video_db
+            d = dict(d)
+            d["credits"] = filter_tmdb_items(get_video_db(), d["credits"], cap)
         return jsonify(d)
 
     @bp.route("/detail/<kind>/<int:item_id>/extras", methods=["GET"])
@@ -219,6 +404,11 @@ def register_routes(bp):
         """Live TMDB extras (trailer / where-to-watch / similar) for the detail page."""
         if kind not in ("movie", "show"):
             return jsonify({}), 400
+        from . import get_video_db
+        from .kids import library_title_allowed, restricted_response, video_cap
+        cap = video_cap()
+        if cap is not None and not library_title_allowed(get_video_db(), kind, item_id, cap):
+            return restricted_response()
         try:
             from core.video.enrichment.engine import get_video_enrichment_engine
             return jsonify(get_video_enrichment_engine().item_extras(kind, item_id))

@@ -18,7 +18,7 @@ ARTIST_NAME_MATCH_THRESHOLD = 0.85
 # Whitelist of artist source-id columns we'll interpolate into SQL — guards the
 # conflict query against any unexpected column name.
 _ARTIST_ID_COLUMNS = frozenset({
-    'deezer_id', 'yandex_id', 'spotify_artist_id', 'itunes_artist_id', 'musicbrainz_id',
+    'deezer_id', 'spotify_artist_id', 'itunes_artist_id', 'musicbrainz_id',
     'discogs_id', 'audiodb_id', 'qobuz_id', 'tidal_id', 'amazon_id', 'soul_id',
     'jiosaavn_id',
 })
@@ -314,7 +314,7 @@ def read_enrichment_priority(service: str) -> str:
     Read every loop so the override applies without restarting the worker.
     Any error / unset / invalid value yields '' (no override)."""
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         val = (config_manager.get(f'{service}_enrichment_priority', '') or '')
         val = str(val).strip().lower()
         return val if val in PRIORITY_ENTITIES else ''
@@ -354,8 +354,13 @@ def priority_pending_item(cursor, service, entity, type_overrides=None):
 
     # track
     cursor.execute(
-        f"SELECT t.id, t.title, ar.name FROM tracks t JOIN artists ar ON t.artist_id = ar.id "
+        f"SELECT t.id, t.title, ar.name, t.isrc FROM tracks t JOIN artists ar ON t.artist_id = ar.id "
         f"WHERE t.{ms} IS NULL AND t.id IS NOT NULL ORDER BY t.id ASC LIMIT 1"
     )
     r = cursor.fetchone()
-    return {'type': type_overrides.get('track', 'track'), 'id': r[0], 'name': r[1], 'artist': r[2]} if r else None
+    # 'isrc' rides along for the MusicBrainz worker's exact-identifier
+    # rung (#1705): without it, a manually prioritised track — exactly
+    # the kind a user is waiting on — silently lost the rung the normal
+    # queue path provides. Other workers ignore the extra key.
+    return {'type': type_overrides.get('track', 'track'), 'id': r[0], 'name': r[1], 'artist': r[2],
+            'isrc': r[3]} if r else None

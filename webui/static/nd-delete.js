@@ -169,6 +169,16 @@
         }
         .nd-del-player:hover { opacity: 1; }
         .nd-del-player svg { width: 20px; height: 20px; pointer-events: none; }
+        /* Fallback placement: a player markup we do not recognise (theme or a
+           new Navidrome layout) still gets a visible control, floating above
+           the player bar instead of vanishing. */
+        .nd-del-floating {
+            position: fixed; right: 24px; bottom: 96px; z-index: 15000;
+            background: rgba(48, 48, 48, 0.95) !important; border-radius: 50%;
+            padding: 12px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5); opacity: 0.85;
+        }
+        .nd-del-floating:hover { opacity: 1; }
+        .nd-del-floating svg { width: 22px; height: 22px; }
         .nd-del-overlay {
             position: fixed; inset: 0; z-index: 20000; display: flex;
             align-items: center; justify-content: center;
@@ -243,29 +253,32 @@
     }
 
     // ---- Player delete button ----
-    function addDeleteToPlayer() {
-        // 0.63 renders the react-jinke bar as `.music-player-panel`; the older
-        // `.music-player-controller` class is gone, which left the button with
-        // nowhere to attach.
-        // Priority matters and querySelector does NOT honour it: given a list it
-        // returns the first match in DOCUMENT order, so passing the panel and
-        // its inner controls row together lands on the panel and the button is
-        // appended past the bottom edge, off-screen. Ask in order instead.
-        const player = document.querySelector('.music-player-panel .player-content')
-            || document.querySelector('.music-player-panel .music-player-controller')
-            || document.querySelector('.music-player-controller, [class*="music-player-controller"], .controller-title')
-            || document.querySelector('.music-player-panel');
-        if (!player || player.querySelector('.nd-del-player')) return;
+    // The row that actually holds the transport controls. Navidrome 0.64 renders
+    // `.music-player-panel` with a `.panel-content` body (0.6x used
+    // `.player-content`), and the mini bar only has `.music-player-controller`.
+    // Ask for each in turn and take the first that contains real controls.
+    function findControlRow() {
+        const panel = document.querySelector('.music-player-panel')
+            || document.querySelector('[class*="music-player"]');
+        if (!panel) return null;
+        const candidates = [
+            panel.querySelector('.player-content'),
+            panel.querySelector('.panel-content'),
+            panel.querySelector('section.audio-main'),
+            panel.querySelector('.music-player-controller'),
+        ].filter(Boolean);
+        for (const row of candidates) {
+            if (row.querySelector('button, .group, svg')) return row;
+        }
+        // Nothing recognised: any element that already holds several buttons.
+        const rows = Array.from(panel.querySelectorAll('div, section'))
+            .filter(el => el.querySelectorAll('button').length >= 3);
+        return rows.length ? rows[rows.length - 1] : panel;
+    }
 
-        // Only show the button once something is actually playing. The id itself
-        // is deliberately NOT captured here — see currentPlayingId().
-        if (!currentPlayingId()) return;
-
-        // The row is a flat list of `span.group` slots (volume, loop, lyrics,
-        // queue, destroy), so match that shape instead of dropping a bare
-        // <button> in — otherwise it does not line up with its neighbours.
+    function buildDeleteButton(floating) {
         const btn = document.createElement('span');
-        btn.className = 'group nd-del-player';
+        btn.className = floating ? 'group nd-del-player nd-del-floating' : 'group nd-del-player';
         btn.title = 'Delete current song from disk';
         btn.innerHTML = TRASH;
         btn.onclick = (e) => {
@@ -274,16 +287,35 @@
             if (!playingNow) { ndToast('Nothing is playing right now.'); return; }
             deleteSong(playingNow);
         };
+        return btn;
+    }
 
-        // Sit immediately to the right of the lyrics toggle; fall back to the
-        // end of the row if that control is absent (older player, or lyrics
-        // disabled in settings).
-        const lyric = player.querySelector('.lyric-btn, [title*="yric"], [title*="екст"]');
-        if (lyric && lyric.parentElement === player) {
-            lyric.insertAdjacentElement('afterend', btn);
-        } else {
-            player.appendChild(btn);
+    function addDeleteToPlayer() {
+        if (document.querySelector('.nd-del-player')) return;
+
+        const row = findControlRow();
+        if (row) {
+            const btn = buildDeleteButton(false);
+            // Sit next to the lyrics toggle when there is one, otherwise after the
+            // last control in the row, so it lines up with its neighbours.
+            const lyric = row.querySelector('.lyric-btn, [title*="yric"], [title*="екст"]');
+            if (lyric && lyric.parentElement) {
+                lyric.insertAdjacentElement('afterend', btn);
+            } else {
+                const groups = row.querySelectorAll('.group');
+                const last = groups.length ? groups[groups.length - 1] : null;
+                if (last) last.insertAdjacentElement('afterend', btn);
+                else row.appendChild(btn);
+            }
+            return;
         }
+
+        // Last resort: the player markup is unrecognisable (a theme or a new
+        // Navidrome layout). Float the control above the player bar so the
+        // feature never silently disappears.
+        const bar = document.querySelector('.music-player-panel, [class*="music-player"]');
+        if (!bar) return;
+        document.body.appendChild(buildDeleteButton(true));
     }
 
     // ---- Main scan ----

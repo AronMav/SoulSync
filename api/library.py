@@ -2,11 +2,31 @@
 Library endpoints — browse artists, albums, tracks, genres, and stats.
 """
 
+from datetime import datetime, timedelta, timezone
+
 from flask import request, current_app
 from database.music_database import get_database
 from .auth import require_api_key
 from .helpers import api_success, api_error, build_pagination, parse_pagination, parse_fields, parse_profile_id
 from .serializers import serialize_artist, serialize_album, serialize_track
+
+# The longest window /library/listening-activity answers. The MetaSync
+# node asks for one ISO week; a month of slack, never the whole history.
+LISTENING_WINDOW_MAX_DAYS = 31
+
+
+def _parse_instant(value):
+    """An ISO-8601 string as an aware UTC datetime (naive reads as UTC, the
+    database's rule), or None when it is empty or unparseable."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def register_routes(bp):
@@ -23,15 +43,24 @@ def register_routes(bp):
         profile_id = parse_profile_id(request)
 
         try:
-            db = get_database()
-            result = db.get_library_artists(
-                search_query=search,
-                letter=letter,
-                page=page,
-                limit=limit,
-                watchlist_filter=watchlist,
-                profile_id=profile_id,
-            )
+            # The artists query scopes by current_library_scope(), which doesn't
+            # resolve for API-key requests. Set it explicitly from the profile.
+            from core.library_scope import set_library_scope, library_scope_for_profile
+            token = set_library_scope(library_scope_for_profile(profile_id))
+            try:
+                db = get_database()
+                result = db.get_library_artists(
+                    search_query=search,
+                    letter=letter,
+                    page=page,
+                    limit=limit,
+                    watchlist_filter=watchlist,
+                    profile_id=profile_id,
+                    skip_server_filter=True,
+                )
+            finally:
+                from core.library_scope import _explicit_scope
+                _explicit_scope.reset(token)
             artists = result.get("artists", [])
             pag = result.get("pagination", {})
             pagination = build_pagination(
@@ -50,17 +79,17 @@ def register_routes(bp):
         fields = parse_fields(request)
         try:
             db = get_database()
-            artist = db.api_get_artist(int(artist_id))
+            # IDs are TEXT in the DB: numeric-string IDs from existing clients
+            # and opaque '...::soulsync' IDs both resolve by exact match.
+            artist = db.api_get_artist(artist_id)
             if not artist:
                 return api_error("NOT_FOUND", f"Artist {artist_id} not found.", 404)
 
-            albums = db.api_get_albums_by_artist(int(artist_id))
+            albums = db.api_get_albums_by_artist(artist_id)
             return api_success({
                 "artist": serialize_artist(artist, fields),
                 "albums": [serialize_album(a, fields) for a in albums],
             })
-        except ValueError:
-            return api_error("BAD_REQUEST", "artist_id must be an integer.", 400)
         except Exception as e:
             return api_error("LIBRARY_ERROR", str(e), 500)
 
@@ -71,10 +100,8 @@ def register_routes(bp):
         fields = parse_fields(request)
         try:
             db = get_database()
-            albums = db.api_get_albums_by_artist(int(artist_id))
+            albums = db.api_get_albums_by_artist(artist_id)
             return api_success({"albums": [serialize_album(a, fields) for a in albums]})
-        except ValueError:
-            return api_error("BAD_REQUEST", "artist_id must be an integer.", 400)
         except Exception as e:
             return api_error("LIBRARY_ERROR", str(e), 500)
 
@@ -89,10 +116,12 @@ def register_routes(bp):
         artist_id = request.args.get("artist_id")
         year = request.args.get("year")
 
-        try:
-            artist_id_int = int(artist_id) if artist_id else None
-        except ValueError:
-            return api_error("BAD_REQUEST", "artist_id must be an integer.", 400)
+        # artist_id is a TEXT id (numeric string or opaque '...::soulsync');
+        # it filters by exact match, so it passes through unconverted. An
+        # empty/blank value means "no filter", as it did when the old int()
+        # conversion treated it as falsy.
+        if artist_id is not None:
+            artist_id = artist_id.strip() or None
         try:
             year_int = int(year) if year else None
         except ValueError:
@@ -102,7 +131,7 @@ def register_routes(bp):
             db = get_database()
             result = db.api_list_albums(
                 search=search,
-                artist_id=artist_id_int,
+                artist_id=artist_id,
                 year=year_int,
                 page=page,
                 limit=limit,
@@ -124,17 +153,15 @@ def register_routes(bp):
         fields = parse_fields(request)
         try:
             db = get_database()
-            album = db.api_get_album(int(album_id))
+            album = db.api_get_album(album_id)
             if not album:
                 return api_error("NOT_FOUND", f"Album {album_id} not found.", 404)
 
-            tracks = db.api_get_tracks_by_album(int(album_id))
+            tracks = db.api_get_tracks_by_album(album_id)
             return api_success({
                 "album": serialize_album(album, fields),
                 "tracks": [serialize_track(t, fields) for t in tracks],
             })
-        except ValueError:
-            return api_error("BAD_REQUEST", "album_id must be an integer.", 400)
         except Exception as e:
             return api_error("LIBRARY_ERROR", str(e), 500)
 
@@ -145,10 +172,8 @@ def register_routes(bp):
         fields = parse_fields(request)
         try:
             db = get_database()
-            tracks = db.api_get_tracks_by_album(int(album_id))
+            tracks = db.api_get_tracks_by_album(album_id)
             return api_success({"tracks": [serialize_track(t, fields) for t in tracks]})
-        except ValueError:
-            return api_error("BAD_REQUEST", "album_id must be an integer.", 400)
         except Exception as e:
             return api_error("LIBRARY_ERROR", str(e), 500)
 
@@ -159,13 +184,11 @@ def register_routes(bp):
         fields = parse_fields(request)
         try:
             db = get_database()
-            track = db.api_get_track(int(track_id))
+            track = db.api_get_track(track_id)
             if not track:
                 return api_error("NOT_FOUND", f"Track {track_id} not found.", 404)
 
             return api_success({"track": serialize_track(track, fields)})
-        except ValueError:
-            return api_error("BAD_REQUEST", "track_id must be an integer.", 400)
         except Exception as e:
             return api_error("LIBRARY_ERROR", str(e), 500)
 
@@ -246,6 +269,153 @@ def register_routes(bp):
         except Exception as e:
             return api_error("LIBRARY_ERROR", str(e), 500)
 
+    @bp.route("/library/recently-played", methods=["GET"])
+    @require_api_key
+    def recently_played():
+        """Get recently played tracks from listening history.
+
+        Query params:
+            limit: max items to return (default: 20, max: 100)
+        """
+        try:
+            limit = min(100, max(1, int(request.args.get("limit", 20))))
+        except (ValueError, TypeError):
+            limit = 20
+        fields = parse_fields(request)
+        profile_id = parse_profile_id(request)
+
+        try:
+            db = get_database()
+            # Get recently played with library track IDs for playback.
+            # Uses listening_history joined to tracks for file_path.
+            from core.stats.queries import listening_owner, owner_clause
+            scope = owner_clause(listening_owner(db, profile_id), 'lh')
+            conn = db._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"""
+                    SELECT lh.title, lh.artist, lh.album, lh.played_at,
+                           t.id as track_id, t.file_path, t.artist_id,
+                           t.album_id, al.thumb_url
+                    FROM listening_history lh
+                    LEFT JOIN tracks t ON t.id = CAST(lh.db_track_id AS TEXT)
+                    LEFT JOIN albums al ON al.id = t.album_id
+                    WHERE {scope}
+                    ORDER BY lh.played_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+            finally:
+                conn.close()
+
+            tracks = []
+            for row in rows:
+                track = {
+                    "title": row[0],
+                    "artist_name": row[1],
+                    "album_title": row[2],
+                    "played_at": row[3],
+                    "id": row[4],
+                    "file_path": row[5],
+                    "artist_id": row[6],
+                    "album_id": row[7],
+                    "thumb_url": row[8],
+                }
+                tracks.append(serialize_track(track, fields))
+
+            return api_success({"tracks": tracks})
+        except Exception as e:
+            return api_error("LIBRARY_ERROR", str(e), 500)
+
+    @bp.route("/library/playlists", methods=["GET"])
+    @require_api_key
+    def list_library_playlists():
+        """List curated playlists with track counts."""
+        fields = parse_fields(request)
+        profile_id = parse_profile_id(request)
+        try:
+            db = get_database()
+            playlists = db.api_list_curated_playlists(profile_id=profile_id)
+            # fields filtering: only include requested fields if specified
+            if fields is not None:
+                playlists = [
+                    {k: v for k, v in p.items() if k in fields}
+                    for p in playlists
+                ]
+            return api_success({"playlists": playlists})
+        except Exception as e:
+            return api_error("LIBRARY_ERROR", str(e), 500)
+
+    @bp.route("/library/playlists/<playlist_id>/tracks", methods=["GET"])
+    @require_api_key
+    def get_playlist_tracks(playlist_id):
+        """List tracks in a curated playlist, in order."""
+        fields = parse_fields(request)
+        profile_id = parse_profile_id(request)
+        try:
+            pid = int(playlist_id)
+        except (ValueError, TypeError):
+            return api_error("BAD_REQUEST", "playlist_id must be an integer.", 400)
+        try:
+            db = get_database()
+            tracks = db.api_get_curated_playlist_tracks(pid, profile_id=profile_id)
+            return api_success({"tracks": [serialize_track(t, fields) for t in tracks]})
+        except Exception as e:
+            return api_error("LIBRARY_ERROR", str(e), 500)
+
+    @bp.route("/library/mirrored-playlists", methods=["GET"])
+    @require_api_key
+    def list_mirrored_playlists():
+        """List mirrored playlists for the profile."""
+        profile_id = parse_profile_id(request)
+        try:
+            db = get_database()
+            playlists = db.get_mirrored_playlists(profile_id=profile_id)
+            out = []
+            for pl in playlists:
+                out.append({
+                    "id": pl.get("id"),
+                    "name": pl.get("name") or pl.get("custom_name") or "Untitled",
+                    "track_count": pl.get("track_count", 0),
+                    "cover_url": pl.get("cover_url"),
+                })
+            return api_success({"playlists": out})
+        except Exception as e:
+            return api_error("LIBRARY_ERROR", str(e), 500)
+
+    @bp.route("/library/mirrored-playlists/<playlist_id>/tracks", methods=["GET"])
+    @require_api_key
+    def get_mirrored_playlist_tracks(playlist_id):
+        """List tracks in a mirrored playlist, in order."""
+        fields = parse_fields(request)
+        profile_id = parse_profile_id(request)
+        try:
+            pid = int(playlist_id)
+        except (ValueError, TypeError):
+            return api_error("BAD_REQUEST", "playlist_id must be an integer.", 400)
+        try:
+            db = get_database()
+            mtracks = db.get_mirrored_playlist_tracks(pid, profile_id=profile_id)
+            out = []
+            for mt in mtracks:
+                t = None
+                # Try external ID first (source_track_id is Spotify/etc).
+                sid = mt.get("source_track_id")
+                if sid:
+                    t = db.api_get_track_by_external_id(str(sid))
+                # Fallback to title/artist.
+                if not t and mt.get("track_name"):
+                    t = db.api_find_track_by_title_artist(
+                        mt.get("track_name"), mt.get("artist_name") or "")
+                if t:
+                    out.append(serialize_track(t, fields))
+            return api_success({"tracks": out})
+        except Exception as e:
+            return api_error("LIBRARY_ERROR", str(e), 500)
+
     @bp.route("/library/lookup", methods=["GET"])
     @require_api_key
     def lookup_by_external_id():
@@ -253,7 +423,7 @@ def register_routes(bp):
 
         Query params:
             type: 'artist', 'album', or 'track' (required)
-            provider: 'spotify', 'musicbrainz', 'itunes', 'deezer', 'audiodb', 'tidal', 'qobuz', 'genius' (required)
+            provider: 'spotify', 'musicbrainz', 'itunes', 'deezer', 'audiodb', 'tidal', 'qobuz', 'genius', 'discogs', 'amazon', 'jiosaavn', 'bandcamp' (required)
             id: the external ID value (required)
         """
         entity_type = request.args.get("type")
@@ -269,12 +439,18 @@ def register_routes(bp):
         if not table:
             return api_error("BAD_REQUEST", "type must be 'artist', 'album', or 'track'.", 400)
 
-        # genius only exists on artists and tracks, not albums
-        valid_providers = ("spotify", "musicbrainz", "itunes", "deezer", "audiodb", "tidal", "qobuz", "genius")
+        # genius only exists on artists and tracks, not albums;
+        # bandcamp only exists on albums and tracks, not artists;
+        # discogs only exists on artists and albums, not tracks
+        valid_providers = ("spotify", "musicbrainz", "itunes", "deezer", "audiodb", "tidal", "qobuz", "genius", "discogs", "amazon", "jiosaavn", "bandcamp")
         if provider not in valid_providers:
             return api_error("BAD_REQUEST", f"provider must be one of: {', '.join(valid_providers)}.", 400)
         if provider == "genius" and entity_type == "album":
             return api_error("BAD_REQUEST", "Genius IDs are not available for albums. Use artist or track.", 400)
+        if provider == "bandcamp" and entity_type == "artist":
+            return api_error("BAD_REQUEST", "Bandcamp IDs are not available for artists. Use album or track.", 400)
+        if provider == "discogs" and entity_type == "track":
+            return api_error("BAD_REQUEST", "Discogs IDs are not available for tracks. Use artist or album.", 400)
 
         try:
             db = get_database()
@@ -289,6 +465,70 @@ def register_routes(bp):
             }[table]
 
             return api_success({entity_type: serializer(result, fields)})
+        except Exception as e:
+            return api_error("LIBRARY_ERROR", str(e), 500)
+
+    @bp.route("/library/download-activity", methods=["GET"])
+    @require_api_key
+    def download_activity():
+        """Per-album completed-download aggregates for the MetaSync node.
+
+        MusicBrainz release ids + counts only (see
+        db.api_download_activity); the node bridges release ids to release
+        groups itself. ``since`` / ``until`` (ISO-8601) bound a per-album
+        ``completed_since`` count.
+        """
+        since = (request.args.get("since") or "").strip()
+        until = (request.args.get("until") or "").strip()
+        # Validated here rather than passed through: an unparseable
+        # string would silently compare as text in SQLite and quietly
+        # return the wrong counts instead of a 400.
+        for name, value in (("since", since), ("until", until)):
+            if value and _parse_instant(value) is None:
+                return api_error(
+                    "BAD_REQUEST",
+                    f"{name} must be an ISO-8601 timestamp (e.g. 2026-10-19T00:00:00).",
+                    400,
+                )
+        try:
+            db = get_database()
+            albums = db.api_download_activity(since=since, until=until)
+            return api_success({"albums": albums})
+        except Exception as e:
+            return api_error("LIBRARY_ERROR", str(e), 500)
+
+    @bp.route("/library/listening-activity", methods=["GET"])
+    @require_api_key
+    def listening_activity():
+        """Per-album listening aggregates for one window, for the MetaSync node.
+
+        MusicBrainz release ids + counts only (see
+        db.api_listening_activity): plays, distinct tracks and distinct
+        days per album in ``[since, until)``, from the shared listening
+        pile only. Both bounds are required and the window is at most
+        LISTENING_WINDOW_MAX_DAYS: this answers "what was played this
+        week", never "everything ever played".
+        """
+        since = (request.args.get("since") or "").strip()
+        until = (request.args.get("until") or "").strip()
+        start, end = _parse_instant(since), _parse_instant(until)
+        if start is None or end is None:
+            return api_error(
+                "BAD_REQUEST",
+                "since and until are both required ISO-8601 timestamps "
+                "(e.g. 2026-10-19T00:00:00).",
+                400,
+            )
+        if not timedelta(0) < end - start <= timedelta(days=LISTENING_WINDOW_MAX_DAYS):
+            return api_error(
+                "BAD_REQUEST",
+                f"until must be after since, at most {LISTENING_WINDOW_MAX_DAYS} days later.",
+                400,
+            )
+        try:
+            db = get_database()
+            albums = db.api_listening_activity(since=since, until=until)
+            return api_success({"albums": albums})
         except Exception as e:
             return api_error("LIBRARY_ERROR", str(e), 500)
 

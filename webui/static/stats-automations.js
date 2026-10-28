@@ -1,467 +1,8 @@
-// ── Import File Tab ──────────────────────────────────────────────────
-
-let _importFileState = {
-    rawText: '',
-    fileName: '',
-    fileType: '',      // 'csv' or 'text'
-    headers: [],       // CSV column headers
-    rows: [],          // raw parsed rows (arrays for csv, strings for text)
-    columnMap: {},     // { columnIndex: 'track_name' | 'artist_name' | 'album_name' | 'duration' | 'skip' }
-    parsedTracks: []   // final [{track_name, artist_name, album_name, duration_ms}]
-};
-
-function _initImportFileTab() {
-    const dropzone = document.getElementById('import-file-dropzone');
-    const fileInput = document.getElementById('import-file-input');
-    if (!dropzone || !fileInput) return;
-
-    dropzone.addEventListener('click', () => fileInput.click());
-    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag-over'); });
-    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
-    dropzone.addEventListener('drop', (e) => {
-        e.preventDefault();
-        dropzone.classList.remove('drag-over');
-        const file = e.dataTransfer.files[0];
-        if (file) _importFileRead(file);
-    });
-    fileInput.addEventListener('change', () => {
-        if (fileInput.files[0]) _importFileRead(fileInput.files[0]);
-        fileInput.value = '';
-    });
-
-    // Enable/disable import button based on playlist name
-    const nameInput = document.getElementById('import-file-playlist-name');
-    if (nameInput) {
-        nameInput.addEventListener('input', () => {
-            const btn = document.getElementById('import-file-import-btn');
-            if (btn) btn.disabled = !nameInput.value.trim();
-        });
-    }
-}
-
-function _importFileRead(file) {
-    const ext = file.name.split('.').pop().toLowerCase();
-    if (!['csv', 'tsv', 'txt', 'm3u', 'm3u8'].includes(ext)) {
-        showToast('Unsupported file type. Use CSV, TSV, TXT, M3U, or M3U8.', 'error');
-        return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = (e) => {
-        _importFileState.rawText = e.target.result;
-        _importFileState.fileName = file.name;
-        _importFileState.fileType = (ext === 'm3u' || ext === 'm3u8') ? 'm3u'
-                                  : (ext === 'txt') ? 'text' : 'csv';
-        _importFileParseAndPreview();
-    };
-    reader.readAsText(file);
-}
-
-function _importFileDetectDelimiter(firstLine) {
-    const tab = (firstLine.match(/\t/g) || []).length;
-    const semi = (firstLine.match(/;/g) || []).length;
-    const comma = (firstLine.match(/,/g) || []).length;
-    if (tab >= comma && tab >= semi && tab > 0) return '\t';
-    if (semi >= comma && semi > 0) return ';';
-    return ',';
-}
-
-function _importFileParseCsv(text, delimiter) {
-    const lines = text.split(/\r?\n/).filter(l => l.trim());
-    if (lines.length < 2) return { headers: [], rows: [] };
-
-    // Parse CSV with basic quote handling
-    function parseLine(line) {
-        const result = [];
-        let current = '';
-        let inQuotes = false;
-        for (let i = 0; i < line.length; i++) {
-            const ch = line[i];
-            if (ch === '"') {
-                if (inQuotes && i + 1 < line.length && line[i + 1] === '"') {
-                    current += '"';
-                    i++;
-                } else {
-                    inQuotes = !inQuotes;
-                }
-            } else if (ch === delimiter && !inQuotes) {
-                result.push(current.trim());
-                current = '';
-            } else {
-                current += ch;
-            }
-        }
-        result.push(current.trim());
-        return result;
-    }
-
-    const headers = parseLine(lines[0]);
-    const rows = [];
-    for (let i = 1; i < lines.length; i++) {
-        const row = parseLine(lines[i]);
-        if (row.some(cell => cell)) rows.push(row);
-    }
-    return { headers, rows };
-}
-
-// Parse an M3U / M3U8 playlist into track objects. Handles both the simple form
-// (one media path per line) and the extended form (#EXTINF:<secs>,<artist> - <title>
-// followed by the path). SoulSync's own export is extended M3U and replaces the path
-// of an un-located track with a "# MISSING: ..." comment — those are exactly the
-// tracks a user imports to go match/download, so a pending #EXTINF is flushed even
-// when no path line follows it. Returns { tracks, playlistName }.
-function _importFileParseM3u(text) {
-    const lines = (text || '').split(/\r?\n/);
-    const tracks = [];
-    let playlistName = '';
-    let pending = null;   // { duration_ms, artist, title } from the last #EXTINF
-
-    function splitArtistTitle(s) {
-        const i = s.indexOf(' - ');
-        return i !== -1
-            ? { artist: s.slice(0, i).trim(), title: s.slice(i + 3).trim() }
-            : { artist: '', title: s.trim() };
-    }
-    function pushTrack(artist, title, duration_ms) {
-        if (!title && !artist) return;
-        tracks.push({ track_name: title || '', artist_name: artist || '', album_name: '', duration_ms: duration_ms || 0 });
-    }
-    function flushPending() {
-        if (pending) { pushTrack(pending.artist, pending.title, pending.duration_ms); pending = null; }
-    }
-
-    for (const raw of lines) {
-        const line = raw.trim();
-        if (!line) continue;
-        if (line.charAt(0) === '#') {
-            if (/^#EXTINF:/i.test(line)) {
-                flushPending();   // a prior #EXTINF whose path was missing still counts
-                const rest = line.slice(8);                 // after "#EXTINF:"
-                const comma = rest.indexOf(',');
-                const secs = parseFloat(comma === -1 ? rest : rest.slice(0, comma));
-                const meta = comma === -1 ? '' : rest.slice(comma + 1).trim();
-                const { artist, title } = splitArtistTitle(meta);
-                pending = { duration_ms: (!isNaN(secs) && secs > 0) ? Math.round(secs * 1000) : 0, artist, title };
-            } else if (/^#PLAYLIST:/i.test(line)) {
-                playlistName = line.slice(line.indexOf(':') + 1).trim();
-            }
-            // ignore #EXTM3U, #GENERATED, "# MISSING:", #EXTALB, and other directives
-            continue;
-        }
-        // A non-# line is a media path/URL — the entry for the pending #EXTINF, if any.
-        if (pending && (pending.title || pending.artist)) {
-            pushTrack(pending.artist, pending.title, pending.duration_ms);
-            pending = null;
-        } else {
-            // Simple M3U with no #EXTINF: derive artist/title from the file name.
-            pending = null;
-            const base = (line.split(/[\\/]/).pop() || line).replace(/\.[^.]+$/, '');
-            const { artist, title } = splitArtistTitle(base);
-            pushTrack(artist, title, 0);
-        }
-    }
-    flushPending();   // trailing #EXTINF with no following path
-    return { tracks, playlistName };
-}
-
-function _importFileAutoMapColumns(headers) {
-    const map = {};
-    const lowerHeaders = headers.map(h => h.toLowerCase().trim());
-
-    const trackPatterns = ['track_name', 'track name', 'track', 'title', 'song', 'song_name', 'song name', 'name'];
-    const artistPatterns = ['artist_name', 'artist name', 'artist', 'artists', 'performer'];
-    const albumPatterns = ['album_name', 'album name', 'album'];
-    const durationPatterns = ['duration', 'duration_ms', 'length', 'time'];
-
-    function findMatch(patterns) {
-        for (const p of patterns) {
-            const idx = lowerHeaders.indexOf(p);
-            if (idx !== -1 && !(idx in map)) return idx;
-        }
-        return -1;
-    }
-
-    const trackIdx = findMatch(trackPatterns);
-    if (trackIdx !== -1) map[trackIdx] = 'track_name';
-
-    const artistIdx = findMatch(artistPatterns);
-    if (artistIdx !== -1) map[artistIdx] = 'artist_name';
-
-    const albumIdx = findMatch(albumPatterns);
-    if (albumIdx !== -1) map[albumIdx] = 'album_name';
-
-    const durIdx = findMatch(durationPatterns);
-    if (durIdx !== -1) map[durIdx] = 'duration';
-
-    return map;
-}
-
-function _importFileParseAndPreview() {
-    const state = _importFileState;
-    const text = state.rawText;
-
-    if (state.fileType === 'm3u') {
-        // M3U/M3U8 is self-describing — no column mapping or order/separator needed.
-        const { tracks, playlistName } = _importFileParseM3u(text);
-        state.rows = tracks;            // already track objects
-        state.headers = [];
-        state.columnMap = {};
-        state.m3uPlaylistName = playlistName || '';
-    } else if (state.fileType === 'text') {
-        // Plain text: one track per line
-        const lines = text.split(/\r?\n/).filter(l => l.trim());
-        state.rows = lines;
-        state.headers = [];
-        state.columnMap = {};
-    } else {
-        // CSV/TSV
-        const firstLine = text.split(/\r?\n/)[0] || '';
-        const delimiter = _importFileDetectDelimiter(firstLine);
-        const { headers, rows } = _importFileParseCsv(text, delimiter);
-        state.headers = headers;
-        state.rows = rows;
-        state.columnMap = _importFileAutoMapColumns(headers);
-    }
-
-    _importFileBuildTracks();
-    _importFileRenderPreview();
-}
-
-function _importFileBuildTracks() {
-    const state = _importFileState;
-    state.parsedTracks = [];
-
-    if (state.fileType === 'm3u') {
-        // Tracks were already parsed by _importFileParseM3u; just copy them through.
-        state.parsedTracks = state.rows.map(t => ({
-            track_name: t.track_name || '',
-            artist_name: t.artist_name || '',
-            album_name: t.album_name || '',
-            duration_ms: t.duration_ms || 0
-        }));
-    } else if (state.fileType === 'text') {
-        const orderEl = document.getElementById('import-file-text-order');
-        const sepEl = document.getElementById('import-file-text-separator');
-        const order = orderEl ? orderEl.value : 'artist-title';
-        const sep = sepEl ? sepEl.value : ' - ';
-
-        for (const line of state.rows) {
-            const parts = line.split(sep);
-            if (parts.length >= 2) {
-                const a = parts[0].trim();
-                const b = parts.slice(1).join(sep).trim();
-                state.parsedTracks.push({
-                    track_name: order === 'artist-title' ? b : a,
-                    artist_name: order === 'artist-title' ? a : b,
-                    album_name: '',
-                    duration_ms: 0
-                });
-            } else {
-                // Can't split — treat whole line as track name
-                state.parsedTracks.push({
-                    track_name: line.trim(),
-                    artist_name: '',
-                    album_name: '',
-                    duration_ms: 0
-                });
-            }
-        }
-    } else {
-        // CSV mapped
-        const map = state.columnMap;
-        const trackCol = Object.keys(map).find(k => map[k] === 'track_name');
-        const artistCol = Object.keys(map).find(k => map[k] === 'artist_name');
-        const albumCol = Object.keys(map).find(k => map[k] === 'album_name');
-        const durCol = Object.keys(map).find(k => map[k] === 'duration');
-
-        for (const row of state.rows) {
-            const track = trackCol !== undefined ? (row[trackCol] || '') : '';
-            const artist = artistCol !== undefined ? (row[artistCol] || '') : '';
-            const album = albumCol !== undefined ? (row[albumCol] || '') : '';
-            let dur = durCol !== undefined ? (row[durCol] || '') : '';
-
-            // Parse duration: could be ms, seconds, or mm:ss
-            let durationMs = 0;
-            if (dur) {
-                dur = dur.trim();
-                if (dur.includes(':')) {
-                    const parts = dur.split(':');
-                    durationMs = (parseInt(parts[0]) * 60 + parseInt(parts[1] || 0)) * 1000;
-                } else {
-                    const num = parseFloat(dur);
-                    durationMs = num > 10000 ? num : num * 1000; // assume ms if > 10000, else seconds
-                }
-                if (isNaN(durationMs)) durationMs = 0;
-            }
-
-            state.parsedTracks.push({
-                track_name: track,
-                artist_name: artist,
-                album_name: album,
-                duration_ms: durationMs
-            });
-        }
-    }
-}
-
-function _importFileRenderPreview() {
-    const state = _importFileState;
-    const validTracks = state.parsedTracks.filter(t => t.track_name || t.artist_name);
-
-    // Show/hide sections
-    document.getElementById('import-file-upload-zone').style.display = 'none';
-    document.getElementById('import-file-preview-section').style.display = '';
-
-    // File info
-    document.getElementById('import-file-name-label').textContent = state.fileName;
-    document.getElementById('import-file-track-count').textContent = `${validTracks.length} track${validTracks.length !== 1 ? 's' : ''} parsed`;
-
-    // Show format controls based on file type
-    document.getElementById('import-file-text-format').style.display = state.fileType === 'text' ? '' : 'none';
-    document.getElementById('import-file-column-mapping').style.display = state.fileType === 'csv' ? '' : 'none';
-
-    // Render column mapping for CSV
-    if (state.fileType === 'csv') {
-        _importFileRenderColumnMapping();
-    }
-
-    // Pre-fill playlist name: prefer the M3U's own #PLAYLIST: directive, else the filename.
-    const nameInput = document.getElementById('import-file-playlist-name');
-    if (nameInput && !nameInput.value) {
-        nameInput.value = (state.fileType === 'm3u' && state.m3uPlaylistName)
-            ? state.m3uPlaylistName
-            : state.fileName.replace(/\.[^.]+$/, '');
-    }
-    // Update button state
-    const btn = document.getElementById('import-file-import-btn');
-    if (btn) btn.disabled = !nameInput.value.trim();
-
-    // Render preview table
-    const tbody = document.getElementById('import-file-preview-tbody');
-    tbody.innerHTML = '';
-
-    state.parsedTracks.forEach((t, i) => {
-        const valid = !!(t.track_name || t.artist_name);
-        const tr = document.createElement('tr');
-        if (!valid) tr.classList.add('invalid-row');
-        tr.innerHTML = `
-            <td>${i + 1}</td>
-            <td>${_esc(t.track_name)}</td>
-            <td>${_esc(t.artist_name)}</td>
-            <td>${_esc(t.album_name)}</td>
-        `;
-        tbody.appendChild(tr);
-    });
-}
-
-function _importFileRenderColumnMapping() {
-    const state = _importFileState;
-    const container = document.getElementById('import-file-mapping-selects');
-    container.innerHTML = '';
-
-    const options = ['skip', 'track_name', 'artist_name', 'album_name', 'duration'];
-    const optLabels = { skip: 'Skip', track_name: 'Track', artist_name: 'Artist', album_name: 'Album', duration: 'Duration' };
-
-    state.headers.forEach((header, idx) => {
-        const mapped = state.columnMap[idx] || 'skip';
-        const wrap = document.createElement('div');
-        wrap.className = 'import-file-col-map';
-        if (mapped === 'track_name') wrap.classList.add('mapped-track');
-        else if (mapped === 'artist_name') wrap.classList.add('mapped-artist');
-        else if (mapped === 'album_name') wrap.classList.add('mapped-album');
-
-        const label = document.createElement('span');
-        label.className = 'import-file-col-label';
-        label.textContent = header;
-        label.title = header;
-
-        const sel = document.createElement('select');
-        sel.className = 'import-file-select';
-        options.forEach(o => {
-            const opt = document.createElement('option');
-            opt.value = o;
-            opt.textContent = optLabels[o];
-            if (o === mapped) opt.selected = true;
-            sel.appendChild(opt);
-        });
-        sel.addEventListener('change', () => {
-            if (sel.value === 'skip') {
-                delete state.columnMap[idx];
-            } else {
-                // Remove this mapping from any other column
-                for (const k of Object.keys(state.columnMap)) {
-                    if (state.columnMap[k] === sel.value) delete state.columnMap[k];
-                }
-                state.columnMap[idx] = sel.value;
-            }
-            _importFileBuildTracks();
-            _importFileRenderPreview();
-        });
-
-        wrap.appendChild(label);
-        wrap.appendChild(sel);
-        container.appendChild(wrap);
-    });
-}
-
-function importFileReparse() {
-    _importFileBuildTracks();
-    _importFileRenderPreview();
-}
-
-function importFileClear() {
-    _importFileState = {
-        rawText: '', fileName: '', fileType: '',
-        headers: [], rows: [], columnMap: {}, parsedTracks: []
-    };
-    document.getElementById('import-file-upload-zone').style.display = '';
-    document.getElementById('import-file-preview-section').style.display = 'none';
-    document.getElementById('import-file-playlist-name').value = '';
-    document.getElementById('import-file-preview-tbody').innerHTML = '';
-}
-
-function importFileSubmit() {
-    const nameInput = document.getElementById('import-file-playlist-name');
-    const name = nameInput ? nameInput.value.trim() : '';
-    if (!name) {
-        showToast('Please enter a playlist name.', 'error');
-        nameInput && nameInput.focus();
-        return;
-    }
-
-    const tracks = _importFileState.parsedTracks.filter(t => t.track_name || t.artist_name);
-    if (!tracks.length) {
-        showToast('No valid tracks to import.', 'error');
-        return;
-    }
-
-    // Use a unique ID based on timestamp so multiple imports don't collide
-    const sourceId = `file_${Date.now()}`;
-
-    mirrorPlaylist('file', sourceId, name, tracks, {
-        description: `Imported from ${_importFileState.fileName}`,
-        owner: 'local'
-    });
-
-    showToast(`Imported "${name}" with ${tracks.length} tracks`, 'success');
-    importFileClear();
-
-    // Switch to mirrored tab so user sees the result
-    const mirroredBtn = document.querySelector('.sync-tab-button[data-tab="mirrored"]');
-    if (mirroredBtn) {
-        mirroredBtn.click();
-        // Reload mirrored playlists to show the new one
-        setTimeout(() => loadMirroredPlaylists(), 500);
-    }
-}
-
 // ── Mirrored Playlists ────────────────────────────────────────────────
 
 let mirroredPlaylistsLoaded = false;
-// Auto-Sync state + functions moved to webui/static/auto-sync.js; declared
-// as globals there so the older mirrored-playlist render path below can
-// still reach `mirroredPipelinePollers`, `runMirroredPlaylistPipeline`,
-// `editMirroredSourceRef`, `getMirroredSourceRef`, and `pollMirroredPipelineStatus`.
+// auto-sync.js retains classic card and edit adapters. AutoSyncHost publishes
+// the run/resume globals, delegating to the native pipeline controller.
 
 /**
  * Fire-and-forget helper: send parsed playlist data to be mirrored on the backend.
@@ -600,8 +141,8 @@ function renderMirroredCard(p, container) {
         ${typeof playlistQualityProfileSelectHtml === 'function'
             ? playlistQualityProfileSelectHtml(p.source_playlist_id, p.source, true)
             : ''}
-        ${disc > 0 ? `<button class="mirrored-card-clear" onclick="event.stopPropagation(); clearMirroredDiscovery(${p.id}, '${_escJs(p.name)}')" title="Clear discovery data">↺</button>` : ''}
-        <button class="mirrored-card-pipeline" onclick="event.stopPropagation(); runMirroredPlaylistPipeline(${p.id}, '${_escJs(p.name)}')" title="Refresh, discover, sync, and queue missing tracks">Auto-Sync</button>
+        ${disc > 0 ? `<button class="mirrored-card-clear" onclick="event.stopPropagation(); clearMirroredDiscovery(${p.id}, '${_escJs(p.name)}')" title="Clear identification data">↺</button>` : ''}
+        <button class="mirrored-card-pipeline" onclick="event.stopPropagation(); runMirroredPlaylistPipeline(${p.id}, '${_escJs(p.name)}')" title="Refresh, identify, sync, and queue missing tracks">Auto-Sync</button>
         <button class="mirrored-card-rename" onclick="event.stopPropagation(); editMirroredCustomName(${p.id}, '${_escJs(p.name)}', '${_escJs(p.custom_name || '')}')" title="Rename (changes the name shown here and used when syncing)">✏️</button>
         <button class="mirrored-card-link" onclick="event.stopPropagation(); editMirroredSourceRef(${p.id}, '${_escJs(p.name)}', '${_escJs(p.source)}', '${_escJs(sourceRef)}')" title="Edit original playlist link">🔗</button>
         <button class="mirrored-card-export" onclick="event.stopPropagation(); exportMirroredPlaylist(${p.id}, '${_escJs(p.display_name || p.name)}')" title="Export to ListenBrainz / JSPF">📤</button>
@@ -650,8 +191,9 @@ function renderMirroredCard(p, container) {
         );
     }
 
-    if (pipelineState && pipelineState.status === 'running' && !mirroredPipelinePollers[hash]) {
-        pollMirroredPipelineStatus(p.id, p.name);
+    if (pipelineState && pipelineState.status === 'running') {
+        // The native controller owns the poller registry and deduplicates resumes.
+        window.pollMirroredPipelineStatus?.(p.id, p.name);
     }
 }
 
@@ -783,7 +325,7 @@ async function _pollPlaylistExport(jobId, playlistId, mode, name) {
             const sum = job.summary || {};
             const cov = `${sum.included || 0}/${sum.total || 0} matched${sum.skipped ? ` · ${sum.skipped} unmatched` : ''}`;
             if (mode === 'download') {
-                window.location = `/api/playlists/export/download/${jobId}`;
+                window.location = window.SoulSyncURL?.resolve(`/api/playlists/export/download/${jobId}`) || `/api/playlists/export/download/${jobId}`;
                 _setExportStatus(playlistId, `<span style="color:#22c55e;">Downloaded · ${cov}</span>`, 8000);
             } else {
                 const url = (job.push && job.push.playlist_url) || '';
@@ -1173,12 +715,12 @@ function closeMirroredModal() {
  * Delete a mirrored playlist after confirmation.
  */
 async function clearMirroredDiscovery(playlistId, name) {
-    if (!await showConfirmDialog({ title: 'Clear Discovery Data', message: `Clear discovery data for "${name}"? You can re-discover afterwards to get updated cover art.` })) return;
+    if (!await showConfirmDialog({ title: 'Clear Identification Data', message: `Clear identification data for "${name}"? You can re-identify afterwards to get updated cover art.` })) return;
     try {
         const res = await fetch(`/api/mirrored-playlists/${playlistId}/clear-discovery`, { method: 'POST' });
         const data = await res.json();
         if (data.success) {
-            showToast(`Cleared discovery for ${name} (${data.cleared} tracks)`, 'success');
+            showToast(`Cleared identification for ${name} (${data.cleared} tracks)`, 'success');
             // Signal cancellation to any running worker, then clear state
             const hash = `mirrored_${playlistId}`;
             if (youtubePlaylistStates[hash]) {
@@ -1189,7 +731,7 @@ async function clearMirroredDiscovery(playlistId, name) {
             if (staleModal) staleModal.remove();
             loadMirroredPlaylists();
         } else {
-            showToast(data.error || 'Failed to clear discovery', 'error');
+            showToast(data.error || 'Failed to clear identification', 'error');
         }
     } catch (err) {
         showToast(`Error: ${err.message}`, 'error');
@@ -1202,6 +744,7 @@ let _discoveryPoolOverlay = null;
 let _discoveryPoolData = null;
 let _discoveryPoolView = 'categories'; // 'categories' | 'failed' | 'matched'
 let _discoveryPoolPlaylistFilter = null;
+let _discoveryPoolSort = 'recent'; // 'recent' | 'confidence_desc' | 'confidence_asc' (#1452)
 
 async function loadDiscoveryPoolStats() {
     try {
@@ -1225,7 +768,7 @@ async function openDiscoveryPoolModal(playlistId = null) {
         const res = await fetch(url);
         _discoveryPoolData = await res.json();
     } catch (err) {
-        showToast('Failed to load discovery pool', 'error');
+        showToast('Failed to load Match Review', 'error');
         return;
     }
 
@@ -1248,7 +791,7 @@ async function openDiscoveryPoolModal(playlistId = null) {
         <div class="modal-container playlist-modal">
             <div class="playlist-modal-header">
                 <div class="playlist-header-content">
-                    <h2>Discovery Pool</h2>
+                    <h2>Match Review</h2>
                     <div class="playlist-quick-info">
                         <span class="playlist-track-count" id="pool-header-matched">${matchedCount} Matched</span>
                         <span class="playlist-owner ${failedCount > 0 ? 'pool-header-failed-highlight' : ''}" id="pool-header-failed">${failedCount} Failed</span>
@@ -1257,6 +800,7 @@ async function openDiscoveryPoolModal(playlistId = null) {
                             ${playlistOptions}
                         </select>
                     </div>
+                    <div class="pool-direction-note" style="font-size:12px;opacity:0.7;margin-top:6px;">Links source tracks to catalogue metadata &mdash; nothing is downloaded or changed here.</div>
                 </div>
                 <span class="playlist-modal-close" onclick="closeDiscoveryPoolModal()">&times;</span>
             </div>
@@ -1290,13 +834,19 @@ async function openDiscoveryPoolModal(playlistId = null) {
                         <button class="pool-back-btn" onclick="showPoolCategories()">&larr; Back</button>
                         <span class="pool-list-title" id="pool-list-title"></span>
                         <input type="text" class="pool-list-search" id="pool-list-search" placeholder="Filter tracks..." oninput="renderPoolList()">
+                        <select id="pool-sort-select" class="pool-sort-select" style="display: none;" onchange="_discoveryPoolSort = this.value; renderPoolList();" title="Sort matched tracks">
+                            <option value="recent">Most recent</option>
+                            <option value="confidence_desc">Highest match %</option>
+                            <option value="confidence_asc">Lowest match %</option>
+                        </select>
+                        <button id="pool-clear-btn" class="playlist-modal-btn playlist-modal-btn-secondary" style="display: none;" onclick="clearPoolCache()" title="Clear cached matches">Clear</button>
                     </div>
                     <div class="pool-list-content" id="pool-list-content"></div>
                 </div>
             </div>
 
             <div class="playlist-modal-footer">
-                <div class="playlist-modal-footer-left"></div>
+                <div class="playlist-modal-footer-left"><span class="pool-persist-note" style="font-size:12px;opacity:0.7;">Saved as: match data on your playlist tracks. Affects next sync: yes.</span></div>
                 <div class="playlist-modal-footer-right">
                     <button class="playlist-modal-btn playlist-modal-btn-secondary" onclick="closeDiscoveryPoolModal()">Close</button>
                 </div>
@@ -1408,6 +958,7 @@ async function openWingItPoolModal(playlistId = null) {
                             ${playlistOptions}
                         </select>
                     </div>
+                    <div class="pool-direction-note" style="font-size:12px;opacity:0.7;margin-top:6px;">Best-effort guesses linking source tracks to catalogue metadata &mdash; verify them before they stick.</div>
                 </div>
                 <span class="playlist-modal-close" onclick="closeWingItPoolModal()">&times;</span>
             </div>
@@ -1447,7 +998,7 @@ async function openWingItPoolModal(playlistId = null) {
             </div>
 
             <div class="playlist-modal-footer">
-                <div class="playlist-modal-footer-left"></div>
+                <div class="playlist-modal-footer-left"><span class="pool-persist-note" style="font-size:12px;opacity:0.7;">Saved as: match data, flagged as a guess until you confirm. Affects next sync: yes.</span></div>
                 <div class="playlist-modal-footer-right">
                     <button class="playlist-modal-btn playlist-modal-btn-secondary" onclick="closeWingItPoolModal()">Close</button>
                 </div>
@@ -1606,9 +1157,15 @@ function showPoolList(category) {
     const titleEl = document.getElementById('pool-list-title');
     if (titleEl) titleEl.textContent = category === 'failed' ? 'Failed Tracks' : 'Matched Tracks';
 
-    // Clear search filter when switching views
+    // Clear search filter when switching views (sort choice persists)
     const searchEl = document.getElementById('pool-list-search');
     if (searchEl) searchEl.value = '';
+
+    // Sort + Clear controls only make sense on the matched view (#1452)
+    const sortEl = document.getElementById('pool-sort-select');
+    if (sortEl) sortEl.style.display = category === 'matched' ? '' : 'none';
+    const clearEl = document.getElementById('pool-clear-btn');
+    if (clearEl) clearEl.style.display = category === 'matched' ? '' : 'none';
 
     renderPoolList();
 }
@@ -1632,7 +1189,7 @@ async function filterDiscoveryPool(playlistId) {
             renderPoolList();
         }
     } catch (err) {
-        showToast('Failed to filter discovery pool', 'error');
+        showToast('Failed to filter Match Review', 'error');
     }
 }
 
@@ -1694,6 +1251,13 @@ function renderPoolList() {
                     (e.original_artist || '').toLowerCase().includes(query) ||
                     matchedName.toLowerCase().includes(query);
             });
+        }
+        // Match-% sort, applied after the search filter (#1452). slice() keeps
+        // the backend's recency order intact when switching back to 'recent'.
+        if (_discoveryPoolSort === 'confidence_desc') {
+            entries = entries.slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+        } else if (_discoveryPoolSort === 'confidence_asc') {
+            entries = entries.slice().sort((a, b) => (a.confidence || 0) - (b.confidence || 0));
         }
         if (entries.length === 0) {
             container.innerHTML = query
@@ -1810,7 +1374,7 @@ function openPoolRematchModal(cacheId, trackName, artistName) {
 }
 
 async function removePoolCacheEntry(entryId) {
-    if (!await showConfirmDialog({ title: 'Remove Cache Entry', message: 'Remove this cached match? The track will be re-discovered fresh next time.' })) return;
+    if (!await showConfirmDialog({ title: 'Remove Cache Entry', message: 'Remove this cached match? The track will be re-identified fresh next time.' })) return;
     try {
         const res = await fetch(`/api/discovery-pool/cache/${entryId}`, { method: 'DELETE' });
         const data = await res.json();
@@ -1819,6 +1383,30 @@ async function removePoolCacheEntry(entryId) {
             filterDiscoveryPool(_discoveryPoolPlaylistFilter || '');
         } else {
             showToast(data.error || 'Failed to remove', 'error');
+        }
+    } catch (err) {
+        showToast(`Error: ${err.message}`, 'error');
+    }
+}
+
+async function clearPoolCache() {
+    // Bulk-clear cached matches, scoped to the playlist filter when one is set (#1452).
+    const count = (_discoveryPoolData && _discoveryPoolData.stats && _discoveryPoolData.stats.matched) || 0;
+    const playlistId = _discoveryPoolPlaylistFilter;
+    const scopeMsg = playlistId
+        ? `Clear ${count} cached matches for this playlist?`
+        : `Clear all ${count} cached matches?`;
+    if (!await showConfirmDialog({ title: 'Clear Cached Matches', message: `${scopeMsg} Tracks will be re-identified on the next discovery or sync.`, confirmText: 'Clear', destructive: true })) return;
+    try {
+        let url = '/api/discovery-pool/cache';
+        if (playlistId) url += `?playlist_id=${playlistId}`;
+        const res = await fetch(url, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+            showToast(`Cleared ${data.cleared} cached matches`, 'success');
+            filterDiscoveryPool(_discoveryPoolPlaylistFilter || '');
+        } else {
+            showToast(data.error || 'Failed to clear', 'error');
         }
     } catch (err) {
         showToast(`Error: ${err.message}`, 'error');
@@ -2113,7 +1701,7 @@ async function discoverMirroredPlaylist(playlistId) {
 
             const cached = prepData.cached_matches || 0;
             const total = prepData.total_tracks || tracks.length;
-            showToast(`Loaded ${cached}/${total} cached discovery results`, 'success');
+            showToast(`Loaded ${cached}/${total} cached identification results`, 'success');
         } else {
             // No cached data — fresh state
             youtubePlaylistStates[tempHash] = {
@@ -2189,7 +1777,7 @@ async function retryFailedMirroredDiscovery(urlHash) {
 
         showToast(`Retrying ${data.retry_count} failed tracks...`, 'info');
     } catch (err) {
-        showToast(`Error retrying discovery: ${err.message}`, 'error');
+        showToast(`Error retrying identification: ${err.message}`, 'error');
     }
 }
 
@@ -2484,6 +2072,7 @@ const VIDEO_HUB_REFERENCE = {
                 { type: 'video_run_repair_job', label: 'Run Maintenance Job', desc: 'Force-run one (or all enabled) Library Maintenance jobs' },
                 { type: 'video_clean_plex_images', label: 'Clean Up Plex Images', desc: 'Clear stale cached artwork' },
                 { type: 'video_clean_youtube_episodes', label: 'Clean Old YouTube Episodes', desc: 'Per-channel retention windows' },
+                { type: 'video_purge_recycle_bin', label: 'Empty Recycle Bin', desc: 'Delete recycled files past the keep window' },
                 { type: 'video_full_cleanup', label: 'Full Cleanup', desc: 'Queue/import/search-history sweep' },
                 { type: 'video_backup_database', label: 'Backup Database', desc: 'Timestamped video_library.db backup' },
             ]
@@ -2530,21 +2119,29 @@ const _autoIcons = {
     watchlist_new_release: '\uD83D\uDD14', playlist_synced: '\uD83D\uDD04',
     playlist_changed: '\u270F\uFE0F',
     process_wishlist: '\uD83D\uDCCB', scan_watchlist: '\uD83D\uDC41\uFE0F',
+    scan_watchlist_podcasts: '\uD83C\uDF99\uFE0F',
+    audiobook_process_wishlist: '\uD83D\uDCDA', audiobook_scan_watchlist: '\u270D\uFE0F',
+    audiobook_scan_library: '\uD83C\uDFA7', audiobook_purge_recycle: '\uD83D\uDDD1\uFE0F',
     scan_library: '\uD83D\uDD04', refresh_mirrored: '\uD83D\uDCC2', sync_playlist: '\uD83D\uDD01',
     discover_playlist: '\uD83D\uDD0D', discovery_completed: '\uD83D\uDD0D',
     notify_only: '\uD83D\uDD14', discord_webhook: '\uD83D\uDCAC', pushbullet: '\uD83D\uDD14', telegram: '\u2709\uFE0F', webhook: '\uD83C\uDF10',
+    ntfy: '\uD83D\uDCE1', gotify: '\uD83D\uDCEC',
     signal_received: '\u26A1', fire_signal: '\u26A1', run_script: '\uD83D\uDCBB',
     // Phase 3
     wishlist_processing_completed: '\u2705', watchlist_scan_completed: '\u2705',
     database_update_completed: '\uD83D\uDDC4\uFE0F', download_failed: '\u274C',
     download_quarantined: '\u26A0\uFE0F', wishlist_item_added: '\u2795',
+    deezer_signin_failed: '\uD83D\uDEAB', deezer_signin_restored: '\u2705',
     watchlist_artist_added: '\uD83D\uDC64', watchlist_artist_removed: '\uD83D\uDC64',
-    import_completed: '\uD83D\uDCE5', mirrored_playlist_created: '\uD83D\uDCC2',
+    import_completed: '\uD83D\uDCE5', import_needs_attention: '\uD83D\uDCE5', audiobook_grab_started: '\u2B07\uFE0F', audiobook_download_failed: '\u274C', audiobook_import_needs_attention: '\u26A0\uFE0F', audiobook_wishlist_item_added: '\u2795', audiobook_wishlist_processing_completed: '\u2705', audiobook_new_release: '\uD83D\uDD14', audiobook_watchlist_scan_completed: '\u2705', audiobook_author_followed: '\uD83D\uDC64', audiobook_author_unfollowed: '\uD83D\uDC64', audiobook_library_scan_completed: '\uD83C\uDFA7', mirrored_playlist_created: '\uD83D\uDCC2',
     quality_scan_completed: '\uD83D\uDCCA', duplicate_scan_completed: '\uD83D\uDDC2\uFE0F', library_scan_completed: '\uD83D\uDCE1',
-    start_database_update: '\uD83D\uDDC4\uFE0F', run_duplicate_cleaner: '\uD83D\uDDC2\uFE0F',
-    clear_quarantine: '\uD83D\uDDD1\uFE0F', cleanup_wishlist: '\uD83E\uDDF9',
+    start_database_update: '\uD83D\uDDC4\uFE0F', start_database_update_hourly: '\uD83D\uDDC4\uFE0F',
+    sync_downloaded_playlists: '\uD83D\uDD04', run_duplicate_cleaner: '\uD83D\uDDC2\uFE0F',
+    clear_quarantine: '\uD83D\uDDD1\uFE0F', library_cleanup: '\uD83D\uDDD1\uFE0F', cleanup_wishlist: '\uD83E\uDDF9',
     update_discovery_pool: '\uD83E\uDDED', start_quality_scan: '\uD83D\uDCCA',
+    run_repair_job: '\uD83D\uDD27',
     backup_database: '\uD83D\uDCBE',
+    check_deezer_signin: '\uD83D\uDD11',
     refresh_beatport_cache: '\uD83C\uDFB5',
     clean_search_history: '\uD83D\uDDD1\uFE0F',
     clean_completed_downloads: '\u2705',
@@ -2558,6 +2155,7 @@ const _autoIcons = {
     video_process_movie_wishlist: '\uD83C\uDFAC', video_process_episode_wishlist: '\uD83D\uDCFA',
     video_process_youtube_wishlist: '\u2B07\uFE0F',
     video_refresh_airing_schedules: '\uD83D\uDDD3\uFE0F', video_clean_youtube_episodes: '\uD83E\uDDF9',
+    video_purge_recycle_bin: '\uD83D\uDDD1\uFE0F',
     video_reenrich_stale: '\uD83D\uDD04',
     video_clean_search_history: '\uD83D\uDDD1\uFE0F', video_clean_completed_downloads: '\u2705',
     video_full_cleanup: '\uD83E\uDDF9', video_backup_database: '\uD83D\uDCBE',
@@ -2566,6 +2164,7 @@ const _autoIcons = {
     // Arr-parity acquisition automations (P1/P5/P6)
     video_rss_sync: '\uD83D\uDCE1', video_seeding_sweep: '\uD83C\uDF31',
     video_import_lists: '\uD83D\uDCE5',
+    video_extto_fresh_refresh: '\u2728',
     // Video event triggers + maintenance action
     monthly_time: '\uD83D\uDCC5',
     video_batch_complete: '\u2705', video_library_scan_completed: '\uD83D\uDCE1',
@@ -2585,7 +2184,7 @@ const _autoIcons = {
 const AUTO_HUB_GROUPS = [
     {
         id: 'playlist-pipeline', icon: '🚀', name: 'Playlist Pipeline (All-in-One)',
-        desc: 'Single automation that runs the full playlist lifecycle: refresh → discover → sync → download missing. No signal wiring needed.',
+        desc: 'Single automation that runs the full playlist lifecycle: refresh → identify → sync → download missing. No signal wiring needed.',
         category: 'Sync', badge: '1 automation', color: '#8b5cf6',
         steps: [
             { label: 'Refresh', icon: '🔄', type: 'action' },
@@ -2728,9 +2327,9 @@ const AUTO_HUB_RECIPES = [
         category: 'Sync', difficulty: 'beginner', when: { type: 'schedule', config: { interval: 6, unit: 'hours' } }, do: { type: 'refresh_mirrored', config: {} }, then: []
     },
     {
-        id: 'release-radar-pipeline', icon: '\uD83D\uDCE1', name: 'Release Radar Pipeline', desc: 'Every Friday, refresh mirrored playlists, discover new tracks, then sync. Chain 3 automations for a full pipeline.',
+        id: 'release-radar-pipeline', icon: '\uD83D\uDCE1', name: 'Release Radar Pipeline', desc: 'Every Friday, refresh mirrored playlists, identify new tracks, then sync. Chain 3 automations for a full pipeline.',
         category: 'Sync', difficulty: 'intermediate', when: { type: 'weekly_time', config: { days: ['friday'], time: '18:00' } }, do: { type: 'refresh_mirrored', config: {} }, then: [],
-        chain: ['Refresh Mirrored', 'Discover Playlist', 'Sync Playlist'], note: 'Create 3 separate automations and chain them with signals for the full pipeline.'
+        chain: ['Refresh Mirrored', 'Identify Playlist Tracks', 'Sync Playlist'], note: 'Create 3 separate automations and chain them with signals for the full pipeline.'
     },
     {
         id: 'discover-weekly-grab', icon: '\uD83C\uDFB5', name: 'Discover Weekly Grab', desc: 'Every Monday, refresh your mirrored Discover Weekly to capture the new playlist before Spotify replaces it.',
@@ -2741,7 +2340,7 @@ const AUTO_HUB_RECIPES = [
         category: 'Sync', difficulty: 'beginner', when: { type: 'playlist_changed', config: {} }, do: { type: 'notify_only', config: {} }, then: [{ type: 'discord_webhook', config: {} }]
     },
     {
-        id: 'new-mirror-discovery', icon: '\uD83D\uDD0D', name: 'New Mirror Auto-Discovery', desc: 'Automatically discover tracks when you mirror a new playlist.',
+        id: 'new-mirror-discovery', icon: '\uD83D\uDD0D', name: 'New Mirror Auto-Identify', desc: 'Automatically identify tracks when you mirror a new playlist.',
         category: 'Sync', difficulty: 'beginner', when: { type: 'mirrored_playlist_created', config: {} }, do: { type: 'discover_playlist', config: {} }, then: []
     },
     // New Music Discovery
@@ -2899,6 +2498,8 @@ const AUTO_HUB_REFERENCE = {
                 { type: 'batch_complete', label: 'Batch Complete', desc: 'Fires when a batch download job finishes' },
                 { type: 'download_failed', label: 'Download Failed', desc: 'Fires when a download fails or errors out' },
                 { type: 'download_quarantined', label: 'File Quarantined', desc: 'Fires when a downloaded file is quarantined for quality issues' },
+                { type: 'deezer_signin_failed', label: 'Deezer Sign-in Failed', desc: 'Fires once when Deezer rejects the ARL (expired or signed out)' },
+                { type: 'deezer_signin_restored', label: 'Deezer Sign-in Restored', desc: 'Fires when an ARL signs in again after a failure, or a new ARL signs in' },
             ]
         },
         {
@@ -2916,7 +2517,7 @@ const AUTO_HUB_REFERENCE = {
                 { type: 'playlist_synced', label: 'Playlist Synced', desc: 'Fires when a playlist sync operation completes' },
                 { type: 'playlist_changed', label: 'Playlist Changed', desc: 'Fires when a tracked playlist has changes detected' },
                 { type: 'mirrored_playlist_created', label: 'Playlist Mirrored', desc: 'Fires when a new mirrored playlist is created' },
-                { type: 'discovery_completed', label: 'Discovery Complete', desc: 'Fires when playlist discovery finishes' },
+                { type: 'discovery_completed', label: 'Identification Complete', desc: 'Fires when playlist identification finishes' },
             ]
         },
         {
@@ -2938,11 +2539,11 @@ const AUTO_HUB_REFERENCE = {
     actions: [
         {
             group: 'Downloads & Sync', items: [
-                { type: 'playlist_pipeline', label: 'Playlist Pipeline', desc: 'Full lifecycle: refresh → discover → sync → download missing' },
+                { type: 'playlist_pipeline', label: 'Playlist Pipeline', desc: 'Full lifecycle: refresh → identify → sync → download missing' },
                 { type: 'process_wishlist', label: 'Process Wishlist', desc: 'Download all pending wishlist items' },
                 { type: 'refresh_mirrored', label: 'Refresh Mirrored', desc: 'Refresh all mirrored playlists from their sources' },
-                { type: 'sync_playlist', label: 'Sync Playlist', desc: 'Sync a specific playlist to your library' },
-                { type: 'discover_playlist', label: 'Discover Playlist', desc: 'Run track discovery on mirrored playlists' },
+                { type: 'sync_playlist', label: 'Sync Playlist', desc: 'Sync mirrored playlist(s) to your media server' },
+                { type: 'discover_playlist', label: 'Identify Playlist Tracks', desc: 'Run track identification on mirrored playlists' },
                 { type: 'scan_watchlist', label: 'Scan Watchlist', desc: 'Check watched artists for new releases' },
                 { type: 'update_discovery_pool', label: 'Update Discovery', desc: 'Refresh the discovery pool with new recommendations' },
             ]
@@ -2951,8 +2552,10 @@ const AUTO_HUB_REFERENCE = {
             group: 'Library Tools', items: [
                 { type: 'scan_library', label: 'Scan Library', desc: 'Full scan of local music library files' },
                 { type: 'start_quality_scan', label: 'Quality Scan', desc: 'Check library tracks for quality issues' },
+                { type: 'run_repair_job', label: 'Run Maintenance Job', desc: 'Run one (or all enabled) Library Maintenance jobs, e.g. the Corrupt File Detector' },
                 { type: 'start_database_update', label: 'Update Database', desc: 'Run a database update/maintenance operation' },
                 { type: 'backup_database', label: 'Backup Database', desc: 'Create a backup of the music database' },
+                { type: 'check_deezer_signin', label: 'Check Deezer Sign-in', desc: 'Ask Deezer whether the ARL still signs in' },
             ]
         },
         {
@@ -2960,6 +2563,7 @@ const AUTO_HUB_REFERENCE = {
                 { type: 'full_cleanup', label: 'Full Cleanup', desc: 'Run all cleanup tasks: dedup, quarantine, wishlist tidy' },
                 { type: 'run_duplicate_cleaner', label: 'Duplicate Cleaner', desc: 'Find and handle duplicate tracks' },
                 { type: 'clear_quarantine', label: 'Clear Quarantine', desc: 'Remove all quarantined files' },
+                { type: 'library_cleanup', label: 'Clear Quarantine + Empty Recycle Bin', desc: 'One sweep for both bins; the recycle bin honours its keep window' },
                 { type: 'cleanup_wishlist', label: 'Clean Wishlist', desc: 'Remove completed/invalid wishlist items' },
                 { type: 'clean_search_history', label: 'Clean Search History', desc: 'Clear old search history entries' },
                 { type: 'clean_completed_downloads', label: 'Clean Downloads', desc: 'Remove completed download records' },
@@ -2977,6 +2581,8 @@ const AUTO_HUB_REFERENCE = {
                 { type: 'discord_webhook', label: 'Discord Webhook', desc: 'Send a message to a Discord channel via webhook' },
                 { type: 'telegram', label: 'Telegram', desc: 'Send a message to a Telegram chat via bot' },
                 { type: 'pushbullet', label: 'Pushbullet', desc: 'Send a push notification via Pushbullet' },
+                { type: 'ntfy', label: 'ntfy', desc: 'Publish to an ntfy topic, on ntfy.sh or your own server' },
+                { type: 'gotify', label: 'Gotify', desc: 'Send a message to your Gotify server' },
             ]
         },
         {
@@ -3314,6 +2920,15 @@ async function loadAutomations() {
     const empty = document.getElementById('automations-empty');
     const statsBar = document.getElementById('automations-stats');
     if (!list || !empty) return;
+    // If React owns /automations, IT is the live page and this container is
+    // hidden. Repainting it would put a second copy of every section and card
+    // in the document — duplicate #auto-section-* ids and duplicate
+    // .automation-card[data-id] nodes, which document-wide getElementById /
+    // querySelector calls then resolve to instead of the visible ones.
+    //
+    // This is reachable: the shared builder's onSaved hook calls back into
+    // here after a save made from the React page.
+    if (document.getElementById('webui-react-root')?.classList.contains('active')) return;
     try {
         const res = await fetch('/api/automations');
         const payload = await res.json();
@@ -3333,8 +2948,34 @@ async function loadAutomations() {
         const systemAutos = automations.filter(a => a.is_system);
         const userAutos = automations.filter(a => !a.is_system);
 
-        if (systemAutos.length) {
-            list.appendChild(_buildAutomationSection('auto-section-system', 'System', systemAutos, true, { isProtected: true }));
+        const isMaint = (a) => {
+            if (a.owned_by === 'system:repair_job') return true;
+            const maintActions = [
+                'run_repair_job', 'video_run_repair_job',
+                'clean_search_history', 'video_clean_search_history',
+                'clean_completed_downloads', 'video_clean_completed_downloads',
+                'backup_database', 'video_backup_database',
+                'full_cleanup', 'video_full_cleanup',
+                'library_cleanup', 'deep_scan_library',
+                'video_deep_scan_movies', 'video_deep_scan_tv',
+                'refresh_beatport_cache',
+                'seeding_sweep', 'video_seeding_sweep',
+                'import_lastfm_listening', 'import_listenbrainz_listening',
+                'audiobook_purge_recycle', 'video_clean_youtube_episodes',
+                'video_clean_plex_images', 'video_purge_recycle_bin',
+                'video_reenrich_stale'
+            ];
+            return maintActions.includes(a.action_type);
+        };
+
+        const opAutos = systemAutos.filter(a => !isMaint(a));
+        const maintAutos = systemAutos.filter(a => isMaint(a));
+
+        if (opAutos.length) {
+            list.appendChild(_buildAutomationSection('auto-section-operations', 'Operations', opAutos, true, { isProtected: true }));
+        }
+        if (maintAutos.length) {
+            list.appendChild(_buildAutomationSection('auto-section-maintenance', 'Maintenance', maintAutos, true, { isProtected: true }));
         }
 
         // Automation Hub section
@@ -3367,8 +3008,6 @@ async function loadAutomations() {
             renderAutomationsMasterToggle(statsBar, 'music');
         }
 
-        // Filter bar — show when 6+ automations
-        _initAutoFilterBar(automations);
         // Catch up on current automation progress
         try {
             const progRes = await fetch('/api/automations/progress');
@@ -3879,7 +3518,7 @@ function _promptNotifyConfig(groupName) {
         overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;display:flex;align-items:center;justify-content:center;';
 
         overlay.innerHTML = `
-            <div style="background:var(--bg-secondary, #1e1e2e);border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:28px;max-width:420px;width:90%;color:var(--text-primary, #fff);font-family:inherit;">
+            <div style="background:var(--bg-secondary);border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:28px;max-width:420px;width:90%;color:var(--text-primary);font-family:inherit;">
                 <h3 style="margin:0 0 6px;font-size:1.1em;">Configure Notifications</h3>
                 <p style="margin:0 0 18px;font-size:0.85em;opacity:0.5;">${groupName} includes notification steps. Choose how to get notified.</p>
                 <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px;">
@@ -3895,7 +3534,7 @@ function _promptNotifyConfig(groupName) {
                 </div>
                 <div style="display:flex;gap:10px;justify-content:flex-end;">
                     <button id="deploy-notify-cancel" style="padding:8px 20px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;background:transparent;color:rgba(255,255,255,0.7);cursor:pointer;font-size:0.88em;">Cancel</button>
-                    <button id="deploy-notify-confirm" style="padding:8px 20px;border:none;border-radius:8px;background:var(--accent-color,#1db954);color:#fff;cursor:pointer;font-size:0.88em;font-weight:600;">Deploy</button>
+                    <button id="deploy-notify-confirm" style="padding:8px 20px;border:none;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer;font-size:0.88em;font-weight:600;">Deploy</button>
                 </div>
             </div>
         `;
@@ -3954,63 +3593,7 @@ function _promptNotifyConfig(groupName) {
 }
 
 // --- Filter Bar ---
-function _initAutoFilterBar(automations) {
-    const bar = document.getElementById('auto-filter-bar');
-    if (!bar) return;
-    if (automations.length < 7) { bar.style.display = 'none'; return; }
-    bar.style.display = '';
 
-    // Populate trigger dropdown
-    const trigSel = document.getElementById('auto-filter-trigger');
-    const actSel = document.getElementById('auto-filter-action');
-    const trigTypes = [...new Set(automations.map(a => a.trigger_type))].sort();
-    const actTypes = [...new Set(automations.map(a => a.action_type))].sort();
-    const prevTrig = trigSel.value;
-    const prevAct = actSel.value;
-    trigSel.innerHTML = '<option value="">All Triggers</option>' + trigTypes.map(t =>
-        `<option value="${_escAttr(t)}">${_esc(_autoFormatTrigger(t, {}))}</option>`).join('');
-    actSel.innerHTML = '<option value="">All Actions</option>' + actTypes.map(t =>
-        `<option value="${_escAttr(t)}">${_esc(_autoFormatAction(t))}</option>`).join('');
-    trigSel.value = prevTrig;
-    actSel.value = prevAct;
-
-    // Bind events (use a flag to avoid double-binding)
-    if (!bar.dataset.bound) {
-        bar.dataset.bound = '1';
-        document.getElementById('auto-filter-search').addEventListener('input', _filterAutomations);
-        trigSel.addEventListener('change', _filterAutomations);
-        actSel.addEventListener('change', _filterAutomations);
-    }
-    _filterAutomations();
-}
-
-function _filterAutomations() {
-    const q = (document.getElementById('auto-filter-search').value || '').toLowerCase().trim();
-    const trigFilter = document.getElementById('auto-filter-trigger').value;
-    const actFilter = document.getElementById('auto-filter-action').value;
-    const cards = document.querySelectorAll('#automations-list .automation-card');
-    let visible = 0;
-    cards.forEach(card => {
-        const name = (card.querySelector('.automation-name')?.textContent || '').toLowerCase();
-        const trig = card.querySelector('.flow-trigger')?.textContent || '';
-        const act = card.querySelector('.flow-action')?.textContent || '';
-        // Match search text against name, trigger label, action label
-        const matchQ = !q || name.includes(q) || trig.toLowerCase().includes(q) || act.toLowerCase().includes(q);
-        // Match trigger/action type filters using data attributes
-        const matchTrig = !trigFilter || card.dataset.triggerType === trigFilter;
-        const matchAct = !actFilter || card.dataset.actionType === actFilter;
-        const show = matchQ && matchTrig && matchAct;
-        card.style.display = show ? '' : 'none';
-        if (show) visible++;
-    });
-    const countEl = document.getElementById('auto-filter-count');
-    if (countEl) {
-        countEl.textContent = (q || trigFilter || actFilter) ? `${visible} of ${cards.length}` : '';
-    }
-}
-
-// --- Group Dropdown ---
-let _activeGroupDropdown = null;
 
 function _showGroupDropdown(event, autoId, currentGroup) {
     // Close any existing dropdown
@@ -4214,10 +3797,11 @@ function _autoFormatTrigger(type, config) {
     const labels = {
         app_started: 'App Started', track_downloaded: 'Track Downloaded', batch_complete: 'Batch Complete',
         watchlist_new_release: 'New Release Found', playlist_synced: 'Playlist Synced',
-        playlist_changed: 'Playlist Changed', discovery_completed: 'Discovery Complete',
+        playlist_changed: 'Playlist Changed', discovery_completed: 'Identification Complete',
         wishlist_processing_completed: 'Wishlist Processed', watchlist_scan_completed: 'Watchlist Scan Done',
         database_update_completed: 'Database Updated', download_failed: 'Download Failed',
         download_quarantined: 'File Quarantined', wishlist_item_added: 'Wishlist Item Added',
+        deezer_signin_failed: 'Deezer Sign-in Failed', deezer_signin_restored: 'Deezer Sign-in Restored',
         watchlist_artist_added: 'Artist Watched', watchlist_artist_removed: 'Artist Unwatched',
         import_completed: 'Import Complete', mirrored_playlist_created: 'Playlist Mirrored',
         quality_scan_completed: 'Quality Scan Done', duplicate_scan_completed: 'Duplicate Scan Done',
@@ -4237,13 +3821,24 @@ function _autoFormatTrigger(type, config) {
 function _autoFormatAction(type) {
     const labels = {
         process_wishlist: 'Process Wishlist', scan_watchlist: 'Scan Watchlist',
+        scan_watchlist_podcasts: 'Scan Watchlist Podcasts',
+        // Audiobook side
+        audiobook_process_wishlist: 'Process Audiobook Wishlist',
+        audiobook_scan_watchlist: 'Scan Followed Authors',
+        audiobook_scan_library: 'Scan Audiobook Library',
+        audiobook_purge_recycle: 'Empty Audiobook Recycle Bin',
         scan_library: 'Scan Library', refresh_mirrored: 'Refresh Mirrored',
-        sync_playlist: 'Sync Playlist', discover_playlist: 'Discover Playlist',
+        sync_playlist: 'Sync Playlist', discover_playlist: 'Identify Playlist Tracks',
         notify_only: 'Notify Only',
-        start_database_update: 'Update Database', run_duplicate_cleaner: 'Run Duplicate Cleaner',
-        clear_quarantine: 'Clear Quarantine', cleanup_wishlist: 'Clean Up Wishlist',
+        start_database_update: 'Update Database', start_database_update_hourly: 'Update Database (Hourly)',
+        sync_downloaded_playlists: 'Sync Downloaded Playlists',
+        run_duplicate_cleaner: 'Run Duplicate Cleaner',
+        clear_quarantine: 'Clear Quarantine', library_cleanup: 'Clear Quarantine + Empty Recycle Bin',
+        cleanup_wishlist: 'Clean Up Wishlist',
         update_discovery_pool: 'Update Discovery', start_quality_scan: 'Run Quality Scan',
+        run_repair_job: 'Run Maintenance Job',
         backup_database: 'Backup Database',
+        check_deezer_signin: 'Check Deezer Sign-in',
         refresh_beatport_cache: 'Refresh Beatport Cache', clean_search_history: 'Clean Search History',
         clean_completed_downloads: 'Clean Completed Downloads',
         full_cleanup: 'Full Cleanup',
@@ -4263,6 +3858,7 @@ function _autoFormatAction(type) {
         video_refresh_airing_schedules: 'Refresh Airing Schedules',
         video_reenrich_stale: 'Refresh Stale Metadata',
         video_clean_youtube_episodes: 'Clean Old YouTube Episodes',
+        video_purge_recycle_bin: 'Empty Recycle Bin',
         video_clean_search_history: 'Clean Search History',
         video_clean_completed_downloads: 'Clean Completed Downloads',
         video_full_cleanup: 'Full Cleanup', video_backup_database: 'Backup Database',
@@ -4271,6 +3867,7 @@ function _autoFormatAction(type) {
         video_rss_sync: 'RSS Release Sync',
         video_seeding_sweep: 'Seeding Goal Sweep',
         video_import_lists: 'Sync Import Lists',
+        video_extto_fresh_refresh: 'Refresh Fresh Releases',
         search_and_download: 'Search & Download',
         seeding_sweep: 'Seeding Sweep',
         deep_scan_library: 'Deep Scan Library',
@@ -4300,6 +3897,8 @@ async function _autoTestNotify(slotKey) {
 function _autoFormatNotify(type) {
     if (type === 'discord_webhook') return 'Discord';
     if (type === 'pushbullet') return 'Pushbullet';
+    if (type === 'ntfy') return 'ntfy';
+    if (type === 'gotify') return 'Gotify';
     if (type === 'telegram') return 'Telegram';
     if (type === 'webhook') return 'Webhook';
     if (type === 'fire_signal') return '\u26A1 Signal';
@@ -4372,7 +3971,13 @@ function updateAutomationProgressFromData(data) {
     for (const [aidStr, state] of Object.entries(data)) {
         const aid = parseInt(aidStr);
         const card = document.querySelector(`.automation-card[data-id="${aid}"]`);
-        if (!card) continue;
+        // Skip cards React owns. This query is document-wide, so once /automations
+        // is a React route it would otherwise inject .automation-output panels
+        // into React's DOM — which React then clobbers on its next render, and
+        // the two fight over the same node. React renders its own progress from
+        // the ss:automation-progress event instead. Vanilla music + video cards
+        // live outside the React root and are unaffected.
+        if (!card || card.closest('#webui-react-root')) continue;
 
         let panel = card.querySelector('.automation-output');
         if (!panel) {
@@ -4738,6 +4343,7 @@ async function _openAutomationBuilder(editId) {
     _autoMirroredPlaylists = null; // invalidate so it re-fetches
     _autoSpotifyAuthenticated = false;
     _autoBuilder = { editId: editId || null, when: null, do: null, then: [], isSystem: false };
+    _autoBlockQuery = '';   // a stale search would open the palette pre-filtered
 
     // Populate group datalist from existing automations
     try {
@@ -4798,37 +4404,123 @@ function hideAutomationBuilder() {
 
 // --- Sidebar ---
 
-function _renderBuilderSidebar() {
+/**
+ * The block palette.
+ *
+ * Was three flat, unsearchable lists — 45 triggers and 52 actions, each a
+ * full-width row with an icon and a description. Finding "Playlist Synced"
+ * meant scrolling past twenty other triggers, which is the same wall the
+ * findings page had in a different costume.
+ *
+ * Now: a search box over everything, and drawers by the `category` the
+ * BACKEND tags each block with (blocks.py owns that taxonomy, so the video
+ * builder gets identical grouping for free). Searching flattens the drawers —
+ * when you know what you want, categories are in the way.
+ *
+ * Shared with the video builder. `_bEl` resolves against whichever builder is
+ * open, so every id below is context-correct without branching.
+ */
+let _autoBlockQuery = '';
+
+function _autoBlockSearch(value) {
+    _autoBlockQuery = String(value || '');
+    _renderBuilderSidebar({ keepFocus: true });
+}
+
+function _autoToggleBlockDrawer(key) {
+    const el = document.querySelector('.block-drawer[data-drawer="' + key + '"]');
+    if (el) el.classList.toggle('collapsed');
+}
+
+function _renderBuilderSidebar(opts) {
     const sidebar = _bEl('sidebar');
     if (!sidebar || !_autoBlocks) return;
 
-    let html = '';
+    const query = _autoBlockQuery.trim().toLowerCase();
+    const searching = query.length > 0;
+    const order = _autoBlocks.category_order || [];
     const sections = [
         { key: 'triggers', title: 'Triggers', slot: 'when' },
         { key: 'actions', title: 'Actions', slot: 'do' },
         { key: 'notifications', title: 'Then', slot: 'then' },
     ];
 
-    sections.forEach(sec => {
+    const matches = (block) => !searching
+        || String(block.label || '').toLowerCase().includes(query)
+        || String(block.description || '').toLowerCase().includes(query)
+        || String(block.type || '').toLowerCase().includes(query);
+
+    const renderBlock = (block, slot) => {
+        const icon = _autoIcons[block.type] || '\u2699\uFE0F';
+        const disabled = !block.available;
+        const helpKey = 'auto-' + block.type;
+        const hasHelp = !!TOOL_HELP_CONTENT[helpKey];
+        return `<div class="block-item${disabled ? ' coming-soon' : ''}" ${!disabled ? `draggable="true" ondragstart="_autoDragStart(event,'${block.type}','${slot}')" onclick="_autoClickBlock('${block.type}','${slot}')"` : ''}>
+            <div class="block-item-icon">${icon}</div>
+            <div class="block-item-text">
+                <div class="block-item-label">${_esc(block.label)}</div>
+                <div class="block-item-desc">${_esc(block.description)}</div>
+            </div>
+            ${disabled ? '<span class="coming-soon-badge">Soon</span>' : ''}
+            ${hasHelp ? `<button class="tool-help-button block-help-btn" onclick="event.stopPropagation(); openToolHelpModal('${helpKey}')" title="Learn more">?</button>` : ''}
+        </div>`;
+    };
+
+    let html = `<div class="block-search-wrap">
+        <input type="search" id="block-search" class="block-search" placeholder="Search blocks\u2026"
+               value="${_escAttr(_autoBlockQuery)}" oninput="_autoBlockSearch(this.value)"
+               aria-label="Search automation blocks">
+    </div>`;
+
+    let total = 0;
+    sections.forEach(function (sec) {
+        const blocks = (_autoBlocks[sec.key] || []).filter(matches);
+        total += blocks.length;
+        if (!blocks.length) return;
+
         html += `<div class="sidebar-section"><div class="sidebar-section-title">${sec.title}</div>`;
-        (_autoBlocks[sec.key] || []).forEach(block => {
-            const icon = _autoIcons[block.type] || '\u2699\uFE0F';
-            const disabled = !block.available;
-            const helpKey = 'auto-' + block.type;
-            const hasHelp = !!TOOL_HELP_CONTENT[helpKey];
-            html += `<div class="block-item${disabled ? ' coming-soon' : ''}" ${!disabled ? `draggable="true" ondragstart="_autoDragStart(event,'${block.type}','${sec.slot}')" onclick="_autoClickBlock('${block.type}','${sec.slot}')"` : ''}>
-                <div class="block-item-icon">${icon}</div>
-                <div class="block-item-text">
-                    <div class="block-item-label">${_esc(block.label)}</div>
-                    <div class="block-item-desc">${_esc(block.description)}</div>
-                </div>
-                ${disabled ? '<span class="coming-soon-badge">Soon</span>' : ''}
-                ${hasHelp ? `<button class="tool-help-button block-help-btn" onclick="event.stopPropagation(); openToolHelpModal('${helpKey}')" title="Learn more">?</button>` : ''}
-            </div>`;
-        });
+
+        if (searching) {
+            // A search is a request for a specific block; drawers would just
+            // be one more click between the query and the answer.
+            html += blocks.map(function (b) { return renderBlock(b, sec.slot); }).join('');
+        } else {
+            const byCategory = {};
+            blocks.forEach(function (b) {
+                const cat = b.category || 'Other';
+                (byCategory[cat] = byCategory[cat] || []).push(b);
+            });
+            const cats = Object.keys(byCategory).sort(function (a, b) {
+                const ia = order.indexOf(a), ib = order.indexOf(b);
+                return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib) || a.localeCompare(b);
+            });
+            cats.forEach(function (cat) {
+                const key = sec.key + '-' + cat.replace(/\W+/g, '_');
+                html += `<div class="block-drawer" data-drawer="${key}">
+                    <button type="button" class="block-drawer-head" onclick="_autoToggleBlockDrawer('${key}')">
+                        <span class="block-drawer-chevron">\u25BC</span>
+                        <span class="block-drawer-name">${_esc(cat)}</span>
+                        <span class="block-drawer-count">${byCategory[cat].length}</span>
+                    </button>
+                    <div class="block-drawer-body">${byCategory[cat].map(function (b) { return renderBlock(b, sec.slot); }).join('')}</div>
+                </div>`;
+            });
+        }
         html += '</div>';
     });
+
+    if (searching && total === 0) {
+        html += '<div class="block-search-empty">No blocks match \u201C' + _esc(_autoBlockQuery) + '\u201D</div>';
+    }
+
     sidebar.innerHTML = html;
+
+    // innerHTML replaces the input, so typing would lose focus after the
+    // first character without this.
+    if (opts && opts.keepFocus) {
+        const input = document.getElementById('block-search');
+        if (input) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+    }
 }
 
 // --- Canvas ---
@@ -4948,7 +4640,7 @@ function _renderPlacedBlock(slotKey, data) {
             <select id="cfg-${slotKey}-condop">${opts}</select>
             <input type="text" id="cfg-${slotKey}-condvalue" value="${_escAttr(cond.value || '')}" placeholder="error" style="width:110px;">
         </div></div>`;
-        if (['discord_webhook', 'pushbullet', 'telegram', 'webhook'].includes(data.type)) {
+        if (['discord_webhook', 'pushbullet', 'telegram', 'ntfy', 'gotify', 'webhook'].includes(data.type)) {
             thenExtraHtml += `<div class="placed-block-config"><div class="config-row">
                 <button type="button" class="btn btn--sm btn--secondary" onclick="_autoTestNotify('${slotKey}')">Send test</button>
                 <span id="cfg-${slotKey}-test-result" style="font-size:11px;opacity:0.6;"></span>
@@ -5116,11 +4808,15 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         </div>`;
     }
     if (blockType === 'sync_playlist') {
+        const allChecked = config.all ? ' checked' : '';
         return `<div class="config-row">
             <label>Playlist</label>
             <select id="cfg-${slotKey}-playlist_id" class="mirrored-playlist-select" data-value="${_escAttr(config.playlist_id || '')}">
                 <option value="">Loading...</option>
             </select>
+        </div>
+        <div class="config-row">
+            <label><input type="checkbox" id="cfg-${slotKey}-all"${allChecked} onchange="_autoTogglePlaylistSelect('${slotKey}')"> Sync all mirrored playlists</label>
         </div>`;
     }
     if (blockType === 'discover_playlist') {
@@ -5132,7 +4828,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
             </select>
         </div>
         <div class="config-row">
-            <label><input type="checkbox" id="cfg-${slotKey}-all"${allChecked} onchange="_autoTogglePlaylistSelect('${slotKey}')"> Discover all mirrored playlists</label>
+            <label><input type="checkbox" id="cfg-${slotKey}-all"${allChecked} onchange="_autoTogglePlaylistSelect('${slotKey}')"> Identify all mirrored playlists</label>
         </div>`;
     }
     if (blockType === 'playlist_pipeline') {
@@ -5150,6 +4846,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         <div class="config-row">
             <label><input type="checkbox" id="cfg-${slotKey}-skip_wishlist"${skipWishlistChecked}> Skip wishlist processing</label>
         </div>
+        ${_autoSyncModeRowHtml(slotKey, config.sync_mode, blockType)}
         <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">Runs 4 phases: Refresh → Discover → Sync → Download Missing</div>`;
     }
     if (blockType === 'personalized_pipeline') {
@@ -5177,6 +4874,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         <div class="config-row">
             <label><input type="checkbox" id="cfg-${slotKey}-skip_wishlist"${skipWishlistChecked}> Skip wishlist processing</label>
         </div>
+        ${_autoSyncModeRowHtml(slotKey, config.sync_mode, blockType)}
         <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">Runs 2 phases: Snapshot → Sync → Download Missing</div>`;
     }
     // Shared variable tags builder for notification types
@@ -5241,6 +4939,77 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         </div>
         ${_notifyVarHtml(slotKey)}`;
     }
+    if (blockType === 'ntfy') {
+        // Server defaults to ntfy.sh but most people self-host, so it is the
+        // first field rather than a hidden assumption. Auth is optional: a
+        // private topic on your own box usually has none.
+        return `<div class="config-row">
+            <label>Server</label>
+            <input type="text" id="cfg-${slotKey}-server" value="${_escAttr(config.server || '')}" placeholder="https://ntfy.sh (or your own server)">
+        </div>
+        <div class="config-row">
+            <label>Topic</label>
+            <input type="text" id="cfg-${slotKey}-topic" value="${_escAttr(config.topic || '')}" placeholder="soulsync">
+        </div>
+        <div class="config-row">
+            <label>Title</label>
+            <input type="text" id="cfg-${slotKey}-title" value="${_escAttr(config.title || '{name}')}" placeholder="Notification title">
+        </div>
+        <div class="config-row">
+            <label>Message</label>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || 'Completed with status: {status}'}</textarea>
+        </div>
+        <div class="config-row">
+            <label>Priority</label>
+            <select id="cfg-${slotKey}-priority">
+                ${[['1','Min'],['2','Low'],['3','Default'],['4','High'],['5','Urgent']].map(function (o) {
+                    return '<option value="' + o[0] + '"' + (String(config.priority || '3') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
+                }).join('')}
+            </select>
+        </div>
+        <div class="config-row">
+            <label>Tags</label>
+            <input type="text" id="cfg-${slotKey}-tags" value="${_escAttr(config.tags || '')}" placeholder="Comma separated, e.g. white_check_mark,cd">
+        </div>
+        <div class="config-row">
+            <label>Access Token</label>
+            <input type="text" id="cfg-${slotKey}-token" value="${_escAttr(config.token || '')}" placeholder="tk_... (optional, wins over username/password)">
+        </div>
+        <div class="config-row">
+            <label>Username</label>
+            <input type="text" id="cfg-${slotKey}-username" value="${_escAttr(config.username || '')}" placeholder="Optional, for basic auth">
+        </div>
+        <div class="config-row">
+            <label>Password</label>
+            <input type="password" id="cfg-${slotKey}-password" value="${_escAttr(config.password || '')}" placeholder="Optional">
+        </div>
+        ${_notifyVarHtml(slotKey)}`;
+    }
+    if (blockType === 'gotify') {
+        // Gotify's priority runs 0-10, NOT ntfy's 1-5. The two look alike and
+        // are not, so they get their own control rather than a shared one.
+        return `<div class="config-row">
+            <label>Server URL</label>
+            <input type="text" id="cfg-${slotKey}-server" value="${_escAttr(config.server || '')}" placeholder="http://your-nas:8080">
+        </div>
+        <div class="config-row">
+            <label>Application Token</label>
+            <input type="text" id="cfg-${slotKey}-token" value="${_escAttr(config.token || '')}" placeholder="An APP token, not a client token">
+        </div>
+        <div class="config-row">
+            <label>Title</label>
+            <input type="text" id="cfg-${slotKey}-title" value="${_escAttr(config.title || '{name}')}" placeholder="Notification title">
+        </div>
+        <div class="config-row">
+            <label>Message</label>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || 'Completed with status: {status}'}</textarea>
+        </div>
+        <div class="config-row">
+            <label>Priority (0-10)</label>
+            <input type="number" min="0" max="10" id="cfg-${slotKey}-priority" value="${_escAttr(String(config.priority === undefined ? 5 : config.priority))}">
+        </div>
+        ${_notifyVarHtml(slotKey)}`;
+    }
     if (blockType === 'webhook') {
         const url = _escAttr(config.url || '');
         const hdrs = (config.headers || '').replace(/"/g, '&quot;');
@@ -5280,6 +5049,20 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         }
     }
     return '';
+}
+
+// #1704: a pipeline's own sync mode, '' = the global Settings mode. the
+// options come from the block's config_fields (core/automation/blocks.py)
+function _autoSyncModeRowHtml(slotKey, value, blockType) {
+    const def = _findBlockDef(blockType);
+    const field = ((def && def.config_fields) || []).find(f => f.key === 'sync_mode');
+    if (!field || !Array.isArray(field.options)) return '';
+    const opts = field.options.map(o => `<option value="${_escAttr(o.value)}"${(value || '') === o.value ? ' selected' : ''}>${_escAttr(o.label)}</option>`).join('');
+    return `<div class="config-row">
+            <label>Sync mode</label>
+            <select id="cfg-${slotKey}-sync_mode">${opts}</select>
+        </div>${blockType === 'playlist_pipeline' ? `
+        <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">A playlist with its own sync mode (set in its ⋯ menu) keeps it</div>` : ''}`;
 }
 
 // One generic config row from a block's config_fields definition.
@@ -5611,7 +5394,11 @@ function _readPlacedConfig(slotKey) {
         };
     }
     if (type === 'sync_playlist') {
-        return { playlist_id: document.getElementById('cfg-' + slotKey + '-playlist_id')?.value || '' };
+        const allCb = document.getElementById('cfg-' + slotKey + '-all');
+        return {
+            playlist_id: document.getElementById('cfg-' + slotKey + '-playlist_id')?.value || '',
+            all: allCb ? allCb.checked : false,
+        };
     }
     if (type === 'discover_playlist') {
         const allCb = document.getElementById('cfg-' + slotKey + '-all');
@@ -5627,6 +5414,7 @@ function _readPlacedConfig(slotKey) {
             playlist_id: document.getElementById('cfg-' + slotKey + '-playlist_id')?.value || '',
             all: allCb ? allCb.checked : false,
             skip_wishlist: skipWl ? skipWl.checked : false,
+            sync_mode: document.getElementById('cfg-' + slotKey + '-sync_mode')?.value || '',
         };
     }
     if (type === 'personalized_pipeline') {
@@ -5647,6 +5435,7 @@ function _readPlacedConfig(slotKey) {
             kinds,
             refresh_first: refreshFirstCb ? refreshFirstCb.checked : false,
             skip_wishlist: skipWl ? skipWl.checked : false,
+            sync_mode: document.getElementById('cfg-' + slotKey + '-sync_mode')?.value || '',
         };
     }
     if (type === 'signal_received' || type === 'fire_signal') {
@@ -5677,6 +5466,31 @@ function _readPlacedConfig(slotKey) {
             chat_id: document.getElementById('cfg-' + slotKey + '-chat_id')?.value?.trim() || '',
             thread_id: document.getElementById('cfg-' + slotKey + '-thread_id')?.value?.trim() || '',
             message: document.getElementById('cfg-' + slotKey + '-message')?.value || '',
+        };
+    }
+    if (type === 'ntfy') {
+        const _v = (f) => document.getElementById('cfg-' + slotKey + '-' + f)?.value?.trim() || '';
+        return {
+            server: _v('server'),
+            topic: _v('topic'),
+            title: document.getElementById('cfg-' + slotKey + '-title')?.value || '',
+            message: document.getElementById('cfg-' + slotKey + '-message')?.value || '',
+            priority: _v('priority'),
+            tags: _v('tags'),
+            token: _v('token'),
+            username: _v('username'),
+            // NOT trimmed: a password may legitimately start or end with a space
+            password: document.getElementById('cfg-' + slotKey + '-password')?.value || '',
+        };
+    }
+    if (type === 'gotify') {
+        const _v = (f) => document.getElementById('cfg-' + slotKey + '-' + f)?.value?.trim() || '';
+        return {
+            server: _v('server'),
+            token: _v('token'),
+            title: document.getElementById('cfg-' + slotKey + '-title')?.value || '',
+            message: document.getElementById('cfg-' + slotKey + '-message')?.value || '',
+            priority: _v('priority'),
         };
     }
     if (type === 'webhook') {
@@ -5889,7 +5703,11 @@ async function playArtistRadio() {
 }
 
 // Parameterized core of the artist-detail Radio button — also driven by the Artist Web graph panel
-// ("Play radio" on an owned node), so both entry points share one implementation.
+// ("Play radio" on an owned node) and the discover Stations row, so every entry point shares one
+// implementation.
+//
+// RETURNS true only when playback actually started. it used to return undefined either way, so a
+// caller could not tell "playing" from "there was nothing to play" and reported success for both.
 async function startArtistRadioById(artistId, artistName) {
     try {
         // Get tracks from this artist's library
@@ -5910,7 +5728,7 @@ async function startArtistRadioById(artistId, artistName) {
 
         if (!allTracks.length) {
             showToast('No playable tracks found for this artist', 'error');
-            return;
+            return false;
         }
 
         // Pick a random track
@@ -5951,8 +5769,10 @@ async function startArtistRadioById(artistId, artistName) {
         }
 
         showToast(`Playing ${artistName} radio — similar tracks will auto-queue`, 'success');
+        return true;
     } catch (e) {
         showToast(`Failed to start artist radio: ${e.message}`, 'error');
+        return false;
     }
 }
 

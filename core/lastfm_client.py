@@ -3,6 +3,7 @@ import time
 import threading
 from typing import Dict, Optional, Any, List
 from functools import wraps
+from core.http_error_status import http_error_status
 from utils.logging_config import get_logger
 
 logger = get_logger("lastfm_client")
@@ -36,7 +37,12 @@ def rate_limited(func):
             result = func(*args, **kwargs)
             return result
         except Exception as e:
-            if "rate limit" in str(e).lower() or "429" in str(e):
+            # Read the structured HTTP status first: the message can contain a
+            # URL whose entity ID holds "429", which is not a rate limit.
+            status = http_error_status(e)
+            is_rate_limit = (status == 429 if status is not None
+                             else "rate limit" in str(e).lower() or "429" in str(e))
+            if is_rate_limit:
                 logger.warning(f"Last.fm rate limit hit, implementing backoff: {e}")
                 time.sleep(5.0)
             raise e
@@ -141,8 +147,13 @@ class LastFMClient:
             ts = t.get('timestamp')
             if isinstance(ts, str):
                 try:
-                    from datetime import datetime
+                    from datetime import datetime, timezone
                     dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        # listening_history stores UTC; a naive stamp is UTC,
+                        # never system-local (else every scrobble outside UTC
+                        # ships shifted by the local offset).
+                        dt = dt.replace(tzinfo=timezone.utc)
                     ts = int(dt.timestamp())
                 except Exception:
                     continue
@@ -274,6 +285,37 @@ class LastFMClient:
         except Exception as e:
             logger.error(f"Error getting Last.fm username: {e}")
             return None
+
+    @rate_limited
+    def get_user_recent_tracks(
+        self,
+        username: str,
+        page: int = 1,
+        limit: int = 200,
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        extended: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch one page of a user's Last.fm scrobbles.
+
+        ``user.getRecentTracks`` is public for public profiles and pages up to
+        200 rows. The importer owns pagination/resume; the client only exposes
+        the raw page plus Last.fm's ``@attr`` counts.
+        """
+        if not username:
+            return None
+        params: Dict[str, Any] = {
+            'user': username,
+            'page': str(max(1, int(page or 1))),
+            'limit': str(min(200, max(1, int(limit or 200)))),
+        }
+        if from_ts is not None:
+            params['from'] = str(int(from_ts))
+        if to_ts is not None:
+            params['to'] = str(int(to_ts))
+        if extended:
+            params['extended'] = '1'
+        return self._make_request('user.getRecentTracks', params, timeout=20, raise_on_transient=True)
 
     @rate_limited
     def get_user_top_artists(self, username: str, period: str = 'overall', limit: int = 200) -> list:

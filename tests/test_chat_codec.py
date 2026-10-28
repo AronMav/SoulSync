@@ -84,7 +84,7 @@ class TestApiIntegration:
         client = _FakeChatClient()
         state = {"client": client}
         chat_api.configure(client_getter=lambda: state["client"],
-                           run_async=lambda v: v,
+                           run_async=lambda v, timeout=None: v,
                            config_get=lambda k, d=None: d)
         app = Flask(__name__)
 
@@ -113,6 +113,21 @@ class TestApiIntegration:
         assert msgs[0]["message"] == "*rich* message" and msgs[0]["rich"] is True
         assert msgs[1]["message"] == "plain from nicotine+" and "rich" not in msgs[1]
 
+    def test_room_send_carries_the_edit_tag_and_read_returns_it(self):
+        http, client = self._app()
+        key = "me|2026-08-11T02:59:00Z|typo'd words"
+        assert http.post("/api/chat/room/message",
+                         json={"message": "fixed words",
+                               "edit": key}).status_code == 200
+        room, wire = client.sent_room[0]
+        assert decode(wire)["ed"] == key
+        client.get_room_messages = lambda room: [
+            {"username": "me", "message": wire, "timestamp": "3"},
+        ]
+        msgs = http.get("/api/chat/room").get_json()["messages"]
+        assert msgs[0]["message"] == "fixed words"
+        assert msgs[0]["ed"] == key
+
     def test_pms_are_never_enveloped(self):
         http, client = self._app()
         assert http.post("/api/chat/conversations/pal",
@@ -127,3 +142,124 @@ def test_autoprove_replies_stay_plaintext():
     src = (Path(__file__).resolve().parent.parent / "core" / "chat_autoprove.py").read_text(
         encoding="utf-8", errors="replace")
     assert "chat_codec" not in src and "encode(" not in src
+
+
+class TestEditTag:
+    """Message edits: 'ed' names the sender's own earlier message by key
+    (user|timestamp|text — the thread-key format); the envelope's own text is
+    the replacement. Soulseek cannot unsend, so both messages stay real —
+    the client fold does the replacing and keeps the history."""
+
+    def test_round_trips_through_the_envelope(self):
+        from core.chat_codec import edit_of
+        wire = encode("the corrected words", {"ed": "boulder|2026-08-11T01:00:00Z|typo'd words"})
+        dec = decode(wire)
+        assert dec["t"] == "the corrected words"
+        assert edit_of(dec) == "boulder|2026-08-11T01:00:00Z|typo'd words"
+
+    def test_rejects_junk_shapes(self):
+        from core.chat_codec import edit_of
+        assert edit_of({"ed": ""}) is None
+        assert edit_of({"ed": "no-separator"}) is None      # not a message key
+        assert edit_of({"ed": 42}) is None
+        assert edit_of({}) is None
+        assert edit_of(None) is None
+
+    def test_bounds_the_key(self):
+        from core.chat_codec import edit_of
+        long_key = "user|" + "x" * 500
+        assert len(edit_of({"ed": long_key})) == 160
+
+
+class TestNowPlayingAndWantedCards:
+    def test_np_round_trip(self):
+        from core.chat_codec import np_of
+        wire = encode("Now Playing text", {
+            "np": {
+                "t": "One More Time",
+                "a": "Daft Punk",
+                "al": "Discovery",
+                "src": "spotify",
+                "id": "trk-123",
+                "img": "https://i.scdn.co/image/ab67616d0000b273",
+                "dur": 320000,
+                "br": 320,
+            }
+        })
+        dec = decode(wire)
+        assert dec["t"] == "Now Playing text"
+        meta = np_of(dec)
+        assert meta["t"] == "One More Time"
+        assert meta["a"] == "Daft Punk"
+        assert meta["al"] == "Discovery"
+        assert meta["src"] == "spotify"
+        assert meta["id"] == "trk-123"
+        assert meta["img"].startswith("https://")
+        assert meta["dur"] == 320000
+        assert meta["br"] == 320
+
+    def test_np_rejects_missing_required(self):
+        from core.chat_codec import np_of
+        assert np_of({"np": {"t": "Track Only"}}) is None
+        assert np_of({"np": {"a": "Artist Only"}}) is None
+        assert np_of({"np": {}}) is None
+        assert np_of(None) is None
+
+    def test_want_round_trip(self):
+        from core.chat_codec import want_of
+        wire = encode("ISO text", {
+            "want": {
+                "t": "Selected Ambient Works 85-92",
+                "a": "Aphex Twin",
+                "ty": "album",
+                "src": "spotify",
+                "id": "alb-456",
+                "img": "https://i.scdn.co/image/ab67616d0000b273",
+                "y": "1992",
+            }
+        })
+        dec = decode(wire)
+        assert dec["t"] == "ISO text"
+        meta = want_of(dec)
+        assert meta["t"] == "Selected Ambient Works 85-92"
+        assert meta["a"] == "Aphex Twin"
+        assert meta["ty"] == "album"
+        assert meta["y"] == "1992"
+        assert meta["img"].startswith("https://")
+
+    def test_want_rejects_missing_required(self):
+        from core.chat_codec import want_of
+        assert want_of({"want": {"t": "Album Only"}}) is None
+        assert want_of({"want": {}}) is None
+        assert want_of(None) is None
+
+    def test_want_rich_wishlist_metadata(self):
+        from core.chat_codec import want_of
+        wire = encode("ISO text", {
+            "want": {
+                "t": "Selected Ambient Works 85-92",
+                "a": "Aphex Twin",
+                "ty": "album",
+                "src": "spotify",
+                "id": "alb-456",
+                "img": "https://i.scdn.co/image/ab67616d0000b273",
+                "ar_id": "art-123",
+                "ar_img": "https://i.scdn.co/image/artist-photo",
+                "al_id": "alb-456",
+                "y": "1992",
+                "tot": 13,
+                "tn": 1,
+                "disc": 1,
+                "dur": 268000,
+            }
+        })
+        meta = want_of(decode(wire))
+        assert meta["ar_id"] == "art-123"
+        assert meta["ar_img"] == "https://i.scdn.co/image/artist-photo"
+        assert meta["al_id"] == "alb-456"
+        assert meta["tot"] == 13
+        assert meta["tn"] == 1
+        assert meta["disc"] == 1
+        assert meta["dur"] == 268000
+
+

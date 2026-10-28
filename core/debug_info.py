@@ -13,7 +13,7 @@ from pathlib import Path
 
 from flask import jsonify, request
 
-from config.settings import config_manager
+from core.settings import config_manager
 from core.metadata.registry import (
     get_spotify_client,
     get_primary_source,
@@ -227,12 +227,12 @@ def get_debug_info():
     # connection state). Listed so the debug dump reflects the full
     # metadata surface SoulSync queries from, not just the auth-gated ones.
     info['services']['always_available_metadata_sources'] = [
-        'deezer', 'yandex', 'itunes', 'musicbrainz',
+        'deezer', 'itunes', 'musicbrainz',
     ]
 
     # Enrichment workers
     workers = {}
-    worker_names = ['musicbrainz', 'audiodb', 'deezer', 'yandex', 'jiosaavn', 'bandcamp', 'spotify', 'itunes', 'lastfm', 'genius', 'discogs', 'tidal', 'qobuz']
+    worker_names = ['musicbrainz', 'audiodb', 'deezer', 'jiosaavn', 'bandcamp', 'spotify', 'itunes', 'lastfm', 'genius', 'discogs', 'tidal', 'qobuz']
     for name in worker_names:
         paused_key = f'{name}_enrichment_paused'
         workers[name] = 'paused' if config_manager.get(paused_key, False) else 'active'
@@ -308,10 +308,10 @@ def get_debug_info():
         'm3u_export_enabled': config_manager.get('m3u.enabled', False),
         'log_level': config_manager.get('logging.level', 'INFO'),
         'primary_metadata_source': config_manager.get('metadata.fallback_source', 'deezer'),
-        'lossy_copy_enabled': config_manager.get('post_processing.lossy_copy.enabled', False),
-        'lossy_copy_format': config_manager.get('post_processing.lossy_copy.format', 'mp3'),
-        'lossy_copy_bitrate': config_manager.get('post_processing.lossy_copy.bitrate', 320),
-        'allow_duplicate_tracks': config_manager.get('library.allow_duplicate_tracks', False),
+        'lossy_copy_enabled': config_manager.get('lossy_copy.enabled', False),
+        'lossy_copy_format': config_manager.get('lossy_copy.codec', 'mp3'),
+        'lossy_copy_bitrate': config_manager.get('lossy_copy.bitrate', '320'),
+        'allow_duplicate_tracks': config_manager.get('wishlist.allow_duplicate_tracks', True),
         'replace_lower_quality': config_manager.get('import.replace_lower_quality', False),
         'auto_import_enabled': config_manager.get('import.auto_import_enabled', False),
     }

@@ -634,7 +634,7 @@ def test_tmdb_extras_parse(monkeypatch):
 def _no_server_config(monkeypatch):
     """Stub the shared config_manager so no media-server watch link is added
     (keeps these tests independent of the dev machine's Plex/Jellyfin config)."""
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_plex_config(self): return {}
         def get_jellyfin_config(self): return {}
@@ -758,7 +758,7 @@ def test_tvdb_episode_gap_fill(db):
 
 def test_item_extras_caches_tmdb_call(db, monkeypatch):
     mid = db.upsert_movie("plex", {"server_id": "m1", "title": "A", "tmdb_id": 603})
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_plex_config(self): return {}
         def get_jellyfin_config(self): return {}
@@ -799,7 +799,7 @@ def test_item_extras_needs_tmdb_and_id(db, monkeypatch):
 
 def test_item_extras_adds_jellyfin_watch_link(db, monkeypatch):
     mid = db.upsert_movie("jellyfin", {"server_id": "abc123", "title": "Owned"})
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_jellyfin_config(self): return {"base_url": "http://jelly:8096/"}
         def get_plex_config(self): return {}
@@ -811,7 +811,7 @@ def test_item_extras_adds_jellyfin_watch_link(db, monkeypatch):
 
 def test_item_extras_adds_plex_watch_link(db, monkeypatch):
     mid = db.upsert_movie("plex", {"server_id": "555", "title": "Owned"})
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_plex_config(self): return {"base_url": "http://plex:32400", "token": "T"}
         def get_jellyfin_config(self): return {}
@@ -828,7 +828,7 @@ def test_item_extras_adds_plex_watch_link(db, monkeypatch):
 
 def test_item_extras_no_server_link_when_unowned(db, monkeypatch):
     # A wishlist-style row with no server id → no watch link.
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_plex_config(self): return {"base_url": "http://plex:32400", "token": "T"}
         def get_jellyfin_config(self): return {}
@@ -1460,6 +1460,7 @@ def test_rematch_tmdb_resets_the_derived_pipeline(db):
             "UPDATE shows SET tmdb_match_status='matched', details_synced=1, episodes_synced=1, "
             "ratings_synced=1, status='Ended', overview='wrong show', tagline='nope', "
             "trakt_status='ok', trakt_rating=7.5, poster_url='https://art/keep.jpg', "
+            "backdrop_url='https://art/wrong-bg.jpg', logo_url='https://art/wrong-logo.png', "
             "locked_fields='[\"overview\"]' WHERE id=?", (sid,))
         conn.execute("INSERT INTO people (name) VALUES ('Wrong Actor')")
         pid = conn.execute("SELECT id FROM people").fetchone()[0]
@@ -1473,10 +1474,25 @@ def test_rematch_tmdb_resets_the_derived_pipeline(db):
     assert row["tmdb_match_status"] is None               # worker re-picks, enriches BY the new id
     assert row["status"] is None and row["tagline"] is None    # old match's text cleared
     assert row["overview"] == "wrong show"                # locked field stays the user's
-    assert row["poster_url"] == "https://art/keep.jpg"    # art is never cleared
+    assert row["poster_url"] is None                    # wrong title's art cleared…
+    assert row["backdrop_url"] is None                   # …so workers re-download
+    assert row["logo_url"] is None                       # …for the new id
     assert (row["details_synced"], row["episodes_synced"], row["ratings_synced"]) == (0, 0, 0)
     assert row["trakt_status"] is None and row["trakt_rating"] is None
     assert credits == 0                                   # wrong title's credits dropped
+
+
+def test_rematch_tmdb_keeps_locked_poster(db):
+    mid = db.upsert_movie("plex", {"server_id": "m1", "title": "M", "tmdb_id": 9})
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE movies SET tmdb_match_status='matched', poster_url='https://art/mine.jpg', "
+            "backdrop_url='https://art/wrong-bg.jpg', locked_fields='[\"poster_url\"]' WHERE id=?", (mid,))
+    assert db.rematch_item("movie", mid, "tmdb", 42) is True
+    with db.connect() as conn:
+        row = conn.execute("SELECT poster_url, backdrop_url FROM movies WHERE id=?", (mid,)).fetchone()
+    assert row["poster_url"] == "https://art/mine.jpg"   # user's explicit choice kept
+    assert row["backdrop_url"] is None                    # wrong title's art cleared
 
 
 def test_rematch_clear_reverts_to_not_found(db):

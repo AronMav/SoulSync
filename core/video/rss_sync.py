@@ -37,6 +37,11 @@ _lock = threading.Lock()
 _FETCH_LIMIT = 200
 
 
+def _with_scene_numbering(items, db):
+    from core.video.numbering import annotate
+    return annotate(items, db=db)
+
+
 def is_running() -> bool:
     return _running
 
@@ -55,7 +60,8 @@ def fetch_recent_releases(limit: int = _FETCH_LIMIT) -> Optional[List[Dict[str, 
         return []
     hits: Dict[str, Dict[str, Any]] = {}
     for r in results:
-        url = getattr(r, "magnet_uri", None) or getattr(r, "download_url", None)
+        # .torrent URL first, magnet second — see _project (#1139).
+        url = getattr(r, "download_url", None) or getattr(r, "magnet_uri", None)
         if not url:
             continue
         proto = str(getattr(r, "protocol", "") or "torrent")
@@ -64,6 +70,69 @@ def fetch_recent_releases(limit: int = _FETCH_LIMIT) -> Optional[List[Dict[str, 
             continue
         hits[keyv] = _project(r, url, proto)
     return list(hits.values())
+
+
+def fetch_extto_releases() -> List[Dict[str, Any]]:
+    """The cached EXT.to Fresh Releases board, projected into the shared hit shape.
+
+    Reads the SNAPSHOT the hourly ``video_extto_fresh_refresh`` automation already
+    keeps - no scraping on the RSS tick. EXT.to sits behind Cloudflare and its
+    board refresh is deliberately hourly to keep that cheap; polling it every few
+    minutes would be a different and much worse bargain.
+
+    The rows already carry their magnet, scraped straight off the homepage, so a
+    match needs no second fetch. Grabbing one is a solved path too: the grab
+    endpoint takes source='extto', files the row as 'torrent' and keeps the
+    identity in the username, exactly as it does for a manual pick off the board.
+
+    This is a COVERAGE lane, not a speed one. The board is ~57 popular releases
+    refreshed hourly, so it will not beat Prowlarr's RSS to anything - what it
+    adds is releases the user's own indexers do not carry. Returns [] when the
+    board is empty or EXT.to isn't set up.
+    """
+    try:
+        from api.video import get_video_db
+        from core.video.extto_board import _rows_of, load_board
+        from core.video.extto_search import _size_bytes
+    except Exception:   # noqa: BLE001 - an optional lane never breaks the tick
+        return []
+    try:
+        rows = _rows_of((load_board(get_video_db()) or {}).get("sections") or {})
+    except Exception:   # noqa: BLE001
+        logger.warning("rss: EXT.to board could not be read", exc_info=True)
+        return []
+
+    hits: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        magnet = row.get("magnet_uri") or row.get("download_url") or row.get("magnet")
+        title = (row.get("title") or "").strip()
+        if not magnet or not title:
+            continue      # nothing to grab, or nothing to match on
+        size = row.get("size_bytes")
+        if not size:
+            try:
+                size = _size_bytes(row.get("size_text"))
+            except Exception:   # noqa: BLE001
+                size = 0
+        seeders = row.get("seeders")
+        hits.append({
+            "title": title,
+            "size_bytes": int(size or 0),
+            "seeders": seeders,
+            "peers": row.get("leechers"),
+            "username": "EXT.to",
+            "availability": seeders if seeders is not None else 0,
+            "filename": title,
+            "files": [], "file_count": 0, "folder_size_bytes": int(size or 0),
+            "download_url": magnet,
+            "magnet_uri": magnet,
+            "protocol": "torrent",
+            "indexer_id": None,
+            "guid": row.get("url") or magnet,
+        })
+    return hits
 
 
 # Words too common to distinguish a title — a release containing only these is
@@ -107,7 +176,8 @@ def _prescreen(hits: List[Dict[str, Any]], titles: List[str]) -> List[Dict[str, 
     return out
 
 
-def rss_pass(*, fetch: Optional[Callable[[], Optional[List[Dict[str, Any]]]]] = None,
+def rss_pass(*, extto: Any = None,
+             fetch: Optional[Callable[[], Optional[List[Dict[str, Any]]]]] = None,
              log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """One RSS tick: recent releases vs the eligible wishlist. Returns
     {status, grabbed, matched_items, releases, skipped?}."""
@@ -117,18 +187,30 @@ def rss_pass(*, fetch: Optional[Callable[[], Optional[List[Dict[str, Any]]]]] = 
             return {"status": "skipped", "reason": "already_running"}
         _running = True
     try:
-        return _rss_pass_inner(fetch=fetch, log=log or (lambda m: None))
+        return _rss_pass_inner(fetch=fetch, extto=extto, log=log or (lambda m: None))
     finally:
         with _lock:
             _running = False
 
 
-def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
+def _rss_pass_inner(*, fetch, log, extto=None) -> Dict[str, Any]:
     from api.video import get_video_db
     from core.automation.handlers import video_process_wishlist as vpw
 
     hits = (fetch or fetch_recent_releases)()
-    if hits is None:
+    prowlarr_off = hits is None
+    hits = list(hits or [])
+    # The EXT.to board rides along on the same pass. It costs nothing here (the
+    # snapshot is already refreshed on its own hourly schedule) and it covers
+    # releases the user's indexers may not carry. Deduped by guid so a release
+    # Prowlarr also returned isn't matched twice.
+    if extto is not False:
+        seen = {h.get("guid") for h in hits if h.get("guid")}
+        for h in ((extto if callable(extto) else fetch_extto_releases)() or []):
+            if h.get("guid") and h["guid"] in seen:
+                continue
+            hits.append(h)
+    if prowlarr_off and not hits:
         return {"status": "skipped", "reason": "prowlarr_not_configured",
                 "grabbed": 0, "releases": 0}
     if not hits:
@@ -154,8 +236,10 @@ def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
     except Exception:   # noqa: BLE001 - no profile → no cutoff
         cutoff = 0
 
-    for media_type, items in (("movie", db.movie_wishlist_to_download()),
-                              ("episode", db.episode_wishlist_to_download())):
+    # due_only=False: matching an incoming feed against the wishlist spends no
+    # searches, so there is nothing to back off from.
+    for media_type, items in (("movie", db.movie_wishlist_to_download(due_only=False)),
+                              ("episode", _with_scene_numbering(db.episode_wishlist_to_download(due_only=False), db))):
         if any(it.get("owned") for it in items):
             per_item = vpw._cutoff_rank_for_item if any(
                 it.get("quality_profile_id") for it in items) else None
@@ -236,13 +320,15 @@ def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> 
     from api.video import get_video_db
     from api.video.downloads import _evaluate_hits
     from core.automation.handlers.video_process_wishlist import search_context
+    from core.video.numbering import ctx_alt
     from core.video.quality_profile import load_for_item
     ctx = search_context(item, media_type)
     cands = _evaluate_hits(pool, load_for_item(get_video_db(), item), ctx["scope"],
                            ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
                            want_title=ctx.get("titles") or ctx.get("title"),
-                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"))
+                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"),
+                           want_alt=ctx_alt(ctx))
     for c in cands:
         c["source"] = "usenet" if str(c.get("protocol") or "") == "usenet" else "torrent"
     # Full ranked list, not just accepted: rejected candidates ride along into

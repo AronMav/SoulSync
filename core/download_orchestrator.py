@@ -24,11 +24,13 @@ from typing import List, Optional, Tuple
 from pathlib import Path
 
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
 from core.download_engine import DownloadEngine
 from core.download_plugins.registry import DownloadPluginRegistry, build_default_registry
 from core.download_plugins.types import TrackResult, AlbumResult, DownloadStatus
 from core.quality.selection import load_search_mode
+from core.quality.source_map import quality_profile_context
+from core.downloads.track_hint import track_hint_context
 
 logger = get_logger("download_orchestrator")
 
@@ -309,7 +311,8 @@ class DownloadOrchestrator:
         return chain
 
     async def search(self, query: str, timeout: int = None, progress_callback=None,
-                     exclude_sources=None) -> Tuple[List[TrackResult], List[AlbumResult]]:
+                     exclude_sources=None, quality_profile_id=None, track_hint=None
+                     ) -> Tuple[List[TrackResult], List[AlbumResult]]:
         """Search for tracks using configured source(s). Single-source
         modes route directly; hybrid mode delegates to
         ``engine.search_with_fallback`` which tries the chain in order.
@@ -320,7 +323,16 @@ class DownloadOrchestrator:
         context batches — those sources are release-level and don't
         score meaningfully on per-track titles; the album-bundle flow
         on the master worker handles them separately when they're the
-        single active source."""
+        single active source.
+
+        ``track_hint`` (optional) is the song itself ({title, artist,
+        deezer_id}), for a source that can search better than a query
+        string (core/downloads/track_hint.py, #1582)."""
+        with track_hint_context(track_hint):
+            return await self._search(query, timeout, progress_callback,
+                                      exclude_sources, quality_profile_id)
+
+    async def _search(self, query, timeout, progress_callback, exclude_sources, quality_profile_id):
         if self.mode != 'hybrid':
             # Single-source mode is opt-in; honour the user's choice even
             # if it's torrent/usenet on an album batch (the master worker
@@ -332,7 +344,8 @@ class DownloadOrchestrator:
                 logger.error(f"{self.registry.display_name(self.mode)} client not available (failed to initialize)")
                 return [], []
             logger.info(f"Searching {self.registry.display_name(self.mode)}: {query}")
-            return await client.search(query, timeout, progress_callback)
+            with quality_profile_context(quality_profile_id):
+                return await client.search(query, timeout, progress_callback)
 
         chain = self._resolve_source_chain()
         if exclude_sources:
@@ -348,13 +361,20 @@ class DownloadOrchestrator:
         if not chain:
             logger.warning("Hybrid search exhausted: no eligible sources after exclusion filter")
             return [], []
-        if load_search_mode() == 'best_quality':
+        if load_search_mode(quality_profile_id) == 'best_quality':
             logger.info(f"Best-quality search ({' → '.join(chain)}): {query}")
-            return await self.engine.search_all_sources(
-                query, chain, timeout, progress_callback,
-            )
+            with quality_profile_context(quality_profile_id):
+                return await self.engine.search_all_sources(
+                    query, chain, timeout, progress_callback,
+                )
         logger.info(f"Hybrid search ({' → '.join(chain)}): {query}")
-        return await self.engine.search_with_fallback(query, chain, timeout, progress_callback)
+        with quality_profile_context(quality_profile_id):
+            return await self.engine.search_with_fallback(
+                query,
+                chain,
+                timeout,
+                progress_callback,
+            )
 
     async def search_and_download_best(self, query: str, expected_track=None) -> Optional[str]:
         """
@@ -381,11 +401,15 @@ class DownloadOrchestrator:
             logger.warning(f"No results found for: {query}")
             return None
 
-        # 2. Filter and validate results
-        _streaming_sources = ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon')
-        is_streaming = tracks[0].username in _streaming_sources if tracks else False
+        # 2. Filter and validate results. Score each source family with its
+        # own checker — a Soulseek peer first must not force Tidal/YouTube
+        # through the P2P path (and vice versa).
+        _streaming_sources = ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'lidarr', 'soundcloud', 'amazon', 'yandex')
+        streaming = [t for t in tracks if getattr(t, 'username', None) in _streaming_sources]
+        p2p = [t for t in tracks if getattr(t, 'username', None) not in _streaming_sources]
 
-        if is_streaming and expected_track:
+        stream_kept = []
+        if streaming and expected_track:
             # Score streaming results against expected track metadata
             from core.matching_engine import MusicMatchingEngine
             me = MusicMatchingEngine()
@@ -400,7 +424,7 @@ class DownloadOrchestrator:
             expected_is_version = any(kw in expected_title_lower for kw in _version_kw)
 
             scored = []
-            for r in tracks:
+            for r in streaming:
                 confidence, _ = me.score_track_match(
                     source_title=expected_title,
                     source_artists=expected_artists,
@@ -425,23 +449,55 @@ class DownloadOrchestrator:
                 scored.sort(key=lambda x: x._match_confidence, reverse=True)
                 # Match filter done (right track); now prefer the best quality
                 # among the confidence-passing survivors so streaming isn't
-                # quality-blind like Soulseek already isn't. Stable ranking
-                # keeps confidence order within an equal quality tier; the
-                # `or scored` fail-safe never leaves us with nothing to try.
-                from core.quality.selection import rank_for_profile
-                ranked, _ = rank_for_profile(scored)
-                filtered_results = ranked or scored
-                logger.info(f"Streaming validation: {len(scored)}/{len(tracks)} passed "
-                            f"(best: {scored[0]._match_confidence:.2f}, "
-                            f"quality pick: {filtered_results[0].audio_quality.label()})")
+                # quality-blind like Soulseek already isn't. An empty rank
+                # with fallback off means skip this source — do not download
+                # a rejected hit.
+                to_rank = scored
+                if any(getattr(r, 'username', None) == 'youtube' for r in scored):
+                    from core.youtube_client import youtube_quality_rank_band
+                    yt = [r for r in scored if getattr(r, 'username', None) == 'youtube']
+                    other = [r for r in scored if getattr(r, 'username', None) != 'youtube']
+                    yt_band = youtube_quality_rank_band(yt) if yt else []
+                    to_rank = other + yt_band
+                    youtube = self.client('youtube')
+                    if yt_band and youtube is not None and hasattr(youtube, 'refresh_claimed_quality'):
+                        try:
+                            probe_targets = None
+                            try:
+                                from core.quality.selection import load_profile_targets
+                                probe_targets, _ = load_profile_targets()
+                            except Exception:  # noqa: BLE001 - probe still works with search claims
+                                probe_targets = None
+                            youtube.refresh_claimed_quality(yt_band, targets=probe_targets)
+                        except Exception as e:  # noqa: BLE001 - ranking still uses the search claim
+                            logger.info("YouTube format probe skipped (%s: %s)", type(e).__name__, e)
+                stream_kept = to_rank
+                logger.info(f"Streaming validation: {len(scored)}/{len(streaming)} passed "
+                            f"(best: {scored[0]._match_confidence:.2f})")
             else:
                 logger.warning(f"No streaming results passed validation for: {query}")
-                return None
-        elif is_streaming:
-            filtered_results = tracks
-        else:
+        elif streaming:
+            stream_kept = list(streaming)
+
+        p2p_kept = []
+        if p2p:
             soulseek = self.client('soulseek')
-            filtered_results = soulseek.filter_results_by_quality_preference(tracks) if soulseek else tracks
+            p2p_kept = list(
+                soulseek.filter_results_by_quality_preference(p2p) if soulseek else p2p
+            )
+
+        combined = stream_kept + p2p_kept
+        if stream_kept:
+            from core.quality.selection import rank_for_profile
+            ranked, _ = rank_for_profile(combined)
+            if not ranked:
+                logger.warning(
+                    "No streaming results match the quality profile for: %s", query,
+                )
+                return None
+            filtered_results = ranked
+        else:
+            filtered_results = p2p_kept
 
         if not filtered_results:
             logger.warning(f"No suitable quality results found for: {query}")
@@ -459,7 +515,8 @@ class DownloadOrchestrator:
         # Use orchestrator's download method to route correctly
         return await self.download(best_result.username, best_result.filename, best_result.size)
 
-    async def download(self, username: str, filename: str, file_size: int = 0) -> Optional[str]:
+    async def download(self, username: str, filename: str, file_size: int = 0,
+                       *, quality_profile_id=None) -> Optional[str]:
         """
         Download a track using the appropriate client.
 
@@ -493,13 +550,22 @@ class DownloadOrchestrator:
             if not client:
                 raise RuntimeError(f"{spec.display_name} download client not available (failed to initialize)")
             logger.info(f"Downloading from {spec.display_name}: {filename}")
-            return await client.download(username, filename, file_size)
+            with quality_profile_context(quality_profile_id):
+                if spec.name in ('torrent', 'usenet'):
+                    return await client.download(
+                        username,
+                        filename,
+                        file_size,
+                        quality_profile_id=quality_profile_id,
+                    )
+                return await client.download(username, filename, file_size)
 
         soulseek = self.registry.get('soulseek')
         if not soulseek:
             raise RuntimeError("Soulseek client not available (failed to initialize)")
         logger.info(f"Downloading from Soulseek: {filename}")
-        return await soulseek.download(username, filename, file_size)
+        with quality_profile_context(quality_profile_id):
+            return await soulseek.download(username, filename, file_size)
 
     async def get_all_downloads(self) -> List[DownloadStatus]:
         """Aggregated view across every source. Delegates to the

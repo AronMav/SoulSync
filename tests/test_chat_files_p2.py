@@ -175,6 +175,75 @@ def test_library_search_only_tracks_with_files(files_app):
     assert http.get("/api/chat/files/library-search?q=x").get_json()["tracks"] == []
 
 
+def test_wanted_resolve_share_matches_album(files_app):
+    http, state, client, uploads = files_app
+    r = http.post("/api/chat/wanted/resolve-share",
+                  json={"title": "The Resistance", "artist": "Muse", "type": "album"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True and body["found"] is True
+    assert body["type"] == "album"
+    assert body["title"] == "The Resistance"
+    assert body["artist"] == "Muse"
+    assert "image_url" in body
+    assert "artist_image_url" in body
+    assert len(body["tracks"]) == 2
+    assert body["tracks"][0]["title"] == "Uprising"
+    assert body["tracks"][0]["size"] == 4096
+
+
+def test_wanted_resolve_share_not_found(files_app):
+    http, state, client, uploads = files_app
+    r = http.post("/api/chat/wanted/resolve-share",
+                  json={"title": "Nonexistent", "artist": "Nobody"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True and body["found"] is False
+
+
+def test_wanted_resolve_share_gated_by_send_permission(files_app):
+    http, state, client, uploads = files_app
+    state["admin"] = False
+    state["config"]["soulseek.chat_member_send"] = False
+    r = http.post("/api/chat/wanted/resolve-share",
+                  json={"title": "The Resistance", "artist": "Muse"})
+    assert r.status_code == 403
+
+
+def test_wanted_resolve_share_bidirectional_and_fallback(files_app):
+    http, state, client, uploads = files_app
+    # 1. Bidirectional: DB has "Muse", query has "Muse (Special Edition)"
+    r1 = http.post("/api/chat/wanted/resolve-share",
+                   json={"title": "The Resistance", "artist": "Muse (Special Edition)"})
+    assert r1.status_code == 200
+    b1 = r1.get_json()
+    assert b1["ok"] is True and b1["found"] is True
+    assert b1["title"] == "The Resistance"
+
+    # 2. Fallback: query artist is "Different Artist" but album is "The Resistance"
+    r2 = http.post("/api/chat/wanted/resolve-share",
+                   json={"title": "The Resistance", "artist": "Completely Wrong Artist"})
+    assert r2.status_code == 200
+    b2 = r2.get_json()
+    assert b2["ok"] is True and b2["found"] is True
+    assert b2["title"] == "The Resistance"
+
+
+def test_wanted_resolve_share_relative_paths(files_app):
+    http, state, client, uploads = files_app
+    r = http.post("/api/chat/wanted/resolve-share",
+                  json={"title": "The Resistance", "artist": "Muse"})
+    assert r.status_code == 200
+    b = r.get_json()
+    assert b["ok"] is True
+    # Verify tracks have relative filenames with backslashes and titles
+    for tr in b["tracks"]:
+        assert "\\" in tr["filename"] or "/" in tr["filename"]
+        assert tr["title"] in ("Uprising", "Ghost Track")
+        assert tr["size"] >= 0
+
+
+
 def test_room_send_dresses_the_file_card(files_app):
     http, state, client, uploads = files_app
     r = http.post("/api/chat/room/message",
@@ -233,7 +302,7 @@ def test_media_server_path_resolves_via_music_paths(files_app, tmp_path, monkeyp
     resolver + Settings → Library → Music Paths, not a naive as-stored check.
     """
     http, state, client, uploads = files_app
-    from config.settings import config_manager
+    from core.settings import config_manager
     from database.music_database import MusicDatabase
 
     # the real file lives where SoulSync mounts the library
@@ -404,3 +473,55 @@ def test_frontend_save_wiring():
     # only audio cards get the save chip
     card = js[js.index("function _fileCardHtml"):js.index("function renderGroups")]
     assert "isAudio\n" in card or "(isAudio" in card
+
+
+def test_frontend_wanted_share_wiring():
+    js = (_ROOT / "webui" / "static" / "chat.js").read_text(encoding="utf-8")
+    html = (_ROOT / "webui" / "index.html").read_text(encoding="utf-8")
+    css = (_ROOT / "webui" / "static" / "chat-overhaul.css").read_text(encoding="utf-8")
+
+    # Wanted card button and resolve API
+    assert "data-chat-wanted-share" in js
+    assert "'/api/chat/wanted/resolve-share'" in js
+    assert "_onShareWanted" in js
+
+    # Protocol handling
+    assert "'want.share'" in js
+    assert "'want.accept'" in js
+    assert "_handleWantedShareEvents" in js
+    assert "_acceptIncomingShare" in js
+
+    # HTML modals and settings switch
+    assert "data-chat-share-confirm-modal" in html
+    assert "data-chat-incoming-share-modal" in html
+    assert "data-chat-set-autoshare" in html
+
+    # CSS styles
+    assert ".chat-card-btn--share" in css
+    assert ".chat-wanted-badge--shared" in css
+    assert ".chat-wanted-badge--fulfilled" in css
+    assert ".chat-share-modal" in css
+
+
+
+def test_every_room_send_path_carries_the_channel_envelope():
+    """A file share and the GIF picker built their payloads by hand and skipped
+    the channel/thread tags the composer sends — so an upload posted in #help
+    folded into #general for everyone (untagged messages fall back to the
+    default channel by design, so they can never be swallowed entirely). One
+    tagger now stamps every room send; this pins each path to it."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "chat.js"
+          ).read_text(encoding="utf-8")
+    assert "function _tagRoomPayload" in js
+    tagger = js.split("function _tagRoomPayload")[1].split("function _sendFileMessage")[0]
+    assert "payload.chan" in tagger and "payload.thread" in tagger
+
+    # the three room send paths, each through the tagger
+    file_send = js.split("function _sendFileMessage")[1].split("\n    function ")[0]
+    assert "_tagRoomPayload({" in file_send, "file shares post untagged again"
+    gif_send = js.split("function sendGif")[1].split("\n    function ")[0]
+    assert "_tagRoomPayload({" in gif_send, "GIFs post untagged again"
+    # the composer path delegates rather than duplicating the tag logic
+    assert js.count("payload.chan = state.channel") == 1, \
+        "channel tagging exists in more than one place — the copies WILL drift"

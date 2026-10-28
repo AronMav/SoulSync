@@ -490,7 +490,11 @@ CREATE TABLE IF NOT EXISTS video_watchlist (
     -- that are still airing are watched by default WITHOUT a row here.
     state       TEXT NOT NULL DEFAULT 'follow',
     date_added  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(kind, tmdb_id)
+    -- per-profile isolation (music side is per-profile; the video side was
+    -- global, so a non-admin saw the admin's list). Existing rows migrate to
+    -- profile 1 (admin).
+    profile_id  INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(profile_id, kind, tmdb_id)
 );
 CREATE INDEX IF NOT EXISTS idx_video_watchlist_kind ON video_watchlist(kind);
 
@@ -522,19 +526,19 @@ CREATE TABLE IF NOT EXISTS video_wishlist (
     parent_source_id TEXT,                   -- owning channel's youtube id (video rows)
     date_added     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     search_attempts INTEGER DEFAULT 0,       -- consecutive fruitless drain searches (reset on grab)
-    last_search_at  TEXT                     -- when the drain last searched this row
+    last_search_at  TEXT,                    -- when the drain last searched this row
+    -- per-profile isolation (music side is per-profile; the video side was
+    -- global, so a non-admin saw the admin's list). Existing rows migrate to
+    -- profile 1 (admin).
+    profile_id      INTEGER NOT NULL DEFAULT 1
 );
 -- one row per movie, one per (show, season, episode), one per youtube video —
 -- partial uniques so the shapes don't collide and re-adding is an idempotent upsert.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_video_wishlist_movie
-    ON video_wishlist(tmdb_id) WHERE kind = 'movie';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_video_wishlist_episode
-    ON video_wishlist(tmdb_id, season_number, episode_number) WHERE kind = 'episode';
-CREATE INDEX IF NOT EXISTS idx_video_wishlist_show ON video_wishlist(tmdb_id) WHERE kind = 'episode';
--- NOTE: the source_id / parent_source_id partial indexes are created in code
+-- NOTE: the profile-scoped partial indexes are created in code
 -- (VideoDatabase._ensure_indexes) AFTER the column migrations run — they can't
 -- live here because this script runs via executescript() BEFORE the ALTERs, so
--- on an upgraded DB the columns wouldn't exist yet.
+-- on an upgraded DB the profile_id column wouldn't exist yet.
+CREATE INDEX IF NOT EXISTS idx_video_wishlist_show ON video_wishlist(tmdb_id) WHERE kind = 'episode';
 
 -- ── Derived views: Watchlist / Wishlist / Calendar ──────────────────────────
 -- WATCHLIST = things you follow for NEW content: monitored shows + channels.
@@ -816,18 +820,25 @@ CREATE TABLE IF NOT EXISTS video_requests (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     profile_id     INTEGER NOT NULL DEFAULT 1,
     requester_name TEXT,
-    kind           TEXT NOT NULL,                  -- movie | show
-    tmdb_id        INTEGER NOT NULL,
+    kind           TEXT NOT NULL,                  -- movie | show | episode | youtube
+    tmdb_id        INTEGER NOT NULL,             -- 0 for youtube (no tmdb id)
     title          TEXT NOT NULL,
     year           INTEGER,
     poster_url     TEXT,
     note           TEXT,                           -- the requester's "why"
     monitor        TEXT DEFAULT 'future',          -- shows: P2 monitor policy applied on approve
+    season_number  INTEGER,                      -- episode requests: which season
+    episode_number INTEGER,                      -- episode requests: which episode
+    youtube_id     TEXT,                         -- youtube requests: the video id
+    channel_youtube_id TEXT,                    -- youtube requests: channel id
+    channel_title  TEXT,                         -- youtube requests: channel name
     status         TEXT NOT NULL DEFAULT 'pending',-- pending | approved | denied
     admin_response TEXT,
     resolved_by    INTEGER,
     resolved_at    TIMESTAMP,
-    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    available_at   TEXT,                           -- when the approved title reached the library
+    quality_profile_id INTEGER                     -- asked-for quality profile (NULL = default)
 );
 CREATE INDEX IF NOT EXISTS idx_vreq_profile ON video_requests(profile_id);
 CREATE INDEX IF NOT EXISTS idx_vreq_status  ON video_requests(status);
@@ -855,3 +866,140 @@ CREATE INDEX IF NOT EXISTS idx_vissues_profile ON video_issues(profile_id);
 CREATE INDEX IF NOT EXISTS idx_vissues_status  ON video_issues(status);
 CREATE INDEX IF NOT EXISTS idx_vissues_entity  ON video_issues(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_vissues_created ON video_issues(created_at);
+
+-- Fresh Releases match cache — one row per EXT.to release detail page.
+-- The board refresh (the hourly video_extto_fresh_refresh automation, or the
+-- tab's Refresh button — same code either way) enriches every row from its own
+-- detail page, and each of those costs its own Cloudflare challenge. The board
+-- turns over slowly, so a release that was there an hour ago is served from
+-- here for free and only genuinely new ones are fetched. That is what makes an
+-- hourly cadence affordable; without it every run would re-pay for the whole
+-- board. Keyed by detail URL because that is what identifies a release, and it
+-- is what the board rows carry.
+CREATE TABLE IF NOT EXISTS video_extto_cache (
+    url        TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,                  -- parsed detail facts (JSON)
+    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_extto_cache_at ON video_extto_cache(fetched_at);
+
+-- Manual library matches ("I have this"). The auto-matcher keys library rows
+-- by tmdb_id, and sometimes it whiffs — a show sits in the library with a
+-- NULL or wrong tmdb_id while TMDB insists you own nothing (Australian
+-- Survivor: almost every season on disk, "not in library" on the detail
+-- page). This table records the user's explicit override: TMDB id X IS
+-- library row Y. Consulted FIRST by library_id_for_tmdb(_s), so the user's
+-- word beats both the row's own tmdb_id and any future re-match. Survives
+-- rescans — nothing but the user (or an explicit unlink) clears it.
+CREATE TABLE IF NOT EXISTS video_manual_matches (
+    kind       TEXT NOT NULL CHECK (kind IN ('movie', 'show')),
+    tmdb_id    INTEGER NOT NULL,
+    library_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, tmdb_id)
+);
+CREATE INDEX IF NOT EXISTS idx_manual_matches_library ON video_manual_matches(library_id);
+
+-- Subtitle wanted queue ("Replace Bazarr", Phase 1). One row per video ×
+-- language × flags: what the import hook tried (or still needs) to fetch from
+-- the subtitle providers. A miss is a durable 'failed' row — not a silent
+-- no-op — so Phase 2's retry loop can pick it back up (a miss when NO provider
+-- was even configured stays 'wanted', attempts untouched, so it retries once
+-- a key is added). video_kind is
+-- 'movie' | 'episode' (movies.id | episodes.id) once the library row exists;
+-- a fresh import has no library row yet (the scanner ingest creates it after
+-- the file lands), so those rows key on the download instead
+-- ('download', video_downloads.id). Per-item language overrides are rows with
+-- user_set=1 (written by the Phase 4 settings UI — the import hook only ever
+-- creates user_set=0 rows, and treats ONLY user_set=1 rows as an override:
+-- when no user-set row exists for the video it refreshes from the CURRENT
+-- subtitle_langs, so changing the global list takes effect on re-grab.
+-- Pre-existing user_set=0 rows for languages no longer wanted are left alone,
+-- not deleted.)
+-- PHASE 2: rows keyed ('download', video_downloads.id) are never reconciled
+-- once the scanner ingest creates the library row (movies.id / episodes.id) —
+-- a later successful library-keyed resolution would create a DUPLICATE set of
+-- rows for the same video. Phase 2 must re-key (or clean up) download-keyed
+-- rows once the library row exists.
+CREATE TABLE IF NOT EXISTS subtitle_wanted (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_kind TEXT NOT NULL,        -- 'movie' | 'episode' | 'download'
+    video_id INTEGER NOT NULL,       -- movies.id | episodes.id | video_downloads.id
+    language TEXT NOT NULL,          -- 'en'
+    hi INTEGER NOT NULL DEFAULT 0,
+    forced INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'wanted',  -- wanted | fetching | have | failed
+    user_set INTEGER NOT NULL DEFAULT 0,    -- 1 = per-item override (Phase 4 UI)
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    last_upgrade_check_at TEXT,      -- Phase 3: upgrade loop re-check cooldown
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(video_kind, video_id, language, hi, forced)
+);
+CREATE INDEX IF NOT EXISTS idx_subtitle_wanted_status ON subtitle_wanted(status);
+
+-- ── "Replace Bazarr" Phase 2: fetch history + per-provider daily quota ───────
+CREATE TABLE IF NOT EXISTS subtitle_fetch_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_kind TEXT NOT NULL,        -- 'movie' | 'episode' | 'download'
+    video_id INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    hi INTEGER NOT NULL DEFAULT 0,
+    forced INTEGER NOT NULL DEFAULT 0,
+    provider TEXT NOT NULL,          -- provider id, or '' when no provider was tried
+    candidate_title TEXT,            -- best candidate's title, if any
+    score REAL,                      -- best candidate's score, if any
+    outcome TEXT NOT NULL,           -- 'downloaded' | 'miss' | 'below_threshold' | 'error'
+    attempted_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_subtitle_fetch_history_video
+    ON subtitle_fetch_history(video_kind, video_id);
+CREATE INDEX IF NOT EXISTS idx_subtitle_fetch_history_attempted
+    ON subtitle_fetch_history(attempted_at);
+
+CREATE TABLE IF NOT EXISTS subtitle_quota (
+    provider TEXT NOT NULL,
+    day TEXT NOT NULL,               -- YYYY-MM-DD (UTC)
+    used INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider, day)
+);
+
+-- ── "Replace Bazarr" Phase 3: per-movie/per-show subtitle language overrides ──
+-- Policy vs state separation (see VideoDatabase.subtitle_override_set): the
+-- override is POLICY ("this show wants en+es"); subtitle_wanted rows are
+-- per-video×language fetch state. A show-level override must not require
+-- materializing per-episode wanted rows, and clearing is a single-row delete.
+CREATE TABLE IF NOT EXISTS subtitle_overrides (
+    kind TEXT NOT NULL,              -- 'movie' | 'show'
+    item_id INTEGER NOT NULL,        -- movies.id | shows.id
+    languages TEXT NOT NULL,         -- JSON array of language codes, e.g. '["en","es"]'
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (kind, item_id)
+);
+
+-- ── scene numbering (TMDB vs TVDB) ──
+-- the wishlist numbers episodes the TMDB way, the scene names releases the
+-- TVDB way, and for ~40% of wanted episodes they disagree (60 Minutes S59E25
+-- is TVDB S58E48). one row per TVDB season: its episodes with air dates, so the
+-- drain can map an episode by air date without asking TVDB per search.
+CREATE TABLE IF NOT EXISTS tvdb_episode_cache (
+    tvdb_id INTEGER NOT NULL,
+    season_number INTEGER NOT NULL,
+    episodes TEXT NOT NULL,          -- JSON [[episode_number, "YYYY-MM-DD"], ...]
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (tvdb_id, season_number)
+);
+
+-- ── series type for shows not in any library yet ──
+-- a show's series type normally comes from its library row (set by hand, or
+-- the show sits in a library marked anime). a show that is followed, wished
+-- or approved before it is owned has no row, so its type lives here, keyed
+-- by TMDB id: suggested from TMDB when it is first followed (source 'tmdb')
+-- or chosen by an admin (source 'user'). once the show is scanned into a
+-- library the library row decides and this row is no longer read.
+CREATE TABLE IF NOT EXISTS show_type_hints (
+    tmdb_id INTEGER PRIMARY KEY,
+    series_type TEXT NOT NULL,       -- standard | daily | anime
+    source TEXT NOT NULL,            -- tmdb | user
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);

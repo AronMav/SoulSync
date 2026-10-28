@@ -49,7 +49,16 @@ def auth_route_client(monkeypatch: pytest.MonkeyPatch):
     fake_client.redirect_uri = "http://127.0.0.1:8889/tidal/callback"
     fake_client._generate_pkce_challenge = MagicMock()
 
-    with patch("core.tidal_client.TidalClient", return_value=fake_client):
+    # a single-profile install, as these tests assume: other test modules leave
+    # profiles in the shared database, and with more than one a request with
+    # no profile chosen answers profile_required (these requests come from
+    # other hosts, so a session cookie can't pick one)
+    from core.security import session_profile as _sp
+    _resolve = _sp.resolve_session_profile
+
+    with patch("core.tidal_client.TidalClient", return_value=fake_client), \
+            patch.object(_sp, "resolve_session_profile",
+                         lambda **kw: _resolve(**{**kw, "profile_count": 1})):
         with patch("web_server.add_activity_item"):
             from web_server import app as flask_app
             flask_app.config['TESTING'] = True
@@ -90,7 +99,7 @@ class TestConfiguredRedirectUriIsHonored:
         Tidal error 1002)."""
         client, _fake = auth_route_client
 
-        from config.settings import config_manager
+        from core.settings import config_manager
         monkeypatch.setattr(
             config_manager, "get",
             lambda key, default=None: (
@@ -114,7 +123,7 @@ class TestConfiguredRedirectUriIsHonored:
         and matching portal registration."""
         client, _fake = auth_route_client
 
-        from config.settings import config_manager
+        from core.settings import config_manager
         monkeypatch.setattr(
             config_manager, "get",
             lambda key, default=None: (
@@ -137,7 +146,7 @@ class TestConfiguredRedirectUriIsHonored:
         be honored, not overridden."""
         client, _fake = auth_route_client
 
-        from config.settings import config_manager
+        from core.settings import config_manager
         monkeypatch.setattr(
             config_manager, "get",
             lambda key, default=None: (
@@ -169,7 +178,7 @@ class TestEmptyConfigFallsBackToDefault:
         the documented portal registration) wins instead."""
         client, _fake = auth_route_client
 
-        from config.settings import config_manager
+        from core.settings import config_manager
         monkeypatch.setattr(
             config_manager, "get",
             lambda key, default=None: ("" if key == "tidal.redirect_uri" else default),
@@ -190,7 +199,7 @@ class TestEmptyConfigFallsBackToDefault:
     ) -> None:
         client, _fake = auth_route_client
 
-        from config.settings import config_manager
+        from core.settings import config_manager
         monkeypatch.setattr(
             config_manager, "get",
             lambda key, default=None: ("" if key == "tidal.redirect_uri" else default),

@@ -44,8 +44,26 @@
             .then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
     }
     function postJSON(url, body) {
+        // The body is parsed on a FAILURE too. Every one of these endpoints puts
+        // the reason in {ok:false, error:"..."} - "Only 2.5 GB free on the
+        // temporary/working drive (C:\\Users\\...) - under your 5 GB minimum",
+        // "Missing the release's download URL", "Set the library folder for this
+        // type" - and `r.ok ? r.json() : null` threw all of it away, so five
+        // different refusals arrived at the user as one bare "Grab failed" with
+        // nothing to act on. Callers already read res.error; they were just
+        // never given one.
         return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify(body) }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
+            body: JSON.stringify(body) }).then(function (r) {
+                return r.json().then(function (d) {
+                    if (r.ok) return d;
+                    // keep whatever the server said; only invent a message when
+                    // it sent none, so the user still learns something happened
+                    return Object.assign({ ok: false, error: 'Request failed (HTTP ' + r.status + ')' }, d || {});
+                }).catch(function () {
+                    // not JSON at all (a proxy error page, an empty 502)
+                    return r.ok ? null : { ok: false, error: 'Request failed (HTTP ' + r.status + ')' };
+                });
+            }).catch(function () { return null; });
     }
 
     function contentHTML() {
@@ -419,7 +437,17 @@
     // send an identical request (incl. the auto-retry candidate pool).
     function buildGrabPayload(panel, r) {
         var p = panel._search || {};
-        var src = p.source || 'soulseek';   // the DOWNLOAD source this panel actually searched
+        // The DOWNLOAD source this panel searched...
+        var src = p.source || 'soulseek';
+        // ...except a torrent search returns Prowlarr AND EXT.to rows together,
+        // and they are not grabbed the same way: an EXT.to row carries an
+        // info_url and no magnet yet, so it has to reach the backend labelled
+        // 'extto' or the magnet is never resolved.
+        // Keyed on indexer_id, NOT on r.source: a result row's `source` is the
+        // RELEASE source parsed out of the filename - "BluRay", "WEB-DL" - and
+        // sending that as the download source makes every grab fail with
+        // "Unsupported download source".
+        if (String(r.indexer_id || '').toLowerCase() === 'extto') src = 'extto';
         var container = panel.closest('[data-vgm-dl-content]');
         var o = (container && (container._opts || container._dl)) || {};
         var payload = {
@@ -440,12 +468,17 @@
         } else {
             // torrent / usenet — hand the magnet/NZB carriers to the backend client (no slskd requery)
             payload.download_url = r.download_url;
+            payload.magnet_uri = r.magnet_uri;   // #1139 fallback if the .torrent fetch fails
             payload.protocol = r.protocol;
             payload.indexer_id = r.indexer_id;
             payload.guid = r.guid;
             payload.username = r.username;          // indexer name (display only)
             payload.filename = r.filename || r.title;
             payload.candidates = [];
+            // What EXT.to resolves its magnet FROM, at grab time, for the one
+            // release actually picked. Harmless on a Prowlarr row: undefined.
+            payload.info_url = r.info_url;
+            payload.magnet_id = r.magnet_id;
         }
         return payload;
     }
@@ -572,8 +605,23 @@
         '</div>';
     }
 
+    // Is this result a whole season rather than one episode? Soulseek says so by
+    // handing over the folder's file list; a torrent/usenet release only has its
+    // NAME, so 'S03' with no episode number is the tell. Without this a torrent
+    // season pack rendered as an ordinary release row with nothing marking it as a
+    // pack — you could grab it, but nothing said what you were grabbing.
+    function _isSeasonPack(r) {
+        if (r && r.files && r.files.length > 1) return true;
+        var t = String((r && (r.title || r.filename)) || '');
+        if (/[Ss]\d{1,2}[\s._-]*[Ee]\d{1,3}/.test(t)) return false;   // names an episode
+        if (/\b\d{4}[\s._-]\d{2}[\s._-]\d{2}\b/.test(t)) return false;  // a dated daily
+        // The season token must start a word: bare /S\d/ also matches the '5' in an
+        // audio tag like 'DTS5.1', which would file a MOVIE as a season pack.
+        return /[Ss]eason[\s._-]*\d{1,2}|(?:^|[\s._\-[(])[Ss]\d{1,2}(?![\dEe])/.test(t);
+    }
+
     function resultCardHTML(r, i) {
-        if (r.files && r.files.length > 1) return _packCardHTML(r, i);
+        if (_isSeasonPack(r)) return _packCardHTML(r, i);
         // Flat / brutalist release card: a bracketed quality block + release name on
         // line 1, an UPPERCASE dot-separated spec line, then the verdict + a hard
         // [ GET ] button. Monospace, sharp, no chrome. .vdl-res stays a column so the
@@ -586,23 +634,38 @@
         meta.push(r.username ? r.username + (r.peers > 1 ? ' (' + r.peers + ')' : '') : (r.seeders || 0) + ' SEED');
         if (r.group) meta.push(r.group);
         meta.push(r.size_gb + ' GB');
+        var formatNames = Array.isArray(r.formats) ? r.formats.filter(Boolean) : [];
+        var formatNote = formatNames.length
+            ? '<div class="vdl-r-formats" title="' + esc(formatNames.join(', ')) + '">' +
+                '<span>Formats</span> ' + esc(formatNames.join(' · ')) +
+                (r.format_score ? ' <b>' + (r.format_score > 0 ? '+' : '') + esc(r.format_score) + '</b>' : '') +
+              '</div>'
+            : (r.format_score ? '<div class="vdl-r-formats"><span>Format score</span> ' +
+                (r.format_score > 0 ? '+' : '') + esc(r.format_score) + '</div>' : '');
+        var isBest = i === 0 && r.accepted;
         var verdict = r.accepted
             ? '<span class="vdl-r-verdict vdl-r-verdict--ok">&#10003; MEETS PROFILE</span>'
             : '<span class="vdl-r-verdict vdl-r-verdict--no" title="' + esc(r.rejected || '') + '">&#10007; ' + esc((r.rejected || 'FILTERED').toUpperCase()) + '</span>';
+        var note = !r.accepted && r.rejected
+            ? '<div class="vdl-r-note vdl-r-note--warn">Reason · ' + esc(r.rejected) + '</div>'
+            : (isBest ? '<div class="vdl-r-note vdl-r-note--best">Best ranked match for this source</div>' : '');
         // Manual pick = the user overrides the quality profile. Auto-grab still only
         // takes accepted releases; here we let them GET a below-profile one anyway.
         var grab = r.username
             ? '<button class="vdl-res-grab' + (r.accepted ? '' : ' vdl-res-grab--override') + '" type="button" data-vdl-grab="' + i +
                 '" title="' + (r.accepted ? 'Download this release' : 'Below your quality profile — download anyway') + '">[ GET ]</button>'
             : '';
-        return '<div class="vdl-res' + (r.accepted ? ' vdl-res--ok' : ' vdl-res--rejected') + '" data-vdl-card="' + i + '">' +
+        return '<div class="vdl-res' + (r.accepted ? ' vdl-res--ok' : ' vdl-res--rejected') + (isBest ? ' vdl-res--best' : '') + '" data-vdl-card="' + i + '">' +
             '<div class="vdl-res-main">' +
                 '<div class="vdl-r-l1">' +
                     '<span class="vdl-r-q vdl-r-q--' + resKind(r.resolution) + '">' + esc(RES_LABEL[r.resolution] || r.resolution || '?') + '</span>' +
                     '<span class="vdl-r-title" title="' + esc(r.title) + '">' + esc(r.title) + '</span>' +
+                    (isBest ? '<span class="vdl-r-best">Best match</span>' : '') +
                 '</div>' +
                 '<div class="vdl-r-l2">' + esc(meta.filter(Boolean).join('  ·  ')) + '</div>' +
+                formatNote +
                 '<div class="vdl-r-l3">' + verdict + grab + '</div>' +
+                note +
             '</div>' +
         '</div>';
     }
@@ -1020,9 +1083,27 @@
         });
     }
 
+    // Ask ONE source for a season pack. Resolves {ok, id} or {ok:false} — a search
+    // that finds nothing is an ordinary outcome here, not a failure.
+    function _trySeasonPack(container, st, sn, src) {
+        return new Promise(function (resolve) {
+            var panel = document.createElement('div');
+            panel.className = 'vdl-results vdl-res-noanim';
+            ensureScratch(container).appendChild(panel);
+            // scope 'season' rides through buildGrabPayload into search_ctx, which is
+            // what tells the monitor this lands as a FOLDER and must be mapped to
+            // episodes rather than narrowed to its largest file.
+            searchInto(container, panel,
+                { scope: 'season', title: st.title, season: sn, source: src },
+                [], function () { _pickAndGrab(panel).then(resolve); });
+        });
+    }
+
     function grabSeason(container, st, sn) {
-        var src = (st.sources || []).filter(function (s) { return SRC_META[s]; })[0];
-        if (!src) { toast('No download source configured', 'error'); return; }
+        // EVERY configured source, not just the first. Asking only sources[0] meant a
+        // show that Soulseek had but Prowlarr didn't was reported as unavailable.
+        var sources = (st.sources || []).filter(function (s) { return SRC_META[s]; });
+        if (!sources.length) { toast('No download source configured', 'error'); return; }
         var eps = [];
         for (var k in st.epMeta) {
             if (k.indexOf(sn + '_') === 0 && st.epMeta[k].state === 'missing') eps.push(+k.split('_')[1]);
@@ -1034,20 +1115,47 @@
         if (card) card.classList.add('vdl-season--open');
         eps.forEach(function (en) { epSearching(_epEl(container, sn, en)); });   // immediate feedback
         var btn = container.querySelector('[data-vdl-season-grab="' + sn + '"]');
-        if (btn) { btn.disabled = true; btn.textContent = 'Grabbing…'; }
-        toast('Grabbing ' + eps.length + ' episode' + (eps.length > 1 ? 's' : '') + ' — each row shows live status', 'info');
-        var idx = 0, active = 0, done = 0, MAX = 3;
-        function pump() {
-            while (active < MAX && idx < eps.length) {
-                active++;
-                autoGrabEpisode(container, st, sn, eps[idx++], src).then(function () {
-                    active--; done++;
-                    if (done >= eps.length) { if (btn) { btn.disabled = false; btn.textContent = 'Grab season'; } }
-                    else pump();
-                });
+        if (btn) { btn.disabled = true; btn.textContent = 'Searching…'; }
+
+        function perEpisode() {
+            if (btn) btn.textContent = 'Grabbing…';
+            toast('Grabbing ' + eps.length + ' episode' + (eps.length > 1 ? 's' : '') +
+                ' — each row shows live status', 'info');
+            var idx = 0, active = 0, done = 0, MAX = 3;
+            function pump() {
+                while (active < MAX && idx < eps.length) {
+                    active++;
+                    // Round-robin the sources so one dead indexer can't sink the season.
+                    var src = sources[idx % sources.length];
+                    autoGrabEpisode(container, st, sn, eps[idx++], src).then(function () {
+                        active--; done++;
+                        if (done >= eps.length) { if (btn) { btn.disabled = false; btn.textContent = 'Grab season'; } }
+                        else pump();
+                    });
+                }
             }
+            pump();
         }
-        pump();
+
+        // A season pack first: one grab, one torrent, one seeded swarm, instead of
+        // 22 separate searches for a 22-episode season. Falls back the moment no
+        // source has an acceptable pack — the per-episode path is still the one
+        // that works for a half-owned season.
+        toast('Looking for a season pack…', 'info');
+        var i = 0;
+        (function next() {
+            if (i >= sources.length) { perEpisode(); return; }
+            _trySeasonPack(container, st, sn, sources[i++]).then(function (r) {
+                if (r && r.ok) {
+                    if (btn) { btn.disabled = false; btn.textContent = 'Grab season'; }
+                    eps.forEach(function (en) { epTrack(_epEl(container, sn, en), r.id); });
+                    toast('Season pack grabbed — episodes import as it finishes', 'success');
+                    document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
+                    return;
+                }
+                next();
+            });
+        })();
     }
 
     // On (re)open, resume live tracking for any episodes of THIS show already in flight,
@@ -1120,11 +1228,29 @@
     function _grabPack(panel, r) {
         var o = ((panel.closest('[data-vgm-dl-content]') || {})._opts) || {};
         var p = panel._search || {};
-        return postJSON('/api/video/downloads/grab-pack', {
-            username: r.username, files: r.files || [],
-            title: p.title || o.title || '', quality_label: r.quality_label,
-            media_id: o.id || o.mediaId, media_source: o.source || o.mediaSource,
-            year: o.year, poster_url: o.poster
+        // Soulseek lists a pack's files BEFORE you download them, so it can fan out at
+        // grab time into one row per episode. A torrent can't — its files don't exist
+        // until it finishes — so it goes through the ordinary grab as ONE row scoped
+        // to the season, and the monitor maps the finished folder to episodes.
+        if (r.files && r.files.length > 1 && r.username && (p.source || 'soulseek') === 'soulseek') {
+            return postJSON('/api/video/downloads/grab-pack', {
+                username: r.username, files: r.files,
+                title: p.title || o.title || '', quality_label: r.quality_label,
+                media_id: o.id || o.mediaId, media_source: o.source || o.mediaSource,
+                year: o.year, poster_url: o.poster
+            });
+        }
+        var payload = buildGrabPayload(panel, r);
+        payload.kind = 'show';
+        payload.search_ctx = payload.search_ctx || {};
+        payload.search_ctx.scope = 'season';        // what makes the monitor map the folder
+        if (payload.search_ctx.season == null && p.season != null) payload.search_ctx.season = p.season;
+        payload.search_ctx.episode = null;          // a pack names no single episode
+        return sendGrab(payload).then(function (res) {
+            // grab-pack answers {started, skipped}; the normal grab answers {id}. Give
+            // the caller one shape so the button doesn't have to know which ran.
+            if (res && res.ok) return { ok: true, started: 1, skipped: 0, id: res.id };
+            return res;
         });
     }
     // Shared expandable-pack interactions (toggle + [ GET PACK ]) — used by the

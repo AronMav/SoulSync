@@ -46,6 +46,14 @@ def register_routes(bp):
         try:
             db = get_database()
             artists = db.get_watchlist_artists(profile_id=profile_id)
+            # #1822: a follower reports the default rules it actually gets
+            from core.settings import config_manager
+            from core.watchlist_defaults import default_values
+            defaults = default_values(config_manager)
+            for artist in artists:
+                if getattr(artist, "follow_defaults", False):
+                    for key, value in defaults.items():
+                        setattr(artist, key, value)
             return api_success({
                 "artists": [serialize_watchlist_artist(a, fields) for a in artists]
             })
@@ -122,7 +130,12 @@ def register_routes(bp):
 
         Body: {"include_albums": true, "include_live": false, ...}
         Accepts any combination of: include_albums, include_eps, include_singles,
-        include_live, include_remixes, include_acoustic, include_compilations
+        include_live, include_remixes, include_acoustic, include_compilations,
+        follow_defaults.
+
+        follow_defaults true puts the artist back on the watchlist defaults.
+        Sending release rules for an artist that follows the defaults gives it
+        its own rules, starting from the defaults it was getting (#1822).
         """
         body = request.get_json(silent=True) or {}
         profile_id = parse_profile_id(request)
@@ -134,7 +147,7 @@ def register_routes(bp):
         # Only fields the client actually SENT are touched — this is a real
         # partial PATCH, unlike the legacy full-form endpoint (P2-03).
         updates = {}
-        for key in allowed_fields & set(body):
+        for key in (allowed_fields | {"follow_defaults"}) & set(body):
             parsed = parse_strict_bool(body[key])
             if parsed is None:
                 return api_error("BAD_REQUEST", f"{key} must be a boolean.", 400)
@@ -152,12 +165,28 @@ def register_routes(bp):
                 return api_error(
                     "BAD_REQUEST",
                     "No valid fields provided. Allowed: "
-                    f"{', '.join(sorted(allowed_fields | {'quality_profile_id'}))}",
+                    f"{', '.join(sorted(allowed_fields | {'quality_profile_id', 'follow_defaults'}))}",
                     400,
                 )
 
             with db._get_connection() as conn:
                 cursor = conn.cursor()
+
+                rule_keys = allowed_fields & set(updates)
+                if rule_keys and "follow_defaults" not in updates:
+                    cursor.execute(f"""
+                        SELECT follow_defaults FROM watchlist_artists
+                        WHERE {artist_id_match_sql()} AND profile_id = ?
+                    """, [artist_id] * len(ARTIST_ID_COLUMNS) + [profile_id])
+                    row = cursor.fetchone()
+                    if row is not None and row[0]:
+                        # unsent rules come from the defaults it was getting,
+                        # not from stale columns
+                        from core.settings import config_manager
+                        from core.watchlist_defaults import default_values
+                        updates = {**{k: v for k, v in default_values(config_manager).items()
+                                      if k not in updates}, **updates}
+                        updates["follow_defaults"] = False
 
                 # Build SET clause
                 set_parts = [f"{k} = ?" for k in updates]
@@ -182,16 +211,22 @@ def register_routes(bp):
     @bp.route("/watchlist/scan", methods=["POST"])
     @require_api_key
     def trigger_scan():
-        """Trigger a watchlist scan for new releases."""
-        try:
-            from web_server import is_watchlist_actually_scanning
-            if is_watchlist_actually_scanning():
-                return api_error("CONFLICT", "Watchlist scan is already running.", 409)
+        """Trigger a watchlist scan for new releases.
 
-            from web_server import start_watchlist_scan
-            start_watchlist_scan()
+        Calls the app's own scan handler in this request context; it reads
+        no body, so the v1 request is a fine one to run it under. It used to
+        import from web_server, which stopped owning it (#1259 class).
+        """
+        try:
+            from api.artist_watchlist import start_watchlist_scan
+
+            result = start_watchlist_scan()
+            response, status = result if isinstance(result, tuple) else (result, 200)
+            if status == 409:
+                return api_error("CONFLICT", "Watchlist scan is already running.", 409)
+            if status != 200:
+                body = response.get_json(silent=True) or {}
+                return api_error("WATCHLIST_ERROR", body.get("error", "Could not start the scan."), status)
             return api_success({"message": "Watchlist scan started."})
-        except ImportError:
-            return api_error("NOT_AVAILABLE", "Watchlist scan function not available.", 501)
         except Exception as e:
             return api_error("WATCHLIST_ERROR", str(e), 500)

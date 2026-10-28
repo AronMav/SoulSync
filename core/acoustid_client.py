@@ -24,7 +24,7 @@ import logging
 import logging.handlers
 
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
 
 # fpcalc binary location (downloaded automatically if needed)
 FPCALC_BIN_DIR = Path(__file__).parent.parent / "bin"
@@ -56,6 +56,31 @@ try:
 except ImportError:
     ACOUSTID_AVAILABLE = False
     logger.warning("pyacoustid library not installed - run: pip install pyacoustid")
+
+def parse_lookup_with_duration(data: Dict[str, Any]):
+    """pyacoustid's parse_lookup_result, plus each recording's duration.
+
+    acoustid sends a length (seconds) on every recording, pyacoustid drops it.
+    without it the duration guards had nothing to read and never fired (#1804).
+    yields (score, recording_id, title, artist, duration_or_None).
+    """
+    import acoustid
+    if data.get("status") != "ok":
+        raise acoustid.WebServiceError("status: {}".format(data.get("status")))
+    if "results" not in data:
+        raise acoustid.WebServiceError("results not included")
+    for result in data["results"]:
+        score = result["score"]
+        for recording in result.get("recordings") or []:
+            artists = recording.get("artists")
+            artist_name = "".join(
+                a["name"] + a.get("joinphrase", "") for a in artists
+            ) if artists else None
+            duration = recording.get("duration")
+            if not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration <= 0:
+                duration = None
+            yield score, recording["id"], recording.get("title"), artist_name, duration
+
 
 def _get_fpcalc_download_url() -> Optional[str]:
     """Get the download URL for fpcalc based on current platform."""
@@ -199,24 +224,24 @@ class AcoustIDClient:
                     logger.info(f"Match: {mbid}")
     """
 
-    def __init__(self):
+    def __init__(self, api_key: Optional[str] = None):
         """Initialize AcoustID client with settings from config."""
-        self._api_key = None
+        self._api_key = api_key
         self._enabled = None
 
     @property
     def api_key(self) -> str:
-        """Get API key from config (cached)."""
-        if self._api_key is None:
-            self._api_key = config_manager.get('acoustid.api_key', '')
-        return self._api_key
+        """Get API key from config (or explicitly set override)."""
+        if self._api_key is not None:
+            return self._api_key
+        return (config_manager.get('acoustid.api_key', '') or '') if config_manager else ''
 
     @property
     def enabled(self) -> bool:
         """Check if AcoustID verification is enabled in config."""
-        if self._enabled is None:
-            self._enabled = config_manager.get('acoustid.enabled', False)
-        return self._enabled
+        if self._enabled is not None:
+            return self._enabled
+        return bool(config_manager.get('acoustid.enabled', False)) if config_manager else False
 
     def is_available(self) -> Tuple[bool, str]:
         """
@@ -315,10 +340,11 @@ class AcoustIDClient:
             if data.get('status') == 'error':
                 error = data.get('error', {})
                 error_code = error.get('code', 0)
+                error_msg = error.get('message', '')
 
                 # Error code 4 is specifically "invalid API key"
-                if error_code == 4:
-                    return False, "Invalid AcoustID API key - get one from https://acoustid.org/new-application"
+                if error_code == 4 or 'invalid api key' in error_msg.lower() or 'invalid client' in error_msg.lower() or 'invalid key' in error_msg.lower():
+                    return False, "Invalid AcoustID API key — use an Application API key from https://acoustid.org/new-application (not your user account key)"
                 # Any other error (e.g. "invalid fingerprint") means the API key
                 # was accepted — the dummy test fingerprint is just rejected as expected
                 return True, "AcoustID API key is valid"
@@ -381,12 +407,41 @@ class AcoustIDClient:
             api_key_preview = f"{self.api_key[:8]}..." if self.api_key and len(self.api_key) > 8 else "NOT SET"
             logger.info(f"Fingerprinting and looking up: {audio_file} (API key: {api_key_preview})")
 
-            logger.debug("Running acoustid.match()...")
             recordings = []
             seen_mbids = set()
             best_score = 0.0
 
-            for result in acoustid.match(self.api_key, audio_file, parse=True):
+            # Try to get raw parsed JSON response first if pyacoustid supports parse_lookup_result,
+            # so we can inspect error codes instead of losing them to pyacoustid's bare "status: error".
+            raw_response = None
+            if hasattr(acoustid, 'parse_lookup_result'):
+                try:
+                    raw_response = acoustid.match(self.api_key, audio_file, parse=False)
+                except (acoustid.NoBackendError, acoustid.FingerprintGenerationError):
+                    raise
+                except Exception:
+                    raw_response = None
+
+            if isinstance(raw_response, dict):
+                if raw_response.get('status') != 'ok':
+                    err = raw_response.get('error', {})
+                    err_code = err.get('code', 0)
+                    err_msg = err.get('message', 'Unknown AcoustID error')
+                    invalid = (err_code == 4 or 'invalid' in err_msg.lower() or 'key' in err_msg.lower())
+                    if invalid:
+                        logger.error(
+                            "AcoustID API key appears to be invalid (Application API key required): %s (code %s)",
+                            err_msg, err_code
+                        )
+                    elif 'rate' in err_msg.lower() or 'limit' in err_msg.lower() or err_code == 5:
+                        logger.warning("Rate limited by AcoustID — will retry later: %s", err_msg)
+                    return {'status': 'error', 'recordings': [], 'invalid_key': invalid,
+                            'error': f'AcoustID API error (code {err_code}): {err_msg}'}
+                match_results = parse_lookup_with_duration(raw_response)
+            else:
+                match_results = acoustid.match(self.api_key, audio_file, parse=True)
+
+            for result in match_results:
                 # match() with parse=True returns (score, recording_id, title, artist)
                 if not isinstance(result, tuple) or len(result) < 2:
                     logger.warning(f"Unexpected result format: {result}")
@@ -396,6 +451,7 @@ class AcoustIDClient:
                 recording_id = result[1]
                 title = result[2] if len(result) > 2 else None
                 artist = result[3] if len(result) > 3 else None
+                duration = result[4] if len(result) > 4 else None
 
                 logger.debug(f"Got result: score={score}, id={recording_id}, title={title}, artist={artist}")
 
@@ -404,7 +460,8 @@ class AcoustIDClient:
 
                 if recording_id and recording_id not in seen_mbids:
                     seen_mbids.add(recording_id)
-                    recordings.append({'mbid': recording_id, 'title': title, 'artist': artist, 'score': score})
+                    recordings.append({'mbid': recording_id, 'title': title, 'artist': artist,
+                                       'score': score, 'duration': duration})
                     logger.debug(f"Found match: {title} by {artist} (MBID: {recording_id}, score: {score})")
 
             if not recordings:

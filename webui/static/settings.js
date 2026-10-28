@@ -78,11 +78,50 @@ function syncRetryConditionalRows() {
 }
 window.syncRetryConditionalRows = syncRetryConditionalRows;
 
-function debouncedAutoSaveSettings() {
+// Sign in with OIDC: the provider's settings (and the admin's connect row
+// inside them) only mean something while the toggle is on, so they hide when
+// it is off. Hidden fields keep their values and still save, so switching
+// OIDC off and on again loses nothing.
+function syncOidcProviderBlock() {
+    const toggle = document.getElementById('security-oidc-signin');
+    const block = document.getElementById('security-oidc-provider');
+    if (block) block.hidden = !(toggle && toggle.checked);
+}
+window.syncOidcProviderBlock = syncOidcProviderBlock;
+
+// Every Settings -> Quality control belongs to the profile currently shown in
+// the editor. Keep this list separate from ordinary app settings so a quality
+// edit uses the profile endpoint (and does not re-initialize every service
+// client through the full settings endpoint). The eight bundle controls live
+// outside the main ladder tile, but are profile-owned just the same.
+const _QP_BUNDLE_CONTROL_IDS = new Set([
+    'acoustid-require-verified', 'downsample-hires', 'audio-completeness-check',
+    'import-replace-lower-quality', 'lossy-copy-enabled', 'lossy-copy-codec',
+    'lossy-copy-bitrate', 'lossy-copy-delete-original',
+]);
+const _QP_PROFILE_CONTROL_IDS = new Set([
+    ..._QP_BUNDLE_CONTROL_IDS,
+    'quality-fallback-enabled', 'quality-search-mode', 'quality-rank-candidates',
+    'quality-upgrade-policy', 'quality-upgrade-cutoff', 'quality-release-import-mode',
+]);
+
+// Route a Quality-page change to the profile editor's lightweight autosave.
+// Returning true lets the full-page autosave stop here: the profile endpoint
+// persists the complete bundle and, for the default row, mirrors its global
+// config keys server-side as well.
+function _qpHandleProfileControlChange(event) {
+    const id = event && event.target && event.target.id;
+    if (!id || !_QP_PROFILE_CONTROL_IDS.has(id)) return false;
+    debouncedSaveQualityProfile();
+    return true;
+}
+
+function debouncedAutoSaveSettings(event) {
     // Ignore changes made while the page is programmatically populating its
     // fields on load — those aren't user edits and must not trigger a full
     // save (which re-initializes every backend service client).
     if (window._suppressSettingsAutoSave) return;
+    if (_qpHandleProfileControlChange(event)) return;
     // ISOLATION: the video side reuses this shared settings page, so editing a
     // VIDEO field (TMDB key, region, autoplay…) would otherwise fire this MUSIC
     // auto-save — which reads the server toggle from the DOM and would persist
@@ -103,6 +142,7 @@ function debouncedAutoSaveSettings() {
 
 function handleManualSaveClick() {
     if (settingsAutoSaveTimer) clearTimeout(settingsAutoSaveTimer);
+    if (qualityProfileAutoSaveTimer) clearTimeout(qualityProfileAutoSaveTimer);
     saveSettings(false);
 }
 
@@ -215,17 +255,20 @@ function resolveExperimentalEnableDialog(confirmed) {
 }
 
 function syncJiosaavnEnrichmentBubble(enabled) {
-    const container = document.querySelector('.jiosaavn-button-container');
-    if (container) container.style.display = enabled ? '' : 'none';
+    // Re-broadcast for the React dashboard (tools-seam rule: in the handler) —
+    // its JioSaavn orb shows/hides on this, since the container write below
+    // only reaches the vanilla markup.
+    window.dispatchEvent(new CustomEvent('ss:jiosaavn-experimental', { detail: { enabled: !!enabled } }));
+    // No container write since the dashboard flip — the JioSaavn orb is
+    // React-rendered and shows/hides on the dispatch above.
     if (typeof refreshRateMonitorExperimentalVisibility === 'function') {
         refreshRateMonitorExperimentalVisibility();
     }
     if (enabled && typeof renderEnrichmentRail === 'function') {
         renderEnrichmentRail();
     }
-    if (window._lastStatusPayload?.enrichment && typeof renderEnrichmentCards === 'function') {
-        renderEnrichmentCards(window._lastStatusPayload.enrichment);
-    }
+    // The chips replay is React's now: service-cards.tsx re-renders its
+    // cached enrichment payload on the ss:jiosaavn-experimental dispatch.
 }
 
 async function onExperimentalJiosaavnToggle(checkbox) {
@@ -391,6 +434,17 @@ function initializeSettings() {
         settingsPage.querySelectorAll('input[type="text"], input[type="url"], input[type="password"], input[type="number"], input[type="range"]').forEach(input => {
             input.addEventListener('input', debouncedAutoSaveSettings);
         });
+        // Textareas were in NEITHER list, so nothing on the page auto-saved
+        // them. Paste a cookies.txt, click Test, and the test ran against the
+        // config as it was before the paste — the value only reached the server
+        // if something else happened to trigger a save. 'input' rather than
+        // 'change' because 'change' on a textarea waits for blur, and pasting
+        // then clicking a button inside the same panel never blurs it.
+        // The Hydrabase payload boxes are a dev console, not settings, and must
+        // not fire a full settings save on every keystroke.
+        settingsPage.querySelectorAll('textarea:not(.hydra-payload)').forEach(input => {
+            input.addEventListener('input', debouncedAutoSaveSettings);
+        });
         settingsPage.querySelectorAll('input[type="checkbox"], select').forEach(input => {
             input.addEventListener('change', debouncedAutoSaveSettings);
         });
@@ -454,15 +508,22 @@ function resetFileOrganizationTemplates() {
         album: '$albumartist/$albumartist - $album/$track - $title',
         single: '$artist/$artist - $title/$title',
         playlist: '$playlist/$artist - $title',
-        video: '$artist/$title-video'
+        video: '$artist/$title-video',
+        podcast: '$show/Season $season/$title',
+        audiobook: '$author/$series/$seriespos - $title',
+        sample: '$artist/$track - $chop'
     };
 
     document.getElementById('template-album-path').value = defaults.album;
     document.getElementById('template-single-path').value = defaults.single;
     document.getElementById('template-playlist-path').value = defaults.playlist;
     document.getElementById('template-video-path').value = defaults.video;
+    document.getElementById('template-podcast-path').value = defaults.podcast;
+    document.getElementById('template-audiobook-path').value = defaults.audiobook;
+    document.getElementById('template-sample-path').value = defaults.sample;
 
     debouncedAutoSaveSettings();
+    refreshPathPreview(0);
 }
 
 function validateFileOrganizationTemplates() {
@@ -470,16 +531,21 @@ function validateFileOrganizationTemplates() {
 
     // Valid variables for each template type
     const validVars = {
-        album: ['$artist', '$albumartist', '$artistletter', '$album', '$albumtype', '$title', '$track', '$disc', '$discnum', '$cdnum', '$year', '$quality'],
-        single: ['$artist', '$albumartist', '$artistletter', '$album', '$albumtype', '$title', '$track', '$year', '$quality'],
+        album: ['$artist', '$albumartist', '$artistletter', '$albumartistletter', '$album', '$albumtype', '$atypes', '$title', '$track', '$disc', '$discnum', '$cdnum', '$year', '$quality', '$disambiguation', '$label', '$explicit', '$contentrating', '$contentratingfull', '$albumartistdisambiguation', '$albumartistcountry', '$albumartistgenre', '$albumartistinfo', '$albumartistcomposite', '$albumartistclash', '$artistdisambiguation', '$artistcountry', '$artistgenre', '$artistinfo', '$artistcomposite', '$artistclash'],
+        single: ['$artist', '$albumartist', '$artistletter', '$albumartistletter', '$album', '$albumtype', '$atypes', '$title', '$track', '$year', '$quality', '$explicit', '$contentrating', '$contentratingfull', '$albumartistdisambiguation', '$albumartistcountry', '$albumartistgenre', '$albumartistinfo', '$albumartistcomposite', '$albumartistclash', '$artistdisambiguation', '$artistcountry', '$artistgenre', '$artistinfo', '$artistcomposite', '$artistclash'],
         playlist: ['$artist', '$artistletter', '$playlist', '$title', '$year', '$quality'],
-        video: ['$artist', '$artistletter', '$title', '$year']
+        video: ['$artist', '$artistletter', '$title', '$year'],
+        podcast: ['$show', '$podcast', '$author', '$artist', '$title', '$season', '$seasonnum', '$episode', '$episodenum', '$year', '$date', '$type'],
+        audiobook: ['$author', '$authorletter', '$narrator', '$title', '$series', '$seriespos', '$year', '$asin'],
+        sample: ['$artist', '$track', '$album', '$chop', '$stem']
     };
 
     // Get template values
     const albumPath = document.getElementById('template-album-path').value.trim();
     const singlePath = document.getElementById('template-single-path').value.trim();
     const playlistPath = document.getElementById('template-playlist-path').value.trim();
+    const podcastPath = document.getElementById('template-podcast-path').value.trim();
+    const samplePath = document.getElementById('template-sample-path').value.trim();
 
     // Validate album template
     if (albumPath) {
@@ -567,13 +633,521 @@ function validateFileOrganizationTemplates() {
         });
     }
 
+    // Validate podcast template
+    if (podcastPath) {
+        if (podcastPath.endsWith('/')) {
+            errors.push('Podcast template cannot end with /');
+        }
+        if (podcastPath.startsWith('/')) {
+            errors.push('Podcast template cannot start with /');
+        }
+        if (podcastPath.includes('//')) {
+            errors.push('Podcast template cannot have consecutive slashes //');
+        }
+        const podcastVarPattern = /\$\{([a-zA-Z]+)\}|\$([a-zA-Z]+)/g;
+        const foundVars = podcastPath.match(podcastVarPattern) || [];
+        foundVars.forEach(v => {
+            const normalized = v.startsWith('${') ? '$' + v.slice(2, -1) : v;
+            const lowerVar = normalized.toLowerCase();
+            const isValid = validVars.podcast.some(validVar => validVar.toLowerCase() === lowerVar);
+            if (!isValid) {
+                errors.push(`Invalid variable "${normalized}" in podcast template. Valid: ${validVars.podcast.join(', ')}`);
+            } else if (normalized !== lowerVar && validVars.podcast.includes(lowerVar)) {
+                errors.push(`Variable "${normalized}" should be lowercase: "${lowerVar}"`);
+            }
+        });
+    }
+
+    // Validate sample template
+    if (samplePath) {
+        if (samplePath.endsWith('/')) {
+            errors.push('Sample template cannot end with /');
+        }
+        if (samplePath.startsWith('/')) {
+            errors.push('Sample template cannot start with /');
+        }
+        if (samplePath.includes('//')) {
+            errors.push('Sample template cannot have consecutive slashes //');
+        }
+        const sampleVarPattern = /\$\{([a-zA-Z]+)\}|\$([a-zA-Z]+)/g;
+        const foundVars = samplePath.match(sampleVarPattern) || [];
+        foundVars.forEach(v => {
+            const normalized = v.startsWith('${') ? '$' + v.slice(2, -1) : v;
+            const lowerVar = normalized.toLowerCase();
+            const isValid = validVars.sample.some(validVar => validVar.toLowerCase() === lowerVar);
+            if (!isValid) {
+                errors.push(`Invalid variable "${normalized}" in sample template. Valid: ${validVars.sample.join(', ')}`);
+            } else if (normalized !== lowerVar && validVars.sample.includes(lowerVar)) {
+                errors.push(`Variable "${normalized}" should be lowercase: "${lowerVar}"`);
+            }
+        });
+    }
+
     return errors;
+}
+
+// ── Connections: services as tiles ─────────────────────────────────────────
+//
+// 22 services lived in two "API Configuration" groups as nested accordions, so
+// finding out whether Last.fm was even configured meant scrolling a wall of
+// chevrons and opening them one at a time. The tiles answer that without
+// opening anything, and the media tabs stop the music side and the video side
+// being one undifferentiated list.
+//
+// The forms themselves are NOT rebuilt. A tile opens the real panel in a modal
+// by MOVING the node - never cloning it - so every id stays unique and all the
+// existing save/load/test code keeps working with no idea this happened. Same
+// contract the Sources tab runs on, and the reason it is worth restating: a
+// clone would duplicate ~200 field ids, and on this page a duplicated id is how
+// a save writes the wrong value into a real credential.
+//
+// Where a panel goes home is remembered as (parent, nextSibling) rather than a
+// shared holding container. It restores to the exact slot it came from, so the
+// accordion groups below keep their order even after a service has been opened.
+const SERVICE_KINDS = {
+    music: { label: 'Music', attr: 'data-service' },
+    video: { label: 'Video', attr: 'data-video-service' },
+};
+
+// Real brand art wherever the repo already has it. A service with no logo gets
+// a monogram on its own colour rather than a grey blob - the point of the grid
+// is to be recognisable at a glance, and a row of identical blobs is a list you
+// have to read anyway.
+const SERVICE_LOGOS = {
+    spotify: '/static/img/brands/spotify.png',
+    itunes: '/static/img/brands/itunes.png',
+    deezer: '/static/img/brands/deezer.png',
+    discogs: '/static/img/brands/discogs.svg',
+    tidal: '/static/img/brands/tidal.svg',
+    qobuz: '/static/img/brands/qobuz.svg',
+    lastfm: '/static/img/brands/lastfm.png',
+    genius: '/static/img/brands/genius.png',
+    musicbrainz: '/static/img/brands/musicbrainz.png',
+    listenbrainz: '/static/img/brands/listenbrainz.png',
+    tmdb: '/static/img/brands/tmdb.svg',
+    tvdb: '/static/img/brands/tvdb.svg',
+    ytextras: '/static/img/brands/youtube.svg',
+};
+
+// Marks that are dark artwork and vanish on a dark tile, same list the download
+// chain keeps for the same reason.
+const INVERT_SERVICE_MARKS = new Set(['tidal', 'qobuz', 'discogs', 'tvdb']);
+
+// Services with no brand art in the repo. Rather than invent icons, these reuse
+// the glyphs the VIDEO DASHBOARD already shows for the same sources - so OMDb is
+// the same star in both places and the app keeps ONE vocabulary. A service with
+// neither a logo nor an established glyph falls back to its monogram; inventing
+// one here would be the start of a second, competing icon set.
+const SERVICE_GLYPHS = {
+    omdb: '\u2605',             // star - ratings, as on the dashboard
+    fanart: '\u{1F3A8}',        // palette - artwork
+    opensubtitles: '\u{1F4AC}', // speech bubble - subtitles
+    trakt: '\u2605',            // star - audience rating
+    nokey: '\u{1F4FA}',         // tv - community data (TVmaze)
+};
+
+// Grouped by what each service does for you, same headings as the download
+// chain. Order inside a group is the order here, not page order. A service not
+// listed lands in "Other" so a new one can never vanish from the grid.
+const SERVICE_GROUPS = {
+    music: [
+        { label: 'Metadata', hint: 'artists, albums and tracks',
+          ids: ['musicbrainz', 'spotify', 'itunes', 'deezer', 'yandex', 'discogs', 'tidal', 'qobuz', 'hydrabase'] },
+        { label: 'Scrobbling', hint: 'listening history and recommendations',
+          ids: ['lastfm', 'listenbrainz'] },
+        { label: 'Extras', hint: 'lyrics, concerts, fingerprint checks and cover art',
+          ids: ['genius', 'concerts', 'acoustid', 'pollinations'] },
+    ],
+    video: [
+        { label: 'Metadata', hint: 'movies, shows and episodes',
+          ids: ['tmdb', 'tvdb', 'nokey'] },
+        { label: 'Ratings & lists', hint: 'scores and list collections',
+          ids: ['omdb', 'trakt', 'mdblist'] },
+        { label: 'Subtitles', hint: 'found and downloaded for your library',
+          ids: ['opensubtitles', 'subdl', 'subsource'] },
+        { label: 'Artwork & extras', hint: 'posters, fanart and trailers',
+          ids: ['fanart', 'ytextras'] },
+    ],
+};
+
+// Follow the side you are standing on, exactly like the download chain does.
+// Defaulting to music meant a video user landed on a grid of Spotify and Tidal
+// tiles with their own TMDB key nowhere in sight.
+let _svcKind = 'music';
+let _svcKindChosen = false;
+
+function _svcSyncKindToSide() {
+    if (_svcKindChosen) return;
+    _svcKind = document.body.getAttribute('data-side') === 'video' ? 'video' : 'music';
+}
+let _svcOpen = null;          // { id, parent, next } for the panel currently lifted
+
+function _svcFrames(kind) {
+    const attr = SERVICE_KINDS[kind]?.attr;
+    if (!attr) return [];
+    // Scoped to the CONNECTIONS tab. Unscoped this also picked up "Detail Pages",
+    // a video-preferences panel that lives on the Library tab and is not a
+    // service at all - it appeared in the grid as a connection you could
+    // configure, which it is not.
+    return Array.from(document.querySelectorAll(`#settings-page .api-service-frame[${attr}]`))
+        .filter(f => f.closest('[data-stg="connections"]'));
+}
+
+function _svcMeta(frame) {
+    const title = frame.querySelector('.service-title')?.textContent?.trim() || '';
+    const id = frame.getAttribute('data-service') || frame.getAttribute('data-video-service') || '';
+    const logo = SERVICE_LOGOS[id]
+        || frame.querySelector('.video-svc-logo')?.getAttribute('src')
+        || null;
+    const dot = frame.querySelector('.stg-service-dot');
+    const colour = dot?.style?.color || '';
+    const required = !!frame.querySelector('.stg-req-pill');
+    // "Deezer (Favorites & Playlists)" is a name plus an explanation; the tile
+    // shows the name and the modal shows the rest.
+    const paren = title.indexOf('(');
+    const name = (paren > 0 ? title.slice(0, paren) : title).trim();
+    return {
+        id, name,
+        detail: paren > 0 ? title.slice(paren + 1).replace(/\)\s*$/, '').trim() : '',
+        logo, colour, required,
+        inverted: INVERT_SERVICE_MARKS.has(id),
+        glyph: SERVICE_GLYPHS[id] || null,
+        monogram: (name.replace(/[^A-Za-z0-9]/g, '')[0] || '?').toUpperCase(),
+    };
+}
+
+// A service counts as configured when it holds a non-empty credential. Read
+// from the live inputs, never from a cached settings object - the same rule the
+// library summaries follow, and for the same reason.
+function _svcConfigured(frame) {
+    const fields = frame.querySelectorAll('input[type="text"], input[type="password"], input[type="email"]');
+    if (fields.length) {
+        for (const f of fields) {
+            if (String(f.value || '').trim()) return true;
+        }
+        return false;
+    }
+    // keyless services (Community Data, YouTube Extras) are on/off instead
+    const toggles = frame.querySelectorAll('input[type="checkbox"]');
+    for (const t of toggles) {
+        if (t.checked) return true;
+    }
+    return null;          // nothing to judge by - say nothing rather than "off"
+}
+
+function buildServiceTiles() {
+    _svcSyncKindToSide();
+    const grid = document.getElementById('service-tile-grid');
+    const tabs = document.getElementById('svc-tabs');
+    if (!grid || !tabs) return;
+
+    tabs.innerHTML = Object.entries(SERVICE_KINDS).map(([k, spec]) =>
+        `<button type="button" role="tab" class="dlchain-tab${k === _svcKind ? ' active' : ''}" `
+        + `onclick="switchServiceKind('${k}')">${spec.label}</button>`).join('');
+
+    // the tab owns the whole tab, not just the grid: the matching side's server
+    // section comes with it, so what is on screen agrees with what the tab says
+    document.querySelectorAll('#settings-page .settings-group[data-svc-side]').forEach(g => {
+        g.classList.toggle('svc-side-active', g.getAttribute('data-svc-side') === _svcKind);
+    });
+
+    const frames = _svcFrames(_svcKind);
+    if (!frames.length) {
+        grid.innerHTML = '<div class="dlchain-empty">No services on this side yet.</div>';
+        return;
+    }
+    const attr = SERVICE_KINDS[_svcKind].attr;
+    const tile = (frame) => {
+        const id = frame.getAttribute(attr);
+        const m = _svcMeta(frame);
+        const set = _svcConfigured(frame);
+        const state = set === null ? 'na' : (set ? 'ok' : 'warn');
+        // real artwork first, then the app's own glyph for that source, then a
+        // monogram. each step is a real fallback, not a placeholder.
+        const fallback = m.glyph
+            ? `<span class="svc-glyph">${m.glyph}</span>`
+            : `<span class="svc-monogram">${escapeHtml(m.monogram)}</span>`;
+        const art = m.logo
+            ? `<img class="svc-mark${m.inverted ? ' is-inverted' : ''}" src="${escapeHtml(m.logo)}" alt="" `
+              + `onerror="this.replaceWith(document.createRange().createContextualFragment(this.dataset.fb))" `
+              + `data-fb="${escapeHtml(fallback)}">`
+            : fallback;
+        const chip = m.required && !set
+            ? '<span class="src-tile-chip src-tile-chip--warn">required</span>'
+            : (set === null ? '<span class="src-tile-chip">no key needed</span>'
+               : set ? '<span class="src-tile-chip src-tile-chip--on">configured</span>'
+                     : '<span class="src-tile-chip">not set up</span>');
+        const brand = (m.colour || '').replace('#', '');
+        return `<button type="button" class="svc-tile${set ? ' is-active' : ''}" `
+             + `data-service-tile="${escapeHtml(id)}" onclick="openServiceModal('${escapeHtml(id)}')" `
+             + `style="--svc-brand: ${escapeHtml(m.colour || '#8a8a8a')}" `
+             + `title="Configure ${escapeHtml(m.name)}">`
+             + `<span class="src-tile-dot hss-${state}"></span>`
+             + `<span class="svc-tile-art">${art}</span>`
+             + `<span class="svc-tile-name">${escapeHtml(m.name)}</span>`
+             + chip + '</button>';
+    };
+
+    const byId = new Map(frames.map(f => [f.getAttribute(attr), f]));
+    const groups = (SERVICE_GROUPS[_svcKind] || []).map(g => ({
+        ...g, frames: g.ids.map(id => byId.get(id)).filter(Boolean),
+    }));
+    const listed = new Set(groups.flatMap(g => g.ids));
+    groups.push({ label: 'Other', hint: '', frames: frames.filter(f => !listed.has(f.getAttribute(attr))) });
+
+    grid.innerHTML = groups.filter(g => g.frames.length).map(g =>
+        `<div class="src-group"><div class="src-group-head">`
+        + `<span class="src-group-label">${g.label}</span>`
+        + `<span class="src-group-count">${g.frames.length}</span>`
+        + (g.hint ? `<span class="src-group-hint">${g.hint}</span>` : '')
+        + `</div><div class="svc-tile-row">${g.frames.map(tile).join('')}</div></div>`).join('');
+}
+window.buildServiceTiles = buildServiceTiles;
+
+function switchServiceKind(kind) {
+    if (!SERVICE_KINDS[kind]) return;
+    _svcKindChosen = true;      // an explicit pick outranks the side default
+    _svcKind = kind;
+    buildServiceTiles();
+}
+window.switchServiceKind = switchServiceKind;
+
+function openServiceModal(id) {
+    const attr = SERVICE_KINDS[_svcKind].attr;
+    const frame = document.querySelector(`#settings-page .api-service-frame[${attr}="${CSS.escape(id)}"]`);
+    const overlay = document.getElementById('service-config-modal');
+    const body = document.getElementById('svc-modal-body');
+    if (!frame || !overlay || !body) return;
+    if (_svcOpen) closeServiceModal();          // never lift two panels at once
+
+    const m = _svcMeta(frame);
+    document.getElementById('svc-modal-title').textContent = m.name;
+    document.getElementById('svc-modal-sub').textContent = m.detail;
+    document.getElementById('svc-modal-icon').innerHTML = m.logo
+        ? `<img class="svc-mark${m.inverted ? ' is-inverted' : ''}" src="${escapeHtml(m.logo)}" alt="">`
+        : (m.glyph ? `<span class="svc-glyph">${m.glyph}</span>`
+                   : `<span class="svc-monogram">${escapeHtml(m.monogram)}</span>`);
+
+    // remember the exact slot so it goes back where it came from
+    _svcOpen = { id, attr, parent: frame.parentNode, next: frame.nextSibling };
+    body.appendChild(frame);
+    // the accordion inside is collapsed by default; in a modal it IS the content
+    frame.querySelector('.stg-service-body')?.style.setProperty('display', 'block');
+    overlay.hidden = false;
+    document.body.classList.add('src-modal-open');
+}
+window.openServiceModal = openServiceModal;
+
+function closeServiceModal() {
+    const overlay = document.getElementById('service-config-modal');
+    if (!overlay) return;
+    // home BEFORE hiding, so the panel's ids never sit inside a hidden modal
+    if (_svcOpen) {
+        const frame = document.querySelector(
+            `#settings-page .api-service-frame[${_svcOpen.attr}="${CSS.escape(_svcOpen.id)}"]`);
+        if (frame && _svcOpen.parent) {
+            frame.querySelector('.stg-service-body')?.style.removeProperty('display');
+            _svcOpen.parent.insertBefore(frame, _svcOpen.next);
+        }
+    }
+    _svcOpen = null;
+    overlay.hidden = true;
+    document.body.classList.remove('src-modal-open');
+    // an api key typed seconds before closing would otherwise sit on the 2s
+    // autosave timer with the modal gone and nothing on screen saying so
+    if (typeof settingsAutoSaveTimer !== 'undefined' && settingsAutoSaveTimer) {
+        clearTimeout(settingsAutoSaveTimer);
+        settingsAutoSaveTimer = null;
+        saveSettings(true);
+    }
+    buildServiceTiles();
+}
+window.closeServiceModal = closeServiceModal;
+
+document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    const overlay = document.getElementById('service-config-modal');
+    if (overlay && !overlay.hidden) closeServiceModal();
+});
+
+// ── Library tab: what each section currently SAYS ──────────────────────────
+//
+// Ten collapsed cards whose hints all read like table-of-contents entries
+// ("Metadata, tags, conversion, lyrics") tell you what is inside a section but
+// nothing about your install. You had to open all ten to learn anything, which
+// is the same problem the Sources tab had before its tiles started showing
+// state - and showing state is what made that page work.
+//
+// So each header reports its own current value instead. The card still says
+// what it is; the hint now says what it is SET TO.
+//
+// Rules that keep this honest:
+//   * only report what is actually on the page. a field that has not rendered
+//     yet reports nothing rather than "off" - claiming a setting is disabled
+//     when you simply cannot see it is worse than staying quiet.
+//   * derive from the live controls, never from a second copy of the state.
+//     a summary that can disagree with the field below it is a bug generator.
+const LIBRARY_SUMMARIES = {
+    'library-paths': () => {
+        const named = ['download-path', 'transfer-path', 'podcasts-path', 'audiobooks-path']
+            .map(id => document.getElementById(id))
+            .filter(el => el && String(el.value || '').trim());
+        if (!named.length) return 'no folders set yet';
+        const tail = String(named[0].value).replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+        return named.length === 1 ? tail : `${tail} +${named.length - 1} more`;
+    },
+    'library-music-org': () => {
+        const on = document.getElementById('file-organization-enabled');
+        if (!on) return '';
+        if (!on.checked) return 'organizing off';
+        const tpl = (document.getElementById('template-album-path')?.value || '').trim();
+        // the template itself is the most useful thing to show - it is what the
+        // user is actually deciding here - but it is long, so show its shape
+        return tpl ? tpl.split('/').slice(-2).join('/') : 'organizing on';
+    },
+    'library-video-folders': () => {
+        const set = ['video-movies-path', 'video-tv-path', 'video-youtube-path']
+            .filter(id => (document.getElementById(id)?.value || '').trim()).length;
+        const extra = [...document.querySelectorAll('[data-video-extra-kind] input')]
+            .filter(input => input.value.trim()).length;
+        const primary = set ? `${set} of 3 libraries set` : 'no primary libraries set';
+        return extra ? `${primary} · ${extra} additional` : (set ? primary : 'no libraries set yet');
+    },
+    'library-post-processing': () => {
+        const on = (id) => document.getElementById(id)?.checked;
+        const bits = [];
+        if (on('metadata-enabled')) bits.push('tagging');
+        if (on('embed-album-art')) bits.push('artwork');
+        return bits.length ? bits.join(' · ') : 'nothing enabled';
+    },
+    'library-filtering': () => {
+        const explicit = document.getElementById('allow-explicit');
+        const genre = document.getElementById('genre-whitelist-enabled');
+        const bits = [];
+        if (explicit) bits.push(explicit.checked ? 'explicit allowed' : 'explicit blocked');
+        if (genre?.checked) bits.push('genre whitelist on');
+        return bits.join(' · ');
+    },
+    'library-playlists': () => {
+        const bits = [];
+        if (document.getElementById('m3u-export-enabled')?.checked) bits.push('M3U export');
+        if (document.getElementById('library-m3u-enabled')?.checked) bits.push('library M3U');
+        return bits.length ? bits.join(' · ') : 'off';
+    },
+    'library-stats': () => {
+        const el = document.getElementById('listening-stats-enabled');
+        if (!el) return '';
+        return el.checked ? 'collecting play history' : 'off';
+    },
+    'library-discovery': () => {
+        const v = document.getElementById('discover-adventurousness')?.value;
+        if (v === undefined || v === null || v === '') return '';
+        const n = Number(v);
+        return n <= 25 ? 'plays it safe' : n <= 60 ? 'balanced' : 'adventurous';
+    },
+    'library-video-prefs': () => {
+        const region = document.getElementById('video-watch-region');
+        const label = region?.selectedOptions?.[0]?.textContent?.trim();
+        return label ? `where to watch: ${label}` : '';
+    },
+};
+
+function refreshLibrarySummaries() {
+    for (const [key, compute] of Object.entries(LIBRARY_SUMMARIES)) {
+        const slot = document.querySelector(`[data-stg-summary="${key}"]`);
+        if (!slot) continue;
+        let text = '';
+        try { text = compute() || ''; } catch (e) { text = ''; }
+        // an empty summary falls back to the static description rather than
+        // leaving a blank gap where a hint used to be
+        if (text) {
+            slot.textContent = text;
+            slot.classList.add('is-live');
+        } else {
+            slot.textContent = slot.dataset.stgFallback || '';
+            slot.classList.remove('is-live');
+        }
+    }
+}
+window.refreshLibrarySummaries = refreshLibrarySummaries;
+
+// recompute whenever anything on the page changes, not on a timer
+document.addEventListener('change', (e) => {
+    if (e.target.closest?.('#settings-page')) refreshLibrarySummaries();
+});
+document.addEventListener('input', (e) => {
+    // the summarised sections now live on more than the Library tab (#1822)
+    if (e.target.closest?.('#settings-page [data-stg]')) refreshLibrarySummaries();
+});
+
+// ── Collapsible section headers: keyboard + screen reader ──────────────────
+//
+// The 31 section toggles are <div onclick>. That works for a mouse and for
+// nothing else: Tab skipped every one of them, Enter and Space did nothing, and
+// the :focus-visible styling written for them could never fire. They carry
+// role="button" and tabindex="0" now, and this supplies the half a real button
+// would have given for free.
+//
+// Delegated rather than 31 listeners: the markup is static, but a delegated
+// handler cannot go stale if a section is ever rendered late.
+//
+// aria-expanded is kept in sync here too. Setting it once in the markup and
+// never updating it is worse than omitting it - a screen reader would announce
+// "collapsed" for a section the user just opened.
+document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+    const header = e.target.closest?.('#settings-page .settings-section-header[role="button"]');
+    if (!header) return;
+    e.preventDefault();          // Space would scroll the page
+    header.click();              // reuse the inline toggle - one behaviour, not two
+});
+
+document.addEventListener('click', (e) => {
+    const header = e.target.closest?.('#settings-page .settings-section-header[role="button"]');
+    if (!header) return;
+    // after the inline handler has run, so it reports the state we ended in
+    requestAnimationFrame(() => {
+        header.setAttribute('aria-expanded', header.classList.contains('collapsed') ? 'false' : 'true');
+    });
+});
+
+// Media tabs keep both panels mounted, preserving unsaved values and listeners.
+function switchLibraryMediaTab(tab) {
+    const card = tab.closest('.stg-media-card');
+    if (!card) return;
+    card.querySelectorAll('[role="tab"]').forEach(button => {
+        const selected = button === tab;
+        button.setAttribute('aria-selected', String(selected));
+        button.tabIndex = selected ? 0 : -1;
+        const panel = document.getElementById(button.getAttribute('aria-controls'));
+        if (panel) panel.hidden = !selected;
+    });
+}
+function handleLibraryMediaTabKey(event) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    const tabs = Array.from(event.currentTarget.closest('[role="tablist"]').querySelectorAll('[role="tab"]'));
+    const current = tabs.indexOf(event.currentTarget);
+    const index = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+        : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    event.preventDefault();
+    switchLibraryMediaTab(tabs[index]);
+    tabs[index].focus();
 }
 
 // Settings redesign — tab switching + service accordions
 function switchSettingsTab(tab) {
+    const search = document.getElementById('stg-search-input');
+    const results = document.getElementById('stg-search-results');
+    if (search) search.value = '';
+    if (results) results.hidden = true;
+    if (tab === 'library') document.dispatchEvent(new CustomEvent('soulsync:library-settings-shown'));
     // Update tab bar
-    document.querySelectorAll('.stg-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+    document.querySelectorAll('#settings-page .stg-tab').forEach(t => {
+        const active = t.dataset.tab === tab;
+        t.classList.toggle('active', active);
+        if (active) t.setAttribute('aria-current', 'page');
+        else t.removeAttribute('aria-current');
+    });
     // Show/hide settings groups and section headers by data-stg attribute
     document.querySelectorAll('#settings-page [data-stg]').forEach(g => {
         g.style.display = g.dataset.stg === tab ? '' : 'none';
@@ -595,10 +1169,39 @@ function switchSettingsTab(tab) {
     if (tab === 'advanced' && typeof loadDbMaintenanceInfo === 'function') {
         try { loadDbMaintenanceInfo(); } catch (e) { }
     }
+    // The yt-dlp tile moved to the YouTube panel on the SOURCES tab - "it belongs
+    // where somebody debugging YouTube will actually look" - but this trigger
+    // stayed behind on Advanced. So the card sat on "Loading..." forever unless
+    // you happened to visit Advanced first, which is not a thing anyone does to
+    // read a version number. Load it wherever it now lives.
+    if ((tab === 'advanced' || tab === 'sources') && typeof loadYtdlpStatus === 'function') {
+        try { loadYtdlpStatus(); } catch (e) { }
+    }
+    if (tab === 'advanced' && typeof loadImageCacheStatus === 'function') {
+        try { loadImageCacheStatus(); } catch (e) { }
+    }
+    // #1822: sidebar weather lives on Appearance, MetaSync on Connections
+    if (tab === 'appearance' && typeof loadSidebarWeatherSettings === 'function') {
+        try { loadSidebarWeatherSettings(); } catch (e) { }
+    }
+    if (tab === 'connections' && typeof loadMetaSyncSettings === 'function') {
+        try { loadMetaSyncSettings(); } catch (e) { }
+    }
     // First time the Downloads tab is shown, auto-probe source status so the
     // dots reflect real connection state without a manual "Test all sources".
     if (tab === 'downloads' && typeof autoTestSourcesOnce === 'function') {
         autoTestSourcesOnce();
+    }
+    // The video chain lives in video.db and can change from the video side, so
+    // re-read on arrival rather than trusting what was rendered earlier.
+    if (tab === 'downloads') {
+        try { _dlchainLoad(); } catch (e) { /* widget is not on every page */ }
+    }
+    // Sources: the cards carry live status, so refresh them on arrival and let
+    // the same one-shot probe fill the dots in.
+    if (tab === 'sources') {
+        try { buildSourceTiles(); } catch (e) { /* tiles are cosmetic */ }
+        if (typeof autoTestSourcesOnce === 'function') autoTestSourcesOnce();
     }
     // Initialize live log viewer when switching to Logs tab
     if (tab === 'logs') {
@@ -610,7 +1213,338 @@ function switchSettingsTab(tab) {
     if (tab === 'connections') {
         try { applyServiceStatusGradients(); } catch (e) { }
     }
+
+    // Update active section title & subtitle in the detail header
+    const titles = {
+        connections: { title: 'Connections', sub: 'Media servers, accounts, Soulseek, MetaSync and notifications' },
+        sources: { title: 'Sources', sub: 'Configure and prioritize acquisition sources and indexers' },
+        downloads: { title: 'Downloads', sub: 'Queue behavior, retries, publishing, and what gets filtered out' },
+        quality: { title: 'Quality', sub: 'Audio and video formats, release profiles, and ladders' },
+        library: { title: 'Library', sub: 'Folders, file organization, tagging, and import' },
+        discovery: { title: 'Discovery', sub: 'Playlists, listening stats, recommendations and import lists' },
+        appearance: { title: 'Appearance', sub: 'Visual themes, accents, animations, and the sidebar weather' },
+        advanced: { title: 'System', sub: 'Security, database tools, caches, logging, the API and experimental features' },
+        logs: { title: 'Logs', sub: 'Live streaming logs and real-time operational diagnostics' }
+    };
+    const titleEl = document.getElementById('stg-active-title');
+    const subEl = document.getElementById('stg-active-sub');
+    if (titleEl && titles[tab]) titleEl.textContent = titles[tab].title;
+    if (subEl && titles[tab]) subEl.textContent = titles[tab].sub;
 }
+
+function filterSettings(query) {
+    const results = document.getElementById('stg-search-results');
+    if (!results) return;
+    const q = (query || '').trim().toLowerCase();
+    results.replaceChildren();
+    results.hidden = !q;
+    if (!q) return;
+    // Search only labels/help, never saved values or credentials. Navigation
+    // initializes the chosen category instead of exposing hidden, unloaded forms.
+    const matches = [];
+    document.querySelectorAll('#settings-page .settings-group[data-stg], #settings-page .settings-section-body[data-stg]').forEach(section => {
+        if (!(section.textContent || '').toLowerCase().includes(q)) return;
+        if (matches.some(item => item.contains(section))) return;
+        matches.push(section);
+    });
+    if (!matches.length) {
+        const empty = document.createElement('p');
+        empty.setAttribute('role', 'status');
+        empty.textContent = 'No settings found. Try a service name, folder, or feature.';
+        results.append(empty);
+    }
+    matches.slice(0, 10).forEach(section => {
+        const category = section.dataset.stg;
+        const tab = document.querySelector('#settings-page .stg-tab[data-tab="' + category + '"]');
+        const heading = section.querySelector('h3') || section.previousElementSibling?.querySelector('h3');
+        const title = heading?.textContent.trim() || category;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = (tab?.textContent.trim() || category) + ' — ' + title;
+        button.addEventListener('click', () => {
+            switchSettingsTab(category);
+            if (section.classList.contains('settings-section-body')) {
+                section.classList.remove('collapsed');
+                section.style.display = '';
+                const header = section.previousElementSibling;
+                header?.classList.remove('collapsed');
+                header?.setAttribute('aria-expanded', 'true');
+            }
+            const matchingLabel = Array.from(section.querySelectorAll('label, h4')).find(label => label.textContent.toLowerCase().includes(q));
+            const mediaPanel = matchingLabel?.closest('[role="tabpanel"]');
+            if (mediaPanel) {
+                const mediaTab = document.querySelector('[aria-controls="' + mediaPanel.id + '"]');
+                if (mediaTab) switchLibraryMediaTab(mediaTab);
+            }
+            section.tabIndex = -1;
+            section.focus({ preventScroll: true });
+            section.scrollIntoView({ block: 'start', behavior: 'auto' });
+            section.classList.add('stg-search-target');
+            window.setTimeout(() => section.classList.remove('stg-search-target'), 2000);
+        });
+        results.append(button);
+    });
+}
+window.filterSettings = filterSettings;
+
+// #1822: what a setting does, said under it. 204 settings hid that behind an
+// "i" you had to click. the first sentence of each help shows as a quiet line;
+// the icon stays only where there is more to read.
+function settingHelpFirstLine(text) {
+    const clean = (text || '').replace(/\s+/g, ' ').trim();
+    if (!clean) return { line: '', rest: false };
+    const match = clean.match(/^(.+?[.!?])(\s|$)/);
+    let line = match ? match[1] : clean;
+    if (line.length > 140) {
+        const cut = line.slice(0, 140);
+        line = cut.slice(0, Math.max(cut.lastIndexOf(' '), 80)).replace(/[,;:\s]+$/, '') + '…';
+    }
+    return { line, rest: line.length < clean.length };
+}
+
+function initSettingHelpLines(root) {
+    const scope = root || document.getElementById('settings-page');
+    if (!scope) return;
+    scope.querySelectorAll('.info-icon[onclick*="toggleSettingHelp"]').forEach(icon => {
+        if (icon.dataset.helpLine) return;
+        icon.dataset.helpLine = '1';
+        // only settings rows; a service card title keeps its icon as it is
+        const group = icon.closest('.form-group');
+        const body = group ? _settingHelpBody(icon) : null;
+        if (!body) return;
+        const { line, rest } = settingHelpFirstLine(body.textContent);
+        if (!line) return;
+        // a full-width last row of the setting itself, so it lines up with the
+        // label whatever the row's layout
+        const small = document.createElement('small');
+        small.className = 'stg-help-line';
+        const text = document.createElement('span');
+        text.className = 'stg-help-text';
+        text.textContent = line;
+        small.append(text);
+        group.append(small);
+        if (rest) {
+            // the "i" sits at the end of the line and still opens the rest
+            icon.__helpBody = body;
+            small.append(icon);
+        } else {
+            icon.hidden = true;
+        }
+    });
+}
+window.initSettingHelpLines = initSettingHelpLines;
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => initSettingHelpLines());
+} else {
+    initSettingHelpLines();
+}
+
+// #1868: what each naming template makes, under it, as you type. the server
+// renders it through the real path builder against a made-up release, so the
+// preview is what the importer would write, not a guess made in here.
+const PATH_PREVIEW_FIELDS = {
+    'template-album-path': 'album_path',
+    'template-compilation-path': 'compilation_path',
+    'template-single-path': 'single_path',
+    'template-playlist-item': 'playlist_item',
+    'template-video-path': 'video_path',
+    'template-sample-path': 'sample_path',
+    'disc-label': 'disc_label',
+};
+const PATH_PREVIEW_TOGGLES = ['auto-disambiguation', 'collab-artist-mode',
+    'artistletter-symbol-fallback', 'unicode-substitution', 'file-organization-enabled'];
+const PATH_PREVIEW_SCENARIOS = [
+    ['standard', 'Standard'],
+    ['explicit', 'Explicit'],
+    ['multidisc', 'Multi-disc'],
+    ['samename', 'Shared artist name'],
+];
+let _pathPreviewScenario = 'standard';
+let _pathPreviewTimer = null;
+let _pathPreviewSeq = 0;
+
+try {
+    const saved = localStorage.getItem('soulsync.pathPreviewScenario');
+    if (PATH_PREVIEW_SCENARIOS.some(([key]) => key === saved)) _pathPreviewScenario = saved;
+} catch (e) { /* storage blocked, standard it is */ }
+
+function _pathPreviewSlot(id) {
+    const input = document.getElementById(id);
+    const group = input?.closest('.form-group');
+    if (!group) return null;
+    let slot = group.querySelector(':scope > .path-preview');
+    if (!slot) {
+        slot = document.createElement('div');
+        slot.className = 'path-preview';
+        slot.setAttribute('aria-live', 'polite');
+        input.after(slot);
+    }
+    return slot;
+}
+
+function initPathPreview() {
+    const album = document.getElementById('template-album-path');
+    const group = album?.closest('.form-group');
+    if (!group || document.getElementById('path-preview-scenarios')) return;
+    const bar = document.createElement('div');
+    bar.id = 'path-preview-scenarios';
+    bar.className = 'path-preview-scenarios';
+    bar.setAttribute('role', 'radiogroup');
+    bar.setAttribute('aria-label', 'Example release your templates are filled in with');
+    const label = document.createElement('span');
+    label.className = 'path-preview-scenarios-label';
+    label.textContent = 'Your templates, filled in with an example release:';
+    bar.append(label);
+    PATH_PREVIEW_SCENARIOS.forEach(([key, text]) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.scenario = key;
+        button.setAttribute('role', 'radio');
+        button.textContent = text;
+        button.addEventListener('click', () => {
+            _pathPreviewScenario = key;
+            try { localStorage.setItem('soulsync.pathPreviewScenario', key); } catch (e) { /* fine */ }
+            refreshPathPreview(0);
+        });
+        bar.append(button);
+    });
+    group.before(bar);
+    Object.keys(PATH_PREVIEW_FIELDS).forEach(_pathPreviewSlot);
+}
+window.initPathPreview = initPathPreview;
+
+function refreshPathPreview(delay = 250) {
+    clearTimeout(_pathPreviewTimer);
+    _pathPreviewTimer = setTimeout(_fetchPathPreview, delay);
+}
+window.refreshPathPreview = refreshPathPreview;
+
+async function _fetchPathPreview() {
+    const bar = document.getElementById('path-preview-scenarios');
+    if (!bar) return;
+    bar.querySelectorAll('button').forEach(button => {
+        button.setAttribute('aria-checked', String(button.dataset.scenario === _pathPreviewScenario));
+    });
+    const on = document.getElementById('file-organization-enabled')?.checked !== false;
+    bar.hidden = !on;
+    Object.keys(PATH_PREVIEW_FIELDS).forEach(id => {
+        const slot = _pathPreviewSlot(id);
+        if (slot) slot.hidden = !on;
+    });
+    if (!on) return;
+
+    const value = (id) => document.getElementById(id)?.value ?? '';
+    const checked = (id) => document.getElementById(id)?.checked === true;
+    const body = {
+        scenario: _pathPreviewScenario,
+        templates: {
+            album_path: value('template-album-path'),
+            compilation_path: value('template-compilation-path'),
+            single_path: value('template-single-path'),
+            playlist_item: value('template-playlist-item'),
+            video_path: value('template-video-path'),
+            sample_path: value('template-sample-path'),
+        },
+        settings: {
+            auto_disambiguation: checked('auto-disambiguation'),
+            collab_artist_mode: value('collab-artist-mode') || 'first',
+            artistletter_symbol_fallback: checked('artistletter-symbol-fallback'),
+            unicode_substitution: checked('unicode-substitution'),
+            disc_label: value('disc-label') || 'Disc',
+        },
+    };
+    const seq = ++_pathPreviewSeq;
+    let data;
+    try {
+        const response = await fetch('/api/settings/path-preview', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || `HTTP ${response.status}`);
+    } catch (e) {
+        if (seq !== _pathPreviewSeq) return;
+        Object.keys(PATH_PREVIEW_FIELDS).forEach(id => {
+            _renderPathPreview(_pathPreviewSlot(id), { error: `Preview unavailable: ${e.message}` });
+        });
+        return;
+    }
+    // a slower answer to an older keystroke never paints over a newer one
+    if (seq !== _pathPreviewSeq) return;
+    Object.entries(PATH_PREVIEW_FIELDS).forEach(([id, key]) => {
+        const slot = _pathPreviewSlot(id);
+        let note = '';
+        if (key === 'disc_label') {
+            note = data.disc_label_used
+                ? 'Disc 2 of a two-disc album'
+                : 'Not used: your album template places the disc itself';
+        }
+        _renderPathPreview(slot, data.paths?.[key], note);
+        if (key === 'single_path' && data.paths?.single_as_album) {
+            _renderPathPreview(slot, data.paths.single_as_album,
+                'A release the source calls a single uses the album template until you change this one',
+                true);
+        }
+    });
+}
+
+function _renderPathPreview(slot, result, note = '', append = false) {
+    if (!slot) return;
+    if (!append) slot.replaceChildren();
+    const row = document.createElement('div');
+    row.className = 'path-preview-row';
+    if (!result || typeof result === 'object') {
+        row.classList.add('path-preview-error');
+        row.textContent = result?.error || 'Nothing to preview';
+        slot.append(row);
+        return;
+    }
+    const path = document.createElement('code');
+    path.className = 'path-preview-path';
+    const parts = String(result).split('/');
+    parts.forEach((part, index) => {
+        if (index) {
+            const sep = document.createElement('span');
+            sep.className = 'path-preview-sep';
+            sep.textContent = '/';
+            path.append(sep);
+        }
+        const seg = document.createElement('span');
+        seg.className = index === parts.length - 1 ? 'path-preview-file' : 'path-preview-folder';
+        seg.textContent = part;
+        path.append(seg);
+    });
+    path.title = result;
+    row.append(path);
+    if (note) {
+        const small = document.createElement('span');
+        small.className = 'path-preview-note';
+        small.textContent = note;
+        row.append(small);
+    }
+    slot.append(row);
+}
+
+document.addEventListener('input', (e) => {
+    if (PATH_PREVIEW_FIELDS[e.target.id]) refreshPathPreview();
+});
+document.addEventListener('change', (e) => {
+    if (PATH_PREVIEW_FIELDS[e.target.id] || PATH_PREVIEW_TOGGLES.includes(e.target.id)) refreshPathPreview(0);
+});
+
+// Ctrl/Cmd+K jumps to settings search while the settings page is open
+document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || (e.key || '').toLowerCase() !== 'k') return;
+    const page = document.getElementById('settings-page');
+    const input = document.getElementById('stg-search-input');
+    if (!page || !input || !page.offsetParent) return;
+    e.preventDefault();
+    input.focus();
+    input.select();
+});
+
+
 
 // ── Settings → Connections: per-service status gradient + verify wiring ──
 // Gradient shows green when the user has filled in credentials, yellow when empty.
@@ -746,6 +1680,16 @@ async function _stgRefreshAfterSave() {
         if (expandedServices.length > 0) {
             _stgVerifyServices(expandedServices, { force: true });
         }
+        const btn = document.getElementById('save-settings');
+        if (btn) {
+            const origHTML = btn.innerHTML;
+            btn.classList.add('is-saved');
+            btn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg><span>Saved</span>';
+            setTimeout(() => {
+                btn.classList.remove('is-saved');
+                btn.innerHTML = origHTML;
+            }, 2000);
+        }
     } catch (e) {
         console.warn('[Settings Status] Post-save refresh failed:', e);
     }
@@ -823,7 +1767,499 @@ function toggleAllServiceAccordions(btn) {
     }
 }
 
+
+// ══ Download chains ═════════════════════════════════════════════════════════
+// Music, video and audiobooks each store the same thing — a mode plus an
+// ordered list of sources — and each had its own editor: music a drag list with
+// status dots, audiobooks arrow buttons and toggles, video a third one inside a
+// pop-up on its own side. Same concept, three looks, three behaviours.
+//
+// One widget now, three adapters. The adapters are the only part that differs:
+// where the chain is read from and where it goes back to. Music and audiobooks
+// ride the page's existing settings save; video has its own endpoint because
+// its settings live in video.db, not app_config.
+//
+// A chain of one IS single-source mode. There is no separate switch, because
+// "mode" and "the list" were never independent — a user picking one source and
+// a user dragging one source into the chain mean the same thing.
+const DLCHAIN_KINDS = {
+    music: {
+        label: 'Music',
+        help: 'Downloads try each source in order, top first. One source means single-source mode; two or more is hybrid.',
+        sources: () => HYBRID_SOURCES.map(s => s.id),
+        meta: (id) => HYBRID_SOURCES.find(s => s.id === id) || { id, name: id, emoji: '🎵', icon: null },
+        read: () => ({ order: getHybridOrder() }),
+        write: (order) => {
+            // Feed the SAME module state the old list owned, so saveSettings and
+            // the Sources tiles keep working with no knowledge of this widget.
+            _hybridSourceOrder = order.slice();
+            HYBRID_SOURCES.forEach(s => { _hybridSourceEnabled[s.id] = order.includes(s.id); });
+            _hybridVisualOrder = null;
+            try { _syncHybridHiddenSelects(); } catch (e) { /* legacy selects */ }
+            const modeSel = document.getElementById('download-source-mode');
+            if (modeSel) modeSel.value = order.length > 1 ? 'hybrid' : (order[0] || 'soulseek');
+            try { buildHybridSourceList(); } catch (e) { /* keeps the tiles fresh */ }
+            debouncedAutoSaveSettings();
+        },
+    },
+    video: {
+        label: 'Video',
+        help: 'Video downloads try each source in order, top first. These settings are the video side\'s own and save immediately.',
+        sources: () => ['soulseek', 'torrent', 'usenet', 'extto'],
+        meta: (id) => ({
+            soulseek: { name: 'Soulseek', emoji: '🎵', icon: '/static/img/brands/slskd.png' },
+            torrent: { name: 'Torrent', emoji: '🧲', icon: null },
+            usenet: { name: 'Usenet', emoji: '📰', icon: null },
+            extto: { name: 'External', emoji: '🔗', icon: null },
+        }[id] || { name: id, emoji: '🎬', icon: null }),
+        read: async () => {
+            const r = await _ssJson('/api/video/downloads/config');
+            const cfg = r || {};
+            const order = (cfg.download_mode === 'hybrid' && Array.isArray(cfg.hybrid_order) && cfg.hybrid_order.length)
+                ? cfg.hybrid_order
+                : (cfg.download_mode ? [cfg.download_mode] : ['soulseek']);
+            return { order };
+        },
+        // Video has no page-wide save button, so it commits on change.
+        write: async (order) => {
+            const patch = order.length > 1
+                ? { download_mode: 'hybrid', hybrid_order: order }
+                : { download_mode: order[0] || 'soulseek', hybrid_order: order };
+            await _ssJson('/api/video/downloads/config', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(patch),
+            });
+        },
+    },
+    audiobooks: {
+        label: 'Audiobooks',
+        // A book is fetched as one whole folder, so the order decides who gets
+        // ASKED — the ranking still decides who wins.
+        help: 'Audiobooks are fetched as a whole folder, so the order decides which source is asked first, not which release wins.',
+        sources: () => AUDIOBOOK_SOURCES.slice(),
+        meta: (id) => ({ name: AUDIOBOOK_SOURCE_LABEL[id] || id, emoji: AUDIOBOOK_SOURCE_EMOJI[id] || '📚', icon: null }),
+        read: () => ({ order: _audiobookHybrid.slice() }),
+        write: (order) => {
+            _audiobookHybrid = order.slice();
+            const modeSel = document.getElementById('audiobook-download-mode');
+            if (modeSel) modeSel.value = order.length > 1 ? 'hybrid' : (order[0] || 'torrent');
+            try { renderAudiobookHybrid(); } catch (e) { /* legacy rows */ }
+            debouncedAutoSaveSettings();
+        },
+    },
+};
+
+let _dlchainKind = 'music';
+// The widget is deliberately shared: the Sources and Downloads tabs render on
+// the video side too. But the kind above is a music default, so a video user
+// opening Downloads landed on the MUSIC chain, with the music-only behaviour
+// group under it. Until they pick a tab themselves, follow the side they are on.
+let _dlchainKindChosen = false;
+
+function _dlchainSyncKindToSide() {
+    if (_dlchainKindChosen) return;
+    _dlchainKind = document.body.getAttribute('data-side') === 'video' ? 'video' : 'music';
+}
+let _dlchainOrder = [];
+let _dlchainDragging = null;
+
+// A source in the pool: the Sources-tab tile, shrunk. Same logo, same shape, so
+// the thing you drag looks like the thing you configure.
+// Groups in a fixed order, each with a count, then anything unlisted under
+// "Other" so a new source is never silently dropped from the pool.
+function _dlchainPoolHtml(kind, available) {
+    if (!available.length) return '<div class="dlchain-empty">Every source is in the chain.</div>';
+    const seen = new Set();
+    let html = '';
+    const group = (label, ids) => {
+        if (!ids.length) return '';
+        ids.forEach(id => seen.add(id));
+        return `<div class="dlchain-group">`
+             + `<div class="dlchain-group-head">`
+             + `<span class="dlchain-group-label">${escapeHtml(label)}</span>`
+             + `<span class="dlchain-group-count">${ids.length}</span></div>`
+             + `<div class="dlchain-group-row">${ids.map(id => _dlchainTile(kind, id)).join('')}</div>`
+             + `</div>`;
+    };
+    for (const g of DLCHAIN_GROUPS) html += group(g.label, g.ids.filter(id => available.includes(id)));
+    html += group('Other', available.filter(id => !seen.has(id)));
+    html += '<div class="dlchain-empty" id="dlchain-no-match" hidden>Nothing matches that.</div>';
+    return html;
+}
+
+// Filter state lives outside the render so re-rendering (adding a source, or
+// switching media tab) does not silently drop what was typed.
+let _dlchainQuery = '';
+
+function dlchainFilter(q) {
+    _dlchainQuery = String(q || '').trim().toLowerCase();
+    _dlchainApplyFilter();
+}
+window.dlchainFilter = dlchainFilter;
+
+function _dlchainApplyFilter() {
+    const pool = document.getElementById('dlchain-pool');
+    if (!pool) return;
+    const q = _dlchainQuery;
+    let shown = 0;
+    pool.querySelectorAll('.dlchain-tile').forEach(tile => {
+        const name = (tile.querySelector('.dlchain-tile-name')?.textContent || '').toLowerCase();
+        const hit = !q || name.includes(q) || (tile.dataset.src || '').toLowerCase().includes(q);
+        tile.hidden = !hit;
+        if (hit) shown++;
+    });
+    pool.querySelectorAll('.dlchain-group').forEach(g => {
+        g.hidden = !g.querySelector('.dlchain-tile:not([hidden])');
+    });
+    const none = document.getElementById('dlchain-no-match');
+    if (none) none.hidden = !(q && shown === 0);
+}
+
+function _dlchainTile(kind, id) {
+    const m = DLCHAIN_KINDS[kind].meta(id);
+    const inv = INVERT_BRAND_MARKS.has(id) ? ' is-inverted' : '';
+    const art = m.icon
+        ? `<img class="dlchain-mark${inv}" src="${m.icon}" alt="" onerror="this.outerHTML='<span class=\'emoji-icon\'>${m.emoji}</span>'">`
+        : `<span class="emoji-icon">${m.emoji}</span>`;
+    return `<button type="button" class="dlchain-tile" draggable="true" data-src="${id}" `
+         + `onclick="dlchainAdd('${id}')" title="Add ${escapeHtml(m.name)} to the chain">`
+         + `<span class="dlchain-tile-art">${art}</span>`
+         + `<span class="dlchain-tile-name">${escapeHtml(m.name)}</span></button>`;
+}
+
+// A step in the chain: the logo, and almost nothing else. The mark identifies
+// the source faster than its name does, and repeating the name in a column
+// already headed "download chain" earned its width back nowhere. The name still
+// reaches a screen reader, and a pointer, through the label.
+function _dlchainStep(kind, id, position, total) {
+    const m = DLCHAIN_KINDS[kind].meta(id);
+    const inv = INVERT_BRAND_MARKS.has(id) ? ' is-inverted' : '';
+    const art = m.icon
+        ? `<img class="dlchain-mark${inv}" src="${m.icon}" alt="" onerror="this.outerHTML='<span class=\'emoji-icon\'>${m.emoji}</span>'">`
+        : `<span class="emoji-icon">${m.emoji}</span>`;
+    const role = position === 1 ? 'Tried first' : `Fallback ${position - 1}`;
+    const name = escapeHtml(m.name);
+    // A full-width row rather than a logo in a box. The logo alone could not say
+    // which source a step was - an emoji shopping cart for Amazon Music is not
+    // recognisable - and a small centred card in a wide column left most of the
+    // column empty, which is what made the whole panel look unfinished.
+    return `<div class="dlchain-step" draggable="true" data-src="${id}" `
+         + `title="${name} - ${role}" aria-label="${name}, ${role}">`
+         + '<span class="dlchain-grip" aria-hidden="true">&#x283F;</span>'
+         + `<span class="dlchain-step-rank">${position}</span>`
+         + `<span class="dlchain-step-art">${art}</span>`
+         + '<span class="dlchain-step-text">'
+         + `<span class="dlchain-step-name">${name}</span>`
+         + `<span class="dlchain-step-role">${role}</span></span>`
+         + '<span class="dlchain-step-move">'
+         + `<button type="button" class="dlchain-move" title="Move ${name} up" aria-label="Move ${name} up"`
+         + `${position === 1 ? ' disabled' : ''} onclick="dlchainMove('${id}', -1)">&#9650;</button>`
+         + `<button type="button" class="dlchain-move" title="Move ${name} down" aria-label="Move ${name} down"`
+         + `${position === total ? ' disabled' : ''} onclick="dlchainMove('${id}', 1)">&#9660;</button>`
+         + '</span>'
+         + `<button type="button" class="dlchain-btn" title="Remove ${name} from the chain" `
+         + `aria-label="Remove ${name} from the chain" onclick="dlchainRemove('${id}')">&times;</button></div>`;
+}
+
+
+// Arrows because dragging is precise work on a touchpad and impossible on a
+// phone; the drag stays for people who prefer it.
+function dlchainMove(id, delta) {
+    const i = _dlchainOrder.indexOf(id);
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= _dlchainOrder.length) return;
+    [_dlchainOrder[i], _dlchainOrder[j]] = [_dlchainOrder[j], _dlchainOrder[i]];
+    _dlchainCommit();
+}
+window.dlchainMove = dlchainMove;
+
+function renderDownloadChain() {
+    const kind = _dlchainKind;
+    const spec = DLCHAIN_KINDS[kind];
+    const tabs = document.getElementById('dlchain-tabs');
+    const pool = document.getElementById('dlchain-pool');
+    const list = document.getElementById('dlchain-list');
+    if (!spec || !tabs || !pool || !list) return;
+
+    tabs.innerHTML = Object.keys(DLCHAIN_KINDS).map(k =>
+        `<button type="button" role="tab" class="dlchain-tab${k === kind ? ' active' : ''}" `
+        + `onclick="switchDownloadChain('${k}')">${DLCHAIN_KINDS[k].label}</button>`).join('');
+    const help = document.getElementById('dlchain-help');
+    if (help) help.textContent = spec.help;
+
+    const all = spec.sources();
+    const order = _dlchainOrder.filter(id => all.includes(id));
+    const available = all.filter(id => !order.includes(id));
+
+    // Steps joined by connectors, then ONE empty slot at the end. One, not a
+    // row of placeholders: the question a person has when they look at this is
+    // "where does the next one go", and several identical empty boxes answer it
+    // worse than a single obvious one. Sized and worded like the automation
+    // builder's slots, which is the thing in this app that already gets it
+    // right — a big dashed target that says what to put in it and why.
+    const steps = order.map((id, i) => _dlchainStep(kind, id, i + 1, order.length));
+    const lastName = order.length ? spec.meta(order[order.length - 1]).name : '';
+    const slotTitle = order.length
+        ? `Drag a source here — tried after ${escapeHtml(lastName)}`
+        : 'Drag a source here — this one is tried first';
+    const slotHint = order.length
+        ? 'It only runs if everything above it came up empty.'
+        : 'Downloads need at least one source. Add more to fall back in order.';
+    const flow = steps.join('<div class="dlchain-connector"></div>')
+        + (steps.length ? '<div class="dlchain-connector"></div>' : '')
+        + `<div class="dlchain-slot${order.length ? '' : ' first'}" id="dlchain-slot">`
+        + `<span class="dlchain-slot-title">${slotTitle}</span>`
+        + `<span class="dlchain-slot-hint">${slotHint}</span>`
+        + '</div>';
+    list.innerHTML = flow;
+
+    pool.innerHTML = _dlchainPoolHtml(kind, available);
+    _dlchainApplyFilter();
+
+    // The behaviour group is download_source.* — music-wide. Showing it under a
+    // video or audiobook chain would say it applies there. Hide the WRAPPER, not
+    // the inner block, or the "Download behaviour" heading stays behind on its own.
+    const behaviour = document.getElementById('dlchain-behaviour');
+    if (behaviour) behaviour.hidden = kind !== 'music';
+
+    const hint = document.getElementById('dlchain-mode-hint');
+    if (hint) {
+        hint.textContent = order.length > 1 ? `hybrid — ${order.length} sources`
+            : order.length === 1 ? 'single source' : 'nothing selected';
+    }
+    _dlchainWireDrag();
+}
+window.renderDownloadChain = renderDownloadChain;
+
+function switchDownloadChain(kind) {
+    if (!DLCHAIN_KINDS[kind]) return;
+    _dlchainKindChosen = true;   // an explicit pick outranks the side default
+    _dlchainKind = kind;
+    _dlchainLoad();
+}
+window.switchDownloadChain = switchDownloadChain;
+
+async function _dlchainLoad() {
+    _dlchainSyncKindToSide();
+    const spec = DLCHAIN_KINDS[_dlchainKind];
+    if (!spec) return;
+    try {
+        const state = await spec.read();
+        _dlchainOrder = (state && Array.isArray(state.order)) ? state.order.slice() : [];
+    } catch (e) {
+        _dlchainOrder = [];
+    }
+    renderDownloadChain();
+}
+window.loadDownloadChain = _dlchainLoad;
+
+function _dlchainCommit() {
+    const spec = DLCHAIN_KINDS[_dlchainKind];
+    renderDownloadChain();
+    try {
+        const r = spec.write(_dlchainOrder.slice());
+        if (r && typeof r.catch === 'function') {
+            r.catch(() => { if (typeof showToast === 'function') showToast('Could not save the download chain', 'error'); });
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not save the download chain', 'error');
+    }
+}
+
+function dlchainAdd(id) {
+    if (!_dlchainOrder.includes(id)) _dlchainOrder.push(id);
+    _dlchainCommit();
+}
+window.dlchainAdd = dlchainAdd;
+
+function dlchainRemove(id) {
+    // An empty chain means nothing can download at all, which is never what a
+    // drag was trying to say. The video side already refused this; now all three do.
+    if (_dlchainOrder.length <= 1) {
+        if (typeof showToast === 'function') showToast('Keep at least one source — downloads need somewhere to go', 'info');
+        return;
+    }
+    _dlchainOrder = _dlchainOrder.filter(x => x !== id);
+    _dlchainCommit();
+}
+window.dlchainRemove = dlchainRemove;
+
+function _dlchainWireDrag() {
+    const pool = document.getElementById('dlchain-pool');
+    const list = document.getElementById('dlchain-list');
+    if (!pool || !list) return;
+
+    const dragged = () => _dlchainDragging;
+
+    // Pool tiles and chain steps are both draggable and both carry data-src.
+    document.querySelectorAll('#download-chain-widget [data-src]').forEach(item => {
+        item.addEventListener('dragstart', (e) => {
+            _dlchainDragging = item.dataset.src;
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', item.dataset.src);
+            item.classList.add('dragging');
+        });
+        item.addEventListener('dragend', () => {
+            _dlchainDragging = null;
+            item.classList.remove('dragging');
+            document.querySelectorAll('#download-chain-widget .drag-over')
+                .forEach(el => el.classList.remove('drag-over'));
+        });
+    });
+
+    // Dropping ON a step inserts before it — that is how you reorder.
+    list.querySelectorAll('.dlchain-step').forEach(step => {
+        step.addEventListener('dragover', (e) => {
+            e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+            step.classList.add('drag-over');
+        });
+        step.addEventListener('dragleave', () => step.classList.remove('drag-over'));
+        step.addEventListener('drop', (e) => {
+            e.preventDefault(); e.stopPropagation();
+            step.classList.remove('drag-over');
+            const src = e.dataTransfer.getData('text/plain') || dragged();
+            const target = step.dataset.src;
+            if (!src || src === target) return;
+            _dlchainOrder = _dlchainOrder.filter(x => x !== src);
+            const at = _dlchainOrder.indexOf(target);
+            _dlchainOrder.splice(at < 0 ? _dlchainOrder.length : at, 0, src);
+            _dlchainCommit();
+        });
+    });
+
+    // The slot at the end: always append.
+    const slot = document.getElementById('dlchain-slot');
+    if (slot) {
+        slot.addEventListener('dragover', (e) => {
+            e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+            slot.classList.add('drag-over');
+        });
+        slot.addEventListener('dragleave', () => slot.classList.remove('drag-over'));
+        slot.addEventListener('drop', (e) => {
+            e.preventDefault(); e.stopPropagation();
+            slot.classList.remove('drag-over');
+            const src = e.dataTransfer.getData('text/plain') || dragged();
+            if (!src) return;
+            _dlchainOrder = _dlchainOrder.filter(x => x !== src);
+            _dlchainOrder.push(src);
+            _dlchainCommit();
+        });
+    }
+
+    // Anywhere else in the chain column appends too, so a slightly-off drop
+    // still does the obvious thing instead of nothing.
+    list.addEventListener('dragover', (e) => { e.preventDefault(); list.classList.add('drag-over'); });
+    list.addEventListener('dragleave', () => list.classList.remove('drag-over'));
+    list.addEventListener('drop', (e) => {
+        e.preventDefault();
+        list.classList.remove('drag-over');
+        const src = e.dataTransfer.getData('text/plain') || dragged();
+        if (!src || _dlchainOrder.includes(src)) return;
+        _dlchainOrder.push(src);
+        _dlchainCommit();
+    });
+
+    // Dragging a step back to the pool removes it.
+    pool.addEventListener('dragover', (e) => { e.preventDefault(); pool.classList.add('drag-over'); });
+    pool.addEventListener('dragleave', () => pool.classList.remove('drag-over'));
+    pool.addEventListener('drop', (e) => {
+        e.preventDefault();
+        pool.classList.remove('drag-over');
+        const src = e.dataTransfer.getData('text/plain') || dragged();
+        if (src && _dlchainOrder.includes(src)) dlchainRemove(src);
+    });
+}
+
 // ── Hybrid source priority list (drag-and-drop) ──
+// ---- Audiobook download sources ----
+// Same three sources the video side offers, and the same .hybrid-source-item
+// markup and CSS music and video already use, so all three read alike. No
+// album-level/track-level badge: that is a music-only idea, a book is always
+// fetched as one whole folder.
+//
+// Torrent first by default. The others are ranked against it afterwards
+// anyway, so the order decides who gets ASKED, not who wins.
+const AUDIOBOOK_SOURCES = ['torrent', 'usenet', 'soulseek'];
+const AUDIOBOOK_SOURCE_LABEL = { torrent: 'Torrent', usenet: 'Usenet', soulseek: 'Soulseek' };
+const AUDIOBOOK_SOURCE_EMOJI = { torrent: '\u{1F9F2}', usenet: '\u{1F4F0}', soulseek: '\u{1F3B5}' };
+let _audiobookHybrid = ['torrent', 'usenet', 'soulseek'];
+
+function renderAudiobookHybrid() {
+    const host = document.getElementById('audiobook-hybrid-rows');
+    if (!host) return;
+    const enabled = _audiobookHybrid.filter(s => AUDIOBOOK_SOURCES.includes(s));
+    const disabled = AUDIOBOOK_SOURCES.filter(s => !enabled.includes(s));
+    host.innerHTML = enabled.concat(disabled).map(src => {
+        const i = enabled.indexOf(src);
+        const on = i >= 0;
+        return `<div class="hybrid-source-item${on ? '' : ' disabled'}">` +
+            '<span class="hybrid-source-arrows">' +
+            `<button type="button" class="hybrid-arrow-btn" onclick="moveAudiobookSource('${src}', -1)"${(!on || i === 0) ? ' disabled' : ''} title="Move up">\u25B2</button>` +
+            `<button type="button" class="hybrid-arrow-btn" onclick="moveAudiobookSource('${src}', 1)"${(!on || i === enabled.length - 1) ? ' disabled' : ''} title="Move down">\u25BC</button>` +
+            '</span>' +
+            `<span class="hybrid-source-icon emoji-icon">${AUDIOBOOK_SOURCE_EMOJI[src] || ''}</span>` +
+            `<span class="hybrid-source-name">${AUDIOBOOK_SOURCE_LABEL[src]}</span>` +
+            `<span class="hybrid-source-priority">${on ? (i + 1) : ''}</span>` +
+            `<label class="hybrid-source-toggle"><input type="checkbox" onchange="toggleAudiobookSource('${src}', this.checked)"${on ? ' checked' : ''}><span class="toggle-track"></span></label>` +
+            '</div>';
+    }).join('');
+}
+
+function moveAudiobookSource(src, direction) {
+    const i = _audiobookHybrid.indexOf(src);
+    const j = i + direction;
+    if (i < 0 || j < 0 || j >= _audiobookHybrid.length) return;
+    [_audiobookHybrid[i], _audiobookHybrid[j]] = [_audiobookHybrid[j], _audiobookHybrid[i]];
+    renderAudiobookHybrid();
+}
+
+function toggleAudiobookSource(src, on) {
+    if (on) {
+        if (!_audiobookHybrid.includes(src)) _audiobookHybrid.push(src);
+    } else {
+        // Keep at least one, the same way video does. An empty chain means
+        // no book can ever be found, with nothing on screen saying why.
+        if (_audiobookHybrid.length <= 1) { renderAudiobookHybrid(); return; }
+        _audiobookHybrid = _audiobookHybrid.filter(s => s !== src);
+    }
+    renderAudiobookHybrid();
+}
+
+// the sources audiobooks actually download through: the chain in hybrid mode,
+// the one picked source otherwise.
+function _audiobookActiveSources() {
+    const mode = document.getElementById('audiobook-download-mode')?.value;
+    if (!mode) return [];
+    const ids = mode === 'hybrid' ? _audiobookHybrid : [mode];
+    return ids.filter(s => AUDIOBOOK_SOURCES.includes(s));
+}
+
+// The chain only applies in hybrid mode; a single-source mode has nothing to
+// order, so showing the rows there would imply a choice that does nothing.
+function onAudiobookModeChange() {
+    const mode = document.getElementById('audiobook-download-mode')?.value || 'hybrid';
+    const container = document.getElementById('audiobook-hybrid-container');
+    if (container) container.style.display = mode === 'hybrid' ? '' : 'none';
+    if (mode === 'hybrid') renderAudiobookHybrid();
+}
+
+// Dark-foreground brand marks that vanish against the dark UI. The app's
+// canonical recipe for "render this image as pure white" is
+// `brightness(0) invert(1)` — already used for the equalizer and auto-sync icons.
+const INVERT_BRAND_MARKS = new Set(['tidal', 'qobuz', 'soundcloud']);
+
+// The pool is grouped rather than one flat grid: eleven music sources is more
+// than anyone scans comfortably, and "which of these is a streaming service"
+// is the question people actually arrive with. Ids not listed here fall into
+// "Other", so adding a source to HYBRID_SOURCES can never make it disappear.
+const DLCHAIN_GROUPS = [
+    { label: 'Peer-to-peer', ids: ['soulseek'] },
+    { label: 'Streaming services', ids: ['tidal', 'qobuz', 'deezer_dl', 'soundcloud', 'hifi'] },
+    { label: 'Public video', ids: ['youtube'] },
+    { label: 'Torrent & Usenet', ids: ['torrent', 'usenet', 'extto'] },
+    { label: 'Library manager', ids: ['lidarr'] },
+];
+
 const HYBRID_SOURCES = [
     { id: 'soulseek', name: 'Soulseek', icon: '/static/img/brands/slskd.png', emoji: '🎵' },
     { id: 'youtube', name: 'YouTube', icon: '/static/img/brands/youtube.svg', emoji: '▶️' },
@@ -831,16 +2267,32 @@ const HYBRID_SOURCES = [
     { id: 'qobuz', name: 'Qobuz', icon: '/static/img/brands/qobuz.svg', emoji: '🎧' },
     { id: 'hifi', name: 'HiFi', icon: null, emoji: '🎶' },
     { id: 'deezer_dl', name: 'Deezer', icon: '/static/img/brands/deezer.png', emoji: '🎧' },
-    { id: 'amazon', name: 'Amazon Music', icon: null, emoji: '🛒' },
     { id: 'lidarr', name: 'Lidarr', icon: null, emoji: '📦' },
     { id: 'soundcloud', name: 'SoundCloud', icon: '/static/img/brands/soundcloud.png', emoji: '☁️' },
     { id: 'torrent', name: 'Torrent', icon: null, emoji: '🧲' },
     { id: 'usenet', name: 'Usenet', icon: null, emoji: '📰' },
 ];
+
+// Prowlarr is not in HYBRID_SOURCES because it is not a link in the download
+// chain - it is the indexer both torrent and usenet search through - but it
+// very much is something you configure to download, so it earns a tile.
+//
+// There used to be a SHARED_SOURCES set here naming the four tiles the video
+// side was allowed to see. The Sources tab is fully shared now: every side sees
+// every tile, because hiding Tidal from someone standing on the video side just
+// means they cannot fix their Tidal credentials without switching sides first.
+const EXTRA_SOURCE_TILES = [
+    { id: 'prowlarr', name: 'Indexers', icon: null, emoji: '🔎' },
+];
 const ALBUM_LEVEL_HYBRID_SOURCES = new Set(['soulseek', 'torrent', 'usenet']);
 
+// sources that can't be picked anymore. amazon ran through the public t2tunes
+// proxy and that site is gone (#1300). a saved chain that still names one gets
+// it dropped on load, so the next save writes a chain that actually works.
+const RETIRED_DOWNLOAD_SOURCES = new Set(['amazon']);
+
 let _hybridSourceOrder = ['soulseek', 'youtube'];
-let _hybridSourceEnabled = { soulseek: true, youtube: true, tidal: false, qobuz: false, hifi: false, deezer_dl: false, amazon: false, lidarr: false, soundcloud: false, torrent: false, usenet: false };
+let _hybridSourceEnabled = { soulseek: true, youtube: true, tidal: false, qobuz: false, hifi: false, deezer_dl: false, lidarr: false, soundcloud: false, yandex: false, torrent: false, usenet: false };
 // Enabled-but-not-fully-configured sources (per the server's status):
 // shown with a "needs setup" chip instead of being silently unchecked.
 let _hybridSourceUnready = {};
@@ -849,38 +2301,369 @@ let _hybridVisualOrder = null; // Full visual order including disabled sources
 // open from its row), so the long per-source config blocks don't all stack up.
 let _expandedHybridSource = null;
 
-function toggleHybridSourceConfig(srcId) {
-    _expandedHybridSource = (_expandedHybridSource === srcId) ? null : srcId;
-    buildHybridSourceList();
-    updateDownloadSourceUI();
-    // Bring the freshly opened config panel into view.
-    if (_expandedHybridSource) {
-        const map = {
-            soulseek: 'soulseek-settings-container', youtube: 'youtube-settings-container',
-            tidal: 'tidal-download-settings-container', qobuz: 'qobuz-settings-container',
-            hifi: 'hifi-download-settings-container', deezer_dl: 'deezer-download-settings-container',
-            amazon: 'amazon-download-settings-container', lidarr: 'lidarr-download-settings-container',
-            soundcloud: 'soundcloud-download-settings-container', torrent: 'prowlarr-source-redirect',
-            usenet: 'prowlarr-source-redirect',
-        };
-        const el = document.getElementById(map[_expandedHybridSource]);
-        if (el) setTimeout(() => el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 60);
-    }
+// ── Sources tab ─────────────────────────────────────────────────────────────
+// The cards are rendered from HYBRID_SOURCES, the same registry the chain rows
+// on the Downloads tab read. One list of names, icons and ids for both views,
+// so the two cannot drift into disagreeing about what a source is called or
+// what its logo is.
+const SOURCE_CARD_HINTS = {
+    soulseek: 'slskd connection, timeouts, peers',
+    youtube: 'Cookies, transcoding, rate limit',
+    tidal: 'Account and stream quality',
+    qobuz: 'Account and stream quality',
+    hifi: 'Public API instances',
+    deezer_dl: 'ARL token',
+    soundcloud: 'Anonymous — nothing to set up',
+    lidarr: 'URL and API key',
+    torrent: 'Runs on Prowlarr plus a torrent client',
+    usenet: 'Runs on Prowlarr plus a usenet client',
+    prowlarr: 'Prowlarr — searched by both torrent and usenet',
+};
+
+function toggleSourceCard(header) {
+    // kept so an older cached page cannot throw; tiles replaced the row cards.
+    if (header && header.dataset) openSourceModal(header.dataset.sourceId);
 }
+window.toggleSourceCard = toggleSourceCard;
+
+// One tile per source: logo, name under it, and the state that matters at a
+// glance. Rendered from HYBRID_SOURCES so the tiles and the chain rows on the
+// Downloads tab cannot disagree about a name or a logo.
+function _srcTileMarkup(src, order) {
+    const pos = order.indexOf(src.id);
+    const inChain = pos !== -1;
+    const state = (_hybridSourceStatus && _hybridSourceStatus[src.id]) || 'unknown';
+    const unready = _hybridSourceUnready && _hybridSourceUnready[src.id];
+    const said = _ssLastTestMessage[src.id];
+    const dotLabel = { unknown: 'Not tested yet', testing: 'Testing…', ok: 'Connected',
+                       warn: said || 'Working, but needs attention',
+                       fail: said || 'Connection failed',
+                       na: 'No connection test for this source' }[state];
+    // Same brand marks that get inverted in the download-chain widget: these
+    // logos are dark-on-light artwork and disappear against a dark tile. They
+    // were only inverted in the chain, so the same source looked different in
+    // the two places it appears.
+    const srcInv = INVERT_BRAND_MARKS.has(src.id) ? ' class="is-inverted"' : '';
+    const art = src.icon
+        ? `<img${srcInv} src="${src.icon}" alt="" onerror="this.outerHTML='<span class=\'emoji-icon\'>${src.emoji}</span>'">`
+        : `<span class="emoji-icon">${src.emoji}</span>`;
+    // Prowlarr is never "in the chain" — it is what the chain's torrent and
+    // usenet links search through — so the chain chip would read as a fault.
+    const chip = src.id === 'prowlarr'
+        ? '<span class="src-tile-chip">torrent &amp; usenet</span>'
+        : (unready || state === 'warn')
+        ? '<span class="src-tile-chip src-tile-chip--warn">needs setup</span>'
+        : inChain
+            ? `<span class="src-tile-chip src-tile-chip--on">#${pos + 1}</span>`
+            : '<span class="src-tile-chip">not in chain</span>';
+    return `<button type="button" class="src-tile${inChain ? ' is-active' : ''}" `
+         + `data-source-id="${src.id}" onclick="openSourceModal('${src.id}')" `
+         + `title="Configure ${escapeHtml(src.name)}">`
+         + `<span class="src-tile-dot hss-${state}" title="${escapeHtml(String(dotLabel))}"></span>`
+         + `<span class="src-tile-art">${art}</span>`
+         + `<span class="src-tile-name">${escapeHtml(src.name)}</span>`
+         + chip
+         + '</button>';
+}
+
+// Two groups rather than one long ragged wrap: what is actually downloading for
+// you, in the order it is tried, then everything else. Eleven tiles in a single
+// auto-fill grid wrapped 7-then-4 and read as an accident, and registry order
+// put "#4" before "#2", which made the chain numbers look wrong.
+function buildSourceTiles() {
+    const grid = document.getElementById('source-tile-grid');
+    if (!grid) return;
+    const order = (typeof getHybridOrder === 'function' ? getHybridOrder() : []) || [];
+
+    // Only sources that own a config panel get a tile. No side filtering: this
+    // tab is shared and shows the same thing on both sides.
+    const configurable = HYBRID_SOURCES.concat(EXTRA_SOURCE_TILES)
+        .filter(src => SOURCE_CONFIG_ID_BY_SRC[src.id]);
+
+    const section = (label, hint, list) => list.length
+        ? `<div class="src-group"><div class="src-group-head">`
+          + `<span class="src-group-label">${label}</span>`
+          + `<span class="src-group-count">${list.length}</span>`
+          + `<span class="src-group-hint">${hint}</span></div>`
+          + `<div class="src-tile-row">${list.map(src => _srcTileMarkup(src, order)).join('')}</div></div>`
+        : '';
+
+    // Indexers are their own kind of thing: not a source you pick, but the
+    // catalogue the torrent and usenet links search. Grouped separately so the
+    // list does not imply Prowlarr is a source you could add to the chain.
+    const isIndexer = (src) => EXTRA_SOURCE_TILES.some(x => x.id === src.id);
+    const indexers = configurable.filter(isIndexer);
+    const sources = configurable.filter(src => !isIndexer(src));
+
+    const inChain = sources
+        .filter(src => order.includes(src.id))
+        .sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    const available = sources.filter(src => !order.includes(src.id));
+
+    grid.innerHTML =
+        section('In your chain', 'tried in this order', inChain) +
+        section('Available', 'configure now, add to the chain when you want it', available) +
+        section('Indexers', 'searched by torrent and usenet', indexers);
+}
+window.buildSourceTiles = buildSourceTiles;
+
+// Live auth/connection checks, run when a source is opened rather than on every
+// settings redraw. Best-effort: a probe that throws must not stop the modal.
+const SOURCE_OPEN_PROBE = {
+    tidal: () => checkTidalDownloadAuthStatus(),
+    qobuz: () => checkQobuzAuthStatus(),
+    hifi: () => testHiFiConnection(),
+    soundcloud: () => testSoundcloudConnection(),
+};
+
+function probeSourceOnOpen(srcId) {
+    const probe = SOURCE_OPEN_PROBE[srcId];
+    if (!probe) return;
+    try { probe(); } catch (e) { /* the modal still opens */ }
+}
+
+let _openSourceModalId = null;
+
+// The panel is MOVED into the modal rather than copied. Cloning would put a
+// second element with the same id in the document, and every getElementById in
+// saveSettings would then read whichever one the browser handed back first —
+// silently saving the copy the user never typed into.
+// Test one source from its own modal and SHOW what the server said. The
+// summary toast only ever gave a count, and the tile dot only a colour, so a
+// source that was amber for a reason you could act on had no way of telling
+// you what the reason was.
+async function testOneSource(srcId) {
+    const btn = document.getElementById('src-modal-test');
+    const out = document.getElementById('src-modal-result');
+    const probe = HYBRID_SOURCE_PROBE[srcId];
+    if (!out) return;
+    if (!probe) {
+        out.className = 'src-modal-result is-na';
+        out.textContent = 'This source has no connection test.';
+        return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = 'Testing…'; }
+    _hybridSourceStatus[srcId] = 'testing';
+    out.className = 'src-modal-result is-testing';
+    out.textContent = 'Testing…';
+    let good = false;
+    try {
+        good = await probe();
+    } catch (e) {
+        good = false;
+        _ssLastTestMessage[srcId] = String((e && e.message) || e || 'Test failed');
+    }
+    const warned = !!_ssLastTestWarned[srcId];
+    const state = good ? (warned ? 'warn' : 'ok') : 'fail';
+    _hybridSourceStatus[srcId] = state;
+    const said = _ssLastTestMessage[srcId];
+    out.className = `src-modal-result is-${state}`;
+    out.textContent = said || (good ? 'Connected.' : 'Connection failed.');
+    document.getElementById('src-modal-meta').innerHTML =
+        `<span class="src-tile-dot hss-${state}"></span>`;
+    if (btn) { btn.disabled = false; btn.textContent = 'Test'; }
+    buildSourceTiles();
+}
+window.testOneSource = testOneSource;
+
+function openSourceModal(srcId) {
+    // opening the YouTube card is the moment its yt-dlp version matters
+    if (srcId === 'youtube' && typeof loadYtdlpStatus === 'function') {
+        try { loadYtdlpStatus(); } catch (e) { }
+    }
+    const containerId = SOURCE_CONFIG_ID_BY_SRC[srcId];
+    const overlay = document.getElementById('source-config-modal');
+    const body = document.getElementById('src-modal-body');
+    const panel = containerId && document.getElementById(containerId);
+    if (!overlay || !body || !panel) return;
+
+    const src = HYBRID_SOURCES.find(x => x.id === srcId) || { name: srcId, emoji: '🎵', icon: null };
+    document.getElementById('src-modal-title').textContent = src.name;
+    document.getElementById('src-modal-sub').textContent = SOURCE_CARD_HINTS[srcId] || '';
+    const iconEl = document.getElementById('src-modal-icon');
+    iconEl.innerHTML = src.icon
+        ? `<img src="${src.icon}" alt="" onerror="this.outerHTML='<span class=\'emoji-icon\'>${src.emoji}</span>'">`
+        : `<span class="emoji-icon">${src.emoji}</span>`;
+    const state = (_hybridSourceStatus && _hybridSourceStatus[srcId]) || 'unknown';
+    document.getElementById('src-modal-meta').innerHTML = `<span class="src-tile-dot hss-${state}"></span>`;
+
+    const testBtn = document.getElementById('src-modal-test');
+    if (testBtn) {
+        testBtn.disabled = false;
+        testBtn.textContent = 'Test';
+        testBtn.style.display = HYBRID_SOURCE_PROBE[srcId] ? '' : 'none';
+        testBtn.onclick = () => testOneSource(srcId);
+    }
+    // Carry the last result in rather than showing a blank slate: an amber dot
+    // on the tile should still explain itself once you are inside.
+    const out = document.getElementById('src-modal-result');
+    if (out) {
+        const said = _ssLastTestMessage[srcId];
+        if (said && state !== 'unknown') {
+            out.className = `src-modal-result is-${state}`;
+            out.textContent = said;
+        } else {
+            out.className = 'src-modal-result';
+            out.textContent = '';
+        }
+    }
+
+    body.appendChild(panel);
+    overlay.hidden = false;
+    document.body.classList.add('src-modal-open');
+    _openSourceModalId = containerId;
+    probeSourceOnOpen(srcId);
+    setTimeout(() => {
+        const first = body.querySelector('input:not([type=hidden]), select, textarea');
+        if (first) first.focus();
+    }, 40);
+}
+window.openSourceModal = openSourceModal;
+
+function closeSourceModal() {
+    const overlay = document.getElementById('source-config-modal');
+    const home = document.getElementById('source-config-home');
+    if (!overlay) return;
+    // Put the panel back before hiding, so its id never sits inside a hidden
+    // modal where a later open would move an already-moved node.
+    if (_openSourceModalId && home) {
+        const panel = document.getElementById(_openSourceModalId);
+        if (panel) home.appendChild(panel);
+    }
+    _openSourceModalId = null;
+    overlay.hidden = true;
+    document.body.classList.remove('src-modal-open');
+    // A field edited seconds before closing would otherwise sit on the 2s
+    // auto-save timer with the modal already gone and nothing on screen saying
+    // anything is pending. Land it now.
+    if (typeof settingsAutoSaveTimer !== 'undefined' && settingsAutoSaveTimer) {
+        clearTimeout(settingsAutoSaveTimer);
+        settingsAutoSaveTimer = null;
+        saveSettings(true);
+    }
+    buildSourceTiles();
+}
+window.closeSourceModal = closeSourceModal;
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        const overlay = document.getElementById('source-config-modal');
+        if (overlay && !overlay.hidden) closeSourceModal();
+    }
+});
+
+
+// src id -> the config panel that belongs to it. Only sources with a panel get
+// a tile; torrent and usenet share one, and it is filed under torrent.
+const SOURCE_CONFIG_ID_BY_SRC = {
+    soulseek: 'soulseek-settings-container', youtube: 'youtube-settings-container',
+    tidal: 'tidal-download-settings-container', qobuz: 'qobuz-settings-container',
+    hifi: 'hifi-download-settings-container', deezer_dl: 'deezer-download-settings-container',
+    lidarr: 'lidarr-download-settings-container',
+    soundcloud: 'soundcloud-download-settings-container',
+    // Usenet is its own link in the chain and shares the Prowlarr panel. It had
+    // no tile at all, so a usenet user saw nothing to click.
+    torrent: 'torrent-client-settings-container',
+    usenet: 'usenet-client-settings-container',
+    prowlarr: 'prowlarr-settings-container',
+};
+
+const HYBRID_SOURCE_CONFIG_ID = {
+    soulseek: 'soulseek-settings-container', youtube: 'youtube-settings-container',
+    tidal: 'tidal-download-settings-container', qobuz: 'qobuz-settings-container',
+    hifi: 'hifi-download-settings-container', deezer_dl: 'deezer-download-settings-container',
+    lidarr: 'lidarr-download-settings-container',
+    soundcloud: 'soundcloud-download-settings-container',
+    torrent: 'torrent-client-settings-container',
+    usenet: 'usenet-client-settings-container',
+    prowlarr: 'prowlarr-settings-container',
+};
+
+// The cog on a chain row. The config is on the Sources tab now, so this crosses
+// to it and opens that one source rather than expanding a panel in place.
+function toggleHybridSourceConfig(srcId) {
+    if (typeof switchSettingsTab === 'function') switchSettingsTab('sources');
+    // torrent and usenet share one panel
+    openSourceModal(srcId === 'usenet' ? 'torrent' : srcId);
+}
+
+// Open one source's accordion on the Sources tab and scroll it into view.
+// Collapsed state is carried on BOTH the header and the body (that is what the
+// shared accordion onclick toggles), so opening one by hand has to set both or
+// the next click reads as "already open" and closes nothing.
+function openSourceConfig(containerId) {
+    const srcId = Object.keys(SOURCE_CONFIG_ID_BY_SRC)
+        .find(k => SOURCE_CONFIG_ID_BY_SRC[k] === containerId);
+    if (srcId) openSourceModal(srcId);
+}
+window.openSourceConfig = openSourceConfig;
 
 // ── Per-source live connection status (shown as a dot in the hybrid list and
 // driven by the "Test all sources" button). srcId -> 'unknown'|'testing'|'ok'|'fail'|'na'
 let _hybridSourceStatus = {};
 
+// Chromium-family browsers seal their cookie store with App-Bound Encryption on
+// Windows, and yt-dlp cannot read it (yt-dlp issue 10927). Firefox is unaffected
+// — different storage, no DPAPI.
+const _ABE_BROWSERS = ['chrome', 'edge', 'brave', 'opera', 'vivaldi', 'chromium'];
+
+// Mark them rather than disable them, for a reason worth writing down: a
+// <select> whose SELECTED option is disabled reports value === '', so the next
+// auto-save would quietly write an empty cookie source over the user's setting.
+// Labelling warns everybody and destroys nobody's config.
+function markUnsupportedCookieBrowsers(isWindowsServer) {
+    const sel = document.getElementById('youtube-cookies-browser');
+    if (!sel) return;
+    sel.querySelectorAll('option').forEach(opt => {
+        const affected = isWindowsServer && _ABE_BROWSERS.includes(opt.value);
+        const base = opt.dataset.baseLabel || (opt.dataset.baseLabel = opt.textContent.trim());
+        opt.textContent = affected ? `${base} — not supported on Windows` : base;
+        opt.dataset.abeUnsupported = affected ? '1' : '';
+    });
+    updateCookieBrowserWarning();
+}
+window.markUnsupportedCookieBrowsers = markUnsupportedCookieBrowsers;
+
+// Say it at the moment of choosing, not when a download fails days later.
+function updateCookieBrowserWarning() {
+    const sel = document.getElementById('youtube-cookies-browser');
+    const box = document.getElementById('youtube-cookie-abe-warning');
+    if (!sel || !box) return;
+    const opt = sel.selectedOptions && sel.selectedOptions[0];
+    const bad = !!(opt && opt.dataset.abeUnsupported === '1');
+    box.hidden = !bad;
+    if (bad) {
+        box.textContent = `${opt.dataset.baseLabel || sel.value} seals its cookies with `
+            + 'App-Bound Encryption on Windows, which yt-dlp cannot read. This will not work. '
+            + 'Choose "Paste cookies.txt" instead, or "None" if you only download public videos.';
+    }
+}
+window.updateCookieBrowserWarning = updateCookieBrowserWarning;
+
 async function _ssJson(url, opts) {
     const r = await fetch(url, opts);
     return await r.json();
 }
+// Records what the server SAID about the last failure, keyed by service, so
+// the summary toast can name a reason instead of only a count. Sources
+// that can explain themselves (YouTube's bot-block, for one) were having
+// that explanation thrown away here.
+const _ssLastTestMessage = {};
+const _ssLastTestWarned = {};
 function _ssTestConn(service) {
     return _ssJson(API.testConnection || '/api/test-connection', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ service })
-    }).then(j => !!j.success);
+    }).then(j => {
+        const msg = j && (j.message || j.error);
+        if (msg) _ssLastTestMessage[service] = String(msg);
+        else delete _ssLastTestMessage[service];
+        // A pass can still carry something worth acting on. The server marks
+        // those with a leading warning glyph; without this a working source
+        // with a broken cookie file drew a plain green light and said nothing.
+        _ssLastTestWarned[service] = !!j.success && !!msg && String(msg).trim().startsWith('\u26a0');
+        return !!j.success;
+    });
 }
 // Each probe returns a boolean (connected/ok). Endpoints mirror the per-source
 // "Test Connection" buttons so the results match what those buttons would show.
@@ -892,12 +2675,16 @@ const HYBRID_SOURCE_PROBE = {
     // POST (the endpoint is POST-only) with an empty body so it tests the SAVED ARL; a GET here
     // 405s and the probe throws -> the dot goes red even though Deezer downloads fine.
     deezer_dl:  () => _ssJson('/api/deezer-download/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(j => j.success === true),
-    amazon:     () => _ssJson('/api/amazon/test-connection').then(j => j.connected === true),
     lidarr:     () => _ssTestConn('lidarr'),
     soundcloud: () => _ssJson('/api/soundcloud/status').then(j => j.available === true && j.reachable === true),
     torrent:    () => _ssTestConn('torrent_client'),
     usenet:     () => _ssTestConn('usenet_client'),
-    youtube:    () => Promise.resolve(true),  // no auth required
+    // run_service_test already handles 'prowlarr'; the tile just needed wiring.
+    prowlarr:   () => _ssTestConn('prowlarr'),
+    // Was hardcoded to true on the grounds that YouTube needs no auth.
+    // It does now — cookies — and the green dot hid a bot-block from the
+    // reporter of #1126 for long enough that he opened #1233 about it.
+    youtube:    () => _ssTestConn('youtube'),
 };
 // Configured metadata / server connections that support a generic test.
 const CONNECTION_TEST_SERVICES = ['spotify', 'server', 'tidal', 'qobuz', 'lastfm', 'genius', 'listenbrainz', 'acoustid', 'discogs'];
@@ -917,22 +2704,54 @@ async function testAllSources(opts = {}) {
         sources.add(mode);
     }
     if (sources.size === 0) sources.add('soulseek');
+    // the audiobook chain is its own setting. a user whose books come over
+    // torrent but whose music never does saw a grey torrent tile forever,
+    // because only the music chain got probed.
+    for (const id of _audiobookActiveSources()) sources.add(id);
 
     // Torrent/Usenet downloads go through Prowlarr — its connection must be
     // established first or those source tests fail. Probe Prowlarr up front.
-    if (sources.has('torrent') || sources.has('usenet')) {
-        try { await _ssTestConn('prowlarr'); } catch (e) { /* surfaced via the per-source test below */ }
+    //
+    // The result used to be thrown away, which is why the Indexers tile stayed
+    // grey however healthy Prowlarr was: the tile reads _hybridSourceStatus,
+    // and nothing ever wrote prowlarr into it. Prowlarr is not a link in the
+    // chain, so the loop below — which walks the chain — never reaches it
+    // either. Record it here, where it is already being tested.
+    // `sources` comes from the MUSIC chain dropdown, so on the video side it
+    // says nothing about whether Prowlarr matters — and there it is the main
+    // path, not an extra. Test it there too, or its tile is permanently grey.
+    const _onVideoSide = document.body.getAttribute('data-side') === 'video';
+    if (sources.has('torrent') || sources.has('usenet') || _onVideoSide) {
+        _hybridSourceStatus.prowlarr = 'testing';
+        try {
+            const good = await _ssTestConn('prowlarr');
+            _hybridSourceStatus.prowlarr = good
+                ? (_ssLastTestWarned.prowlarr ? 'warn' : 'ok')
+                : 'fail';
+        } catch (e) {
+            _hybridSourceStatus.prowlarr = 'fail';
+        }
+        // the loop below only redraws while walking the chain, which Prowlarr
+        // is not part of
+        try { buildSourceTiles(); } catch (e) { /* tiles are cosmetic */ }
     }
 
     for (const id of sources) _hybridSourceStatus[id] = 'testing';
     buildHybridSourceList();
 
     let ok = 0, fail = 0;
+    const failedIds = [];
     for (const id of sources) {
         const probe = HYBRID_SOURCE_PROBE[id];
         if (!probe) { _hybridSourceStatus[id] = 'na'; continue; }
-        try { const good = await probe(); _hybridSourceStatus[id] = good ? 'ok' : 'fail'; good ? ok++ : fail++; }
-        catch (e) { _hybridSourceStatus[id] = 'fail'; fail++; }
+        try {
+            const good = await probe();
+            _hybridSourceStatus[id] = good ? (_ssLastTestWarned[id] ? 'warn' : 'ok') : 'fail';
+            good ? ok++ : (fail++, failedIds.push(id));
+            // a warning is worth surfacing even though the source passed
+            if (good && _ssLastTestWarned[id]) failedIds.push(id);
+        }
+        catch (e) { _hybridSourceStatus[id] = 'fail'; fail++; failedIds.push(id); }
         buildHybridSourceList();
     }
 
@@ -945,7 +2764,7 @@ async function testAllSources(opts = {}) {
             for (const svc of CONNECTION_TEST_SERVICES) {
                 const configured = svc === 'server' ? true : (cfg && cfg[svc] && cfg[svc].configured);
                 if (!configured) continue;
-                try { const good = await _ssTestConn(svc); good ? connOk++ : connFail++; } catch (e) { connFail++; }
+                try { const good = await _ssTestConn(svc); good ? connOk++ : (connFail++, failedIds.push(svc)); } catch (e) { connFail++; failedIds.push(svc); }
             }
         } catch (e) { /* config-status unavailable — skip connection sweep */ }
     }
@@ -954,7 +2773,14 @@ async function testAllSources(opts = {}) {
     if (!silent) {
         const parts = [`sources ${ok}✓${fail ? ' / ' + fail + '✗' : ''}`];
         if (connOk || connFail) parts.push(`connections ${connOk}✓${connFail ? ' / ' + connFail + '✗' : ''}`);
-        showToast('Tested ' + parts.join(', '), (fail || connFail) ? 'error' : 'success');
+        // A count tells you something broke, not what. Sources that can
+        // explain themselves already do — carry the first one through so
+        // the toast is actionable (#1233).
+        let detail = '';
+        for (const id of failedIds) {
+            if (_ssLastTestMessage[id]) { detail = ` — ${_ssLastTestMessage[id]}`; break; }
+        }
+        showToast('Tested ' + parts.join(', ') + detail, (fail || connFail) ? 'error' : 'success');
     }
 }
 window.testAllSources = testAllSources;
@@ -969,6 +2795,8 @@ function autoTestSourcesOnce() {
 }
 
 function buildHybridSourceList() {
+    // Same state drives both views; refresh the Sources cards alongside.
+    try { buildSourceTiles(); } catch (e) { /* tiles are cosmetic */ }
     const container = document.getElementById('hybrid-source-list');
     if (!container) return;
 
@@ -1152,7 +2980,7 @@ function buildArtSourceList() {
     if (!container) return;
     container.innerHTML = '';
     if (!_artVisualOrder.length) {
-        container.innerHTML = '<div style="padding:10px;color:var(--text-secondary,#888);font-size:13px;">No connected art sources available.</div>';
+        container.innerHTML = '<div style="padding:10px;color:#888;font-size:13px;">No connected art sources available.</div>';
         return;
     }
     const enabledOrder = getArtOrder();
@@ -1246,7 +3074,8 @@ async function loadArtSourceOrder(settings) {
 }
 
 function loadHybridSourceOrder(settings) {
-    const order = settings.download_source?.hybrid_order;
+    const saved = settings.download_source?.hybrid_order;
+    const order = Array.isArray(saved) ? saved.filter(id => !RETIRED_DOWNLOAD_SOURCES.has(id)) : saved;
     const sourceStatus = settings._source_status || {};
 
     if (order && Array.isArray(order) && order.length > 0) {
@@ -1259,7 +3088,8 @@ function loadHybridSourceOrder(settings) {
         // Legacy: fall back to primary/secondary
         const primary = settings.download_source?.hybrid_primary || 'soulseek';
         const secondary = settings.download_source?.hybrid_secondary || 'youtube';
-        _hybridSourceOrder = [primary, secondary];
+        _hybridSourceOrder = [primary, secondary].filter(id => !RETIRED_DOWNLOAD_SOURCES.has(id));
+        if (!_hybridSourceOrder.length) _hybridSourceOrder = ['soulseek'];
         _hybridSourceEnabled = {};
         for (const src of HYBRID_SOURCES) {
             _hybridSourceEnabled[src.id] = src.id === primary || src.id === secondary;
@@ -1292,6 +3122,19 @@ function updateLossyBitrateOptions() {
     const opt320 = bitrateSelect.querySelector('option[value="320"]');
     if (codec === 'opus') {
         // Opus max is 256kbps per channel — hide 320 option
+        if (opt320) opt320.disabled = true;
+        if (bitrateSelect.value === '320') bitrateSelect.value = '256';
+    } else {
+        if (opt320) opt320.disabled = false;
+    }
+}
+
+function updateYoutubeTranscodeBitrateOptions() {
+    const codec = document.getElementById('youtube-transcode-codec')?.value || 'mp3';
+    const bitrateSelect = document.getElementById('youtube-transcode-bitrate');
+    if (!bitrateSelect) return;
+    const opt320 = bitrateSelect.querySelector('option[value="320"]');
+    if (codec === 'opus') {
         if (opt320) opt320.disabled = true;
         if (bitrateSelect.value === '320') bitrateSelect.value = '256';
     } else {
@@ -1354,9 +3197,6 @@ async function loadSettingsData() {
         document.getElementById('deezer-redirect-uri').value = settings.deezer?.redirect_uri || 'http://127.0.0.1:8008/deezer/callback';
         document.getElementById('deezer-callback-display').textContent = settings.deezer?.redirect_uri || 'http://127.0.0.1:8008/deezer/callback';
 
-        // Populate Yandex Music settings
-        document.getElementById('yandex-token').value = settings.yandex?.token || '';
-
         // Add event listeners to update display URLs when input changes
         document.getElementById('spotify-redirect-uri').addEventListener('input', function () {
             document.getElementById('spotify-callback-display').textContent = this.value || 'http://127.0.0.1:8888/callback';
@@ -1388,6 +3228,8 @@ async function loadSettingsData() {
         document.getElementById('navidrome-url').value = settings.navidrome?.base_url || '';
         document.getElementById('navidrome-username').value = settings.navidrome?.username || '';
         document.getElementById('navidrome-password').value = settings.navidrome?.password || '';
+        loadNavidromePlaylistLogin();
+        loadMediaServerNames();
 
         // Set active server and toggle visibility
         const activeServer = settings.active_media_server || 'plex';
@@ -1420,12 +3262,17 @@ async function loadSettingsData() {
         document.getElementById('soulseek-search-min-delay-seconds').value = settings.soulseek?.search_min_delay_seconds ?? 0;
         document.getElementById('soulseek-min-peer-speed').value = settings.soulseek?.min_peer_upload_speed || 0;
         document.getElementById('soulseek-max-peer-queue').value = settings.soulseek?.max_peer_queue || 0;
+        document.getElementById('soulseek-observed-speed-fallback-enabled').checked = settings.soulseek?.observed_speed_fallback_enabled === true;
+        document.getElementById('soulseek-min-observed-download-speed').value = settings.soulseek?.min_observed_download_speed_kbps ?? 250;
         document.getElementById('soulseek-download-timeout').value = Math.round((settings.soulseek?.download_timeout || 600) / 60);
         document.getElementById('soulseek-auto-clear-searches').checked = settings.soulseek?.auto_clear_searches !== false;
+        document.getElementById('soulseek-cleanup-scope').value = settings.soulseek?.cleanup_scope === 'all' ? 'all' : 'own';
 
         // Populate ListenBrainz settings
         document.getElementById('listenbrainz-base-url').value = settings.listenbrainz?.base_url || '';
         document.getElementById('listenbrainz-token').value = settings.listenbrainz?.token || '';
+        const _lbUser = document.getElementById('listenbrainz-username');
+        if (_lbUser) _lbUser.value = settings.listenbrainz?.username || '';
 
         // Populate AcoustID settings
         document.getElementById('acoustid-api-key').value = settings.acoustid?.api_key || '';
@@ -1436,8 +3283,16 @@ async function loadSettingsData() {
         if (typeof syncAcoustidRequireVerifiedVisibility === 'function') syncAcoustidRequireVerifiedVisibility();
 
         // Populate Last.fm settings
+        const _tmKey = document.getElementById('concerts-ticketmaster-api-key');
+        if (_tmKey) _tmKey.value = settings.concerts?.ticketmaster_api_key || '';
+        const _slfmKey = document.getElementById('concerts-setlistfm-api-key');
+        if (_slfmKey) _slfmKey.value = settings.concerts?.setlistfm_api_key || '';
+        const _concertCountry = document.getElementById('concerts-country');
+        if (_concertCountry) _concertCountry.value = settings.concerts?.country || '';
         document.getElementById('lastfm-api-key').value = settings.lastfm?.api_key || '';
         document.getElementById('lastfm-api-secret').value = settings.lastfm?.api_secret || '';
+        const _lfmUser = document.getElementById('lastfm-username');
+        if (_lfmUser) _lfmUser.value = settings.lastfm?.username || '';
         document.getElementById('lastfm-scrobble-enabled').checked = settings.lastfm?.scrobble_enabled === true;
         const lfmStatus = document.getElementById('lastfm-scrobble-status');
         if (lfmStatus) {
@@ -1449,11 +3304,16 @@ async function loadSettingsData() {
 
         // Populate Genius settings
         document.getElementById('genius-access-token').value = settings.genius?.access_token || '';
+        const _pollinationsKey = document.getElementById('pollinations-api-key');
+        if (_pollinationsKey) _pollinationsKey.value = settings.pollinations?.api_key || '';
 
         // Populate iTunes settings
         document.getElementById('itunes-country').value = settings.itunes?.country || 'US';
 
         // Populate Discogs settings
+        // Yandex Music: one token powers metadata, search, new releases and downloads
+        const _yandexTokenInput = document.getElementById('yandex-token');
+        if (_yandexTokenInput) _yandexTokenInput.value = settings.yandex?.token || '';
         document.getElementById('discogs-token').value = settings.discogs?.token || '';
 
         // Populate Metadata source setting. 'Spotify Free' is stored as
@@ -1515,11 +3375,34 @@ async function loadSettingsData() {
         applyPathsEnvironment(settings);
         document.getElementById('staging-path').value = settings.import?.staging_path || './Staging';
         document.getElementById('music-videos-path').value = settings.library?.music_videos_path || './MusicVideos';
+        const isDocker = !!(settings._environment && settings._environment.docker) ||
+                         (settings.soulseek?.transfer_path || '').startsWith('/app/') ||
+                         (settings.soulseek?.download_path || '').startsWith('/app/');
+        const defaultPodcastPath = isDocker ? '/app/podcasts' : './podcasts';
+        const podcastsEl = document.getElementById('podcasts-path');
+        if (podcastsEl) {
+            podcastsEl.placeholder = defaultPodcastPath;
+            const currentPodcastsVal = settings.podcasts?.download_path || settings.library?.podcasts_path;
+            podcastsEl.value = (isDocker && (!currentPodcastsVal || currentPodcastsVal === './podcasts'))
+                ? defaultPodcastPath
+                : (currentPodcastsVal || defaultPodcastPath);
+        }
+        loadAudiobookRoutes();
+        const defaultAudiobookPath = isDocker ? '/app/audiobooks' : './audiobooks';
+        const audiobooksEl = document.getElementById('audiobooks-path');
+        if (audiobooksEl) {
+            audiobooksEl.placeholder = defaultAudiobookPath;
+            const currentAudiobooksVal = settings.audiobooks?.download_path || settings.library?.audiobooks_path;
+            audiobooksEl.value = (isDocker && (!currentAudiobooksVal || currentAudiobooksVal === './audiobooks'))
+                ? defaultAudiobookPath
+                : (currentAudiobooksVal || defaultAudiobookPath);
+        }
         document.getElementById('playlists-materialize-path').value = settings.playlists?.materialize_path || './Playlists';
         document.getElementById('playlists-materialize-mode').value = settings.playlists?.materialize_mode || 'symlink';
 
         // Populate Download Source settings
-        document.getElementById('download-source-mode').value = settings.download_source?.mode || 'soulseek';
+        const _savedMode = settings.download_source?.mode || 'soulseek';
+        document.getElementById('download-source-mode').value = RETIRED_DOWNLOAD_SOURCES.has(_savedMode) ? 'soulseek' : _savedMode;
         document.getElementById('stream-source').value = settings.download_source?.stream_source || 'youtube';
         document.getElementById('max-concurrent-downloads').value = settings.download_source?.max_concurrent || '3';
         // #1056 — 0/blank = each source's built-in default
@@ -1569,6 +3452,11 @@ async function loadSettingsData() {
             _tcStall.value = (secs === undefined || secs === null) ? 10 : Math.round(Number(secs) / 60);
         }
         if (_tcStallAct) _tcStallAct.value = settings.download_source?.torrent_stall_action || 'abandon';
+        const _tcMinSeed = document.getElementById('torrent-min-seeders');
+        if (_tcMinSeed) {
+            const n = settings.download_source?.torrent_min_seeders;
+            _tcMinSeed.value = (n === undefined || n === null) ? 1 : Number(n);
+        }
         const _tcDlPath = document.getElementById('torrent-download-path');
         if (_tcDlPath) _tcDlPath.value = settings.download_source?.torrent_download_path || '';
         const _ucType = document.getElementById('usenet-client-type');
@@ -1597,7 +3485,25 @@ async function loadSettingsData() {
 
         // Populate YouTube settings
         document.getElementById('youtube-cookies-browser').value = settings.youtube?.cookies_browser || '';
+        markUnsupportedCookieBrowsers(!!(settings._environment && settings._environment.windows));
         document.getElementById('youtube-download-delay').value = settings.youtube?.download_delay ?? 3;
+        const _ytAlbumBundle = document.getElementById('youtube-album-bundle');
+        if (_ytAlbumBundle) _ytAlbumBundle.checked = settings.download_source?.youtube_album_bundle === true;
+        const _ytTranscode = document.getElementById('youtube-transcode');
+        const _ytTranscodeOpts = document.getElementById('youtube-transcode-options');
+        if (_ytTranscode) {
+            _ytTranscode.checked = settings.youtube?.transcode !== false;
+            if (_ytTranscodeOpts) {
+                _ytTranscodeOpts.style.display = _ytTranscode.checked ? 'block' : 'none';
+            }
+        }
+        const _ytCodec = document.getElementById('youtube-transcode-codec');
+        if (_ytCodec) _ytCodec.value = settings.youtube?.transcode_codec || 'mp3';
+        const _ytBitrate = document.getElementById('youtube-transcode-bitrate');
+        if (_ytBitrate) _ytBitrate.value = settings.youtube?.transcode_bitrate || '320';
+        if (typeof updateYoutubeTranscodeBitrateOptions === 'function') {
+            updateYoutubeTranscodeBitrateOptions();
+        }
         // Show the cookies.txt paste box only in "custom" mode. We never echo the
         // stored cookie back to the UI (it's secret + lives in a file, not config);
         // if one is already saved, say so via placeholder so a blank save won't wipe it.
@@ -1614,6 +3520,7 @@ async function loadSettingsData() {
             _toggleYtPaste();
             if (!_ytCookieSel.dataset.pasteToggleBound) {
                 _ytCookieSel.addEventListener('change', _toggleYtPaste);
+                _ytCookieSel.addEventListener('change', updateCookieBrowserWarning);
                 _ytCookieSel.dataset.pasteToggleBound = '1';
             }
         }
@@ -1633,6 +3540,7 @@ async function loadSettingsData() {
         document.getElementById('lrclib-enabled').checked = settings.metadata_enhancement?.lrclib_enabled !== false;
         document.getElementById('replaygain-enabled').checked = settings.post_processing?.replaygain_enabled === true;
         document.getElementById('audio-completeness-check').checked = settings.post_processing?.audio_completeness_check === true;
+        document.getElementById('verify-flac-decode').checked = settings.post_processing?.verify_flac_decode === true;
         document.getElementById('duration-tolerance-seconds').value = settings.post_processing?.duration_tolerance_seconds ?? 0;
         document.getElementById('retry-next-candidate').checked = settings.post_processing?.retry_next_candidate_on_mismatch !== false;
         document.getElementById('retry-exhaustive').checked = settings.post_processing?.retry_exhaustive === true;
@@ -1643,7 +3551,11 @@ async function loadSettingsData() {
         // Load service master toggles
         document.getElementById('embed-spotify').checked = settings.spotify?.embed_tags !== false;
         document.getElementById('embed-itunes').checked = settings.itunes?.embed_tags !== false;
+        loadMusicBrainzServerSettings(settings);
         document.getElementById('embed-musicbrainz').checked = settings.musicbrainz?.embed_tags !== false;
+        // #1451: beets-style original-date-as-DATE (default off)
+        const _mbDateEl = document.getElementById('mb-use-original-date-for-date');
+        if (_mbDateEl) _mbDateEl.checked = settings.musicbrainz?.use_original_date_for_date === true;
         document.getElementById('embed-deezer').checked = settings.deezer?.embed_tags !== false;
         document.getElementById('embed-audiodb').checked = settings.audiodb?.embed_tags !== false;
         document.getElementById('embed-tidal').checked = settings.tidal?.embed_tags !== false;
@@ -1651,6 +3563,10 @@ async function loadSettingsData() {
         document.getElementById('embed-lastfm').checked = settings.lastfm?.embed_tags !== false;
         document.getElementById('embed-genius').checked = settings.genius?.embed_tags !== false;
         document.getElementById('embed-hifi').checked = settings.hifi?.embed_tags !== false;
+        const embedBeatport = document.getElementById('embed-beatport');
+        if (embedBeatport) embedBeatport.checked = settings.beatport?.embed_tags !== false;
+        const beatportSearchAll = document.getElementById('beatport-search-all');
+        if (beatportSearchAll) beatportSearchAll.checked = settings.beatport?.search_all_tracks === true;
         // Load per-tag toggles from data-config attributes
         document.querySelectorAll('[data-config]').forEach(cb => {
             const path = cb.dataset.config.split('.');
@@ -1659,7 +3575,7 @@ async function loadSettingsData() {
             cb.checked = val !== false;
         });
         // Apply service disabled state to child tags
-        ['spotify', 'itunes', 'musicbrainz', 'deezer', 'audiodb', 'tidal', 'qobuz', 'lastfm', 'genius', 'hifi'].forEach(svc => {
+        ['spotify', 'itunes', 'musicbrainz', 'deezer', 'audiodb', 'tidal', 'qobuz', 'lastfm', 'genius', 'hifi', 'beatport'].forEach(svc => {
             const master = document.getElementById('embed-' + svc);
             if (master) toggleServiceTags(master, svc);
         });
@@ -1668,6 +3584,9 @@ async function loadSettingsData() {
         // Populate File Organization settings
         document.getElementById('file-organization-enabled').checked = settings.file_organization?.enabled !== false;
         document.getElementById('template-album-path').value = settings.file_organization?.templates?.album_path || '$albumartist/$albumartist - $album/$track - $title';
+        // compilations have their own template; it was never shown, so an album
+        // template change silently skipped every soundtrack (#1385)
+        document.getElementById('template-compilation-path').value = settings.file_organization?.templates?.compilation_path || 'Compilations/$album/$track - $artist - $title';
         // $albumartist honors the Collaborative Album Artist mode; the old
         // $artist default filed multi-artist singles under "A, B & C". A
         // stored old-default upgrades server-side too (core/imports/paths.py).
@@ -1680,20 +3599,115 @@ async function loadSettingsData() {
         document.getElementById('template-playlist-path').value = settings.file_organization?.templates?.playlist_path || '$playlist/$artist - $title';
         document.getElementById('template-playlist-item').value = settings.file_organization?.templates?.playlist_item || '';
         document.getElementById('template-video-path').value = settings.file_organization?.templates?.video_path || '$artist/$title-video';
+        document.getElementById('template-podcast-path').value = settings.file_organization?.templates?.podcast_path || '$show/Season $season/$title';
+        document.getElementById('template-audiobook-path').value = settings.file_organization?.templates?.audiobook_path || '$author/$series/$seriespos - $title';
+        document.getElementById('template-sample-path').value = settings.file_organization?.templates?.sample_path || '$artist/$track - $chop';
+        const podcastFormatEl = document.getElementById('podcast-media-format');
+        if (podcastFormatEl) {
+            podcastFormatEl.value = settings.podcasts?.media_format || 'audio';
+        }
+
+        // Audiobook settings. Every read carries an explicit default: there is no
+        // deep merge of new defaults into an existing config row, so a key added
+        // after an install was set up comes back undefined, and a bare ?? here
+        // would silently show every switch as off.
+        const ab = settings.audiobooks || {};
+        const abSource = ab.download_source || {};
+        const abVal = (el, value) => { if (el) el.value = value; };
+        const abChecked = (el, value) => { if (el) el.checked = value !== false; };
+        // Which Audible storefront the catalogue pages query. No deep merge
+        // of new defaults into an existing config row, so older installs come
+        // back undefined and read as the US store, same as before.
+        abVal(document.getElementById('audiobook-marketplace'), ab.marketplace || 'us');
+        abVal(document.getElementById('audiobook-download-mode'), abSource.mode || 'hybrid');
+        _audiobookHybrid = (abSource.hybrid_order || [])
+            .filter(src => AUDIOBOOK_SOURCES.includes(src));
+        if (!_audiobookHybrid.length) _audiobookHybrid = [...AUDIOBOOK_SOURCES];
+        onAudiobookModeChange();
+        // Both music and audiobook chain state are loaded by now, so the shared
+        // widget can render whichever tab is showing.
+        try { _dlchainLoad(); } catch (e) { /* widget is not on every page */ }
+        abVal(document.getElementById('audiobook-torrent-category'),
+            ab.torrent_category || 'audiobooks');
+        abVal(document.getElementById('audiobook-prowlarr-categories'),
+            (ab.prowlarr_categories || [3030]).join(', '));
+        // Stored as a fraction because that is what the gate multiplies by;
+        // shown as a percentage because "0.92" in a box labelled % is a bug
+        // report waiting to happen.
+        abVal(document.getElementById('audiobook-completeness-tolerance'),
+            Math.round((ab.completeness_tolerance ?? 0.92) * 100));
+        abVal(document.getElementById('audiobook-staging-days'), ab.staging_days ?? 7);
+        abChecked(document.getElementById('audiobook-renumber-chapters'), ab.renumber_chapters);
+        // Opt-in, off by default: abChecked treats a missing key as on, which
+        // would switch these on for older configs.
+        const mergeM4b = document.getElementById('audiobook-merge-m4b');
+        if (mergeM4b) mergeM4b.checked = ab.merge_m4b === true;
+        // Off by default, unlike the toggles above: abChecked treats a
+        // missing key as on, which would switch this on for older configs.
+        const removeOwned = document.getElementById('audiobook-remove-owned-from-wishlist');
+        if (removeOwned) removeOwned.checked = ab.remove_owned_from_wishlist === true;
+        abChecked(document.getElementById('audiobook-embed-metadata'), ab.embed_metadata);
+        abChecked(document.getElementById('audiobook-embed-artwork'), ab.embed_artwork);
+        abChecked(document.getElementById('audiobook-save-artwork'), ab.save_artwork);
+        abChecked(document.getElementById('audiobook-write-nfo'), ab.write_nfo);
+
+        // Quality profile. The stored order is a list, best first; the page
+        // only edits which format leads, and the rest keep their order behind
+        // it — a full drag-to-reorder list is more UI than the choice needs.
+        const abq = ab.quality || {};
+        const abOrder = Array.isArray(abq.format_order) && abq.format_order.length
+            ? abq.format_order
+            : ['m4b', 'm4a', 'mp3', 'opus', 'ogg', 'flac'];
+        abVal(document.getElementById('audiobook-format-first'), abOrder[0] || 'm4b');
+        // Empty means every format, so a fresh install shows them all on.
+        const abAllowed = Array.isArray(abq.allowed_formats) ? abq.allowed_formats : [];
+        document.getElementById('audiobook-allowed-formats')?.querySelectorAll('input').forEach(box => {
+            box.checked = !abAllowed.length || abAllowed.includes(box.value);
+        });
+        // "any" shows both switches on; "single"/"multiple" shows just that one.
+        const abLayout = abq.file_layout || 'any';
+        document.getElementById('audiobook-file-layout')?.querySelectorAll('input').forEach(box => {
+            box.checked = abLayout === 'any' || abLayout === box.value;
+        });
+        abVal(document.getElementById('audiobook-min-bitrate'), abq.min_bitrate_kbps ?? 0);
+        abVal(document.getElementById('audiobook-max-bitrate'), abq.max_bitrate_kbps ?? 0);
+        abChecked(document.getElementById('audiobook-allow-dramatized'),
+            abq.allow_dramatized);
+        abChecked(document.getElementById('audiobook-recycle-deletes'), ab.recycle_deletes);
+        abVal(document.getElementById('audiobook-recycle-keep-days'), ab.recycle_keep_days ?? 7);
         document.getElementById('disc-label').value = settings.file_organization?.disc_label || 'Disc';
         document.getElementById('collab-artist-mode').value = settings.file_organization?.collab_artist_mode || 'first';
         document.getElementById('artistletter-symbol-fallback').checked = settings.file_organization?.artistletter_symbol_fallback === true;
+        document.getElementById('unicode-substitution').checked = settings.file_organization?.unicode_substitution === true;
+        // !== false, not === true: the backend default is ON, so an install
+        // that has never saved this key must show it ON or the checkbox lies
+        // about what the importer is doing.
+        document.getElementById('detect-multi-artist-compilations').checked = settings.file_organization?.detect_multi_artist_compilations !== false;
+        // !== false, not === true: same default-ON convention — the importer
+        // auto-adds the disambiguation unless the key was explicitly saved off.
+        document.getElementById('auto-disambiguation').checked = settings.file_organization?.auto_disambiguation !== false;
         document.getElementById('artist-separator').value = settings.metadata_enhancement?.tags?.artist_separator || ', ';
         document.getElementById('write-multi-artist').checked = settings.metadata_enhancement?.tags?.write_multi_artist || false;
         document.getElementById('feat-in-title').checked = settings.metadata_enhancement?.tags?.feat_in_title || false;
         document.getElementById('allow-duplicate-tracks').checked = settings.wishlist?.allow_duplicate_tracks !== false;
+        const _lcOn = document.getElementById('lidarr-compat-enabled');
+        if (_lcOn) _lcOn.checked = settings.lidarr_compat?.enabled === true;
+        loadLidarrCompatProfiles(settings.lidarr_compat?.profile_id ?? 1);
+        const _mcpOn = document.getElementById('mcp-enabled');
+        if (_mcpOn) _mcpOn.checked = settings.mcp?.enabled === true;
         const _wlTtl = document.getElementById('wishlist-ignore-ttl');
         if (_wlTtl) _wlTtl.value = settings.wishlist?.ignore_ttl_days ?? 30;
+        const _wlWingIt = document.getElementById('wishlist-wing-it-guesses');
+        if (_wlWingIt) _wlWingIt.checked = settings.wishlist?.wing_it_guesses === true;
 
         // Populate Playlist Sync settings
-        document.getElementById('create-backup').checked = settings.playlist_sync?.create_backup !== false;
+        document.getElementById('create-backup').checked = settings.playlist_sync?.create_backup === true;
         const _syncModeEl = document.getElementById('playlist-sync-mode');
-        if (_syncModeEl) _syncModeEl.value = settings.playlist_sync?.mode || 'replace';
+        if (_syncModeEl) _syncModeEl.value = settings.playlist_sync?.mode || 'reconcile';
+        // #1455: default ON — older installs come back undefined and read as
+        // today's behavior (wishlist missing tracks during sync).
+        document.getElementById('playlist-sync-wishlist-missing').checked =
+            settings.playlist_sync?.wishlist_missing_tracks !== false;
 
         // Populate Post-Download Conversion settings
         document.getElementById('downsample-hires').checked = settings.lossy_copy?.downsample_hires === true;
@@ -1706,6 +3720,9 @@ async function loadSettingsData() {
         // Album Publishing (#999) — atomic album publish, opt-in, default off.
         const _atomicPub = document.getElementById('album-atomic-publish');
         if (_atomicPub) _atomicPub.checked = settings.album_downloads?.atomic_publish === true;
+        const _atomicRecover = document.getElementById('album-atomic-recover');
+        // Defaults ON — an absent value means "recover", not "quarantine".
+        if (_atomicRecover) _atomicRecover.checked = settings.album_downloads?.atomic_recover_orphans !== false;
 
         // Populate Listening Stats settings
         document.getElementById('listening-stats-enabled').checked = settings.listening_stats?.enabled === true;
@@ -1724,14 +3741,30 @@ async function loadSettingsData() {
         const _musicPaths = settings.library?.music_paths || [];
         renderMusicPaths(_musicPaths);
 
+        // Populate Sample Studio folders (first = default destination).
+        // Configs predating the key get the Docker-aware default row.
+        const _samplePaths = settings.library?.sample_paths || [];
+        const _defaultSamplePath = isDocker ? '/app/samples' : './samples';
+        renderSamplePaths(_samplePaths.length ? _samplePaths : [_defaultSamplePath]);
+
         // Library Organize: preserve the user's casing (default on)
         const _pcEl = document.getElementById('reorganize-preserve-casing');
         if (_pcEl) _pcEl.checked = settings.library?.reorganize_preserve_casing !== false;
+
+        // #1449: write artist.nfo into new artist folders (default off)
+        const _nfoEl = document.getElementById('write-artist-nfo');
+        if (_nfoEl) _nfoEl.checked = settings.library?.write_artist_nfo === true;
 
         // Populate Content Filter settings
         document.getElementById('allow-explicit').checked = settings.content_filter?.allow_explicit !== false;
         document.getElementById('prefer-explicit').checked = settings.content_filter?.prefer_explicit === true;
         syncPreferExplicitState();
+
+        // Prefer a version (off = ''), lives under soulseek with the other match settings
+        const _pvEl = document.getElementById('preferred-version');
+        if (_pvEl) _pvEl.value = settings.soulseek?.preferred_version || '';
+        const _sizeCap = document.getElementById('music-max-mb-per-minute');
+        if (_sizeCap) _sizeCap.value = settings.download_source?.max_mb_per_minute ?? 0;
 
         // Populate Genre Whitelist
         const gwEnabled = settings.genre_whitelist?.enabled === true;
@@ -1748,10 +3781,12 @@ async function loadSettingsData() {
         const _folderArtistEl = document.getElementById('import-folder-artist-override');
         if (_folderArtistEl) _folderArtistEl.checked = settings.import?.folder_artist_override !== false;
         const _transferPermEl = document.getElementById('import-transfer-permanent');
-        if (_transferPermEl) _transferPermEl.checked = settings.import?.transfer_is_permanent === true;
+        if (_transferPermEl) _transferPermEl.checked = settings.import?.transfer_is_permanent !== false;
 
         // Populate M3U Export settings
         document.getElementById('m3u-export-enabled').checked = settings.m3u_export?.enabled === true;
+        const _m3uRelEl = document.getElementById('m3u-relative-paths');
+        if (_m3uRelEl) _m3uRelEl.checked = settings.m3u_export?.relative_paths === true;
         document.getElementById('m3u-entry-base-path').value = settings.m3u_export?.entry_base_path || '';
         document.getElementById('m3u-rewrite-from').value = settings.m3u_export?.rewrite_from || '';
         document.getElementById('m3u-rewrite-to').value = settings.m3u_export?.rewrite_to || '';
@@ -1885,6 +3920,45 @@ async function loadSettingsData() {
             if (authHeader) authHeader.value = settings.security?.auth_proxy_header || '';
             const reqLogin = document.getElementById('security-require-login');
             if (reqLogin) reqLogin.checked = settings.security?.require_login || false;
+            const plexSignin = document.getElementById('security-plex-signin');
+            if (plexSignin) plexSignin.checked = settings.security?.plex_signin || false;
+            const plexCreate = document.getElementById('security-plex-signin-auto-create');
+            if (plexCreate) plexCreate.checked = settings.security?.plex_signin_auto_create !== false;
+            const plexDl = document.getElementById('security-plex-signin-can-download');
+            if (plexDl) plexDl.checked = settings.security?.plex_signin_default_can_download || false;
+            const oidcOn = document.getElementById('security-oidc-signin');
+            if (oidcOn) oidcOn.checked = settings.security?.oidc_signin || false;
+            syncOidcProviderBlock();
+            for (const [id, key] of [
+                ['security-oidc-issuer', 'oidc_issuer'],
+                ['security-oidc-client-id', 'oidc_client_id'],
+                ['security-oidc-client-secret', 'oidc_client_secret'],
+                ['security-oidc-button-label', 'oidc_button_label'],
+                ['security-oidc-icon-url', 'oidc_icon_url'],
+                ['security-oidc-required-group', 'oidc_required_group'],
+                ['security-oidc-groups-claim', 'oidc_groups_claim'],
+                ['security-oidc-scopes', 'oidc_scopes'],
+                ['security-oidc-redirect-uri', 'oidc_redirect_uri'],
+            ]) {
+                const el = document.getElementById(id);
+                if (el) el.value = settings.security?.[key] || '';
+            }
+            const oidcCreate = document.getElementById('security-oidc-signin-auto-create');
+            if (oidcCreate) oidcCreate.checked = settings.security?.oidc_signin_auto_create !== false;
+            const oidcDl = document.getElementById('security-oidc-signin-can-download');
+            if (oidcDl) oidcDl.checked = settings.security?.oidc_signin_default_can_download || false;
+            // the address to register at the provider, as this browser sees it
+            const oidcCb = document.getElementById('security-oidc-callback-url');
+            if (oidcCb) oidcCb.textContent = window.location.origin + '/api/auth/oidc/callback';
+            const signupSides = document.getElementById('security-signup-sides');
+            if (signupSides) {
+                const sides = settings.security?.signup_sides;
+                signupSides.value = ['music', 'video', 'both'].includes(sides) ? sides : 'music';
+            }
+            const signupLimit = document.getElementById('security-signup-request-limit');
+            if (signupLimit) signupLimit.value = settings.security?.signup_request_limit ?? 0;
+            const signupDays = document.getElementById('security-signup-request-limit-days');
+            if (signupDays) signupDays.value = settings.security?.signup_request_limit_days ?? 7;
 
             // Check if admin has a PIN set
             const profilesRes = await fetch('/api/profiles');
@@ -1916,10 +3990,15 @@ async function loadSettingsData() {
             const devResponse = await fetch('/api/dev-mode');
             const devData = await devResponse.json();
             if (devData.enabled) {
+                // Re-broadcast for the React dashboard's Hydrabase orb.
+                window.dispatchEvent(new CustomEvent('ss:dev-mode', { detail: { enabled: true } }));
                 document.getElementById('dev-mode-status').textContent = 'Active';
                 document.getElementById('dev-mode-status').style.color = 'rgb(var(--accent-light-rgb))';
                 document.getElementById('hydrabase-nav').style.display = '';
-                document.getElementById('hydrabase-button-container').style.display = '';
+                // The Hydrabase ORB is React-rendered since the dashboard flip
+                // and shows on the dispatch above; the old container write
+                // would throw here (the node only exists while the dashboard
+                // is mounted).
             }
         } catch (error) {
             console.error('Error checking dev mode:', error);
@@ -1930,6 +4009,22 @@ async function loadSettingsData() {
         // on top of it, and an untouched field re-masks on blur (round-trips the
         // sentinel, which the server treats as "keep existing").
         _wireRedactedSecrets();
+
+        // the library headers report live values, so they are only meaningful
+        // once the form actually holds them. deliberately inside the try: if the
+        // load failed there is nothing true to summarise, and the headers keep
+        // their static descriptions rather than reporting an empty form as
+        // "nothing enabled".
+        if (typeof refreshLibrarySummaries === 'function') refreshLibrarySummaries();
+        // the template previews render the loaded values, same reason
+        if (typeof initPathPreview === 'function') {
+            initPathPreview();
+            refreshPathPreview(0);
+        }
+        // the service tiles report which credentials are actually filled in, so
+        // they are only truthful once the form holds them. same reason as above:
+        // summarising an empty form would report every service as "not set up".
+        if (typeof buildServiceTiles === 'function') buildServiceTiles();
 
     } catch (error) {
         console.error('Error loading settings:', error);
@@ -2062,6 +4157,18 @@ function setPlexConfigActionButton(isManualConfig) {
     }
 }
 
+// Re-link: Plex is already configured and the user wants a fresh token
+// through plex.tv/link without clearing anything. The PIN box lives in the
+// setup area (hidden once configured), so re-link shows that area on its own.
+let _plexPinRelink = false;
+
+function startPlexRelink() {
+    _plexPinRelink = true;
+    const plexSetup = document.getElementById('plex-setup');
+    if (plexSetup) plexSetup.style.display = '';
+    startPlexPinAuth();
+}
+
 async function startPlexPinAuth() {
     const setupButtons = document.getElementById('plex-setup-buttons');
     const authFlow = document.getElementById('plex-pin-auth-flow');
@@ -2129,9 +4236,31 @@ async function pollPlexPinAuthStatus() {
 
         if (result.success) {
             stopPlexPinAuthPolling();
-            if (statusEl) statusEl.textContent = 'Authorization complete! Saving Plex configuration...';
-            document.getElementById('plex-url').value = result.found_url || '';
-            document.getElementById('plex-token').value = result.token || '';
+            const urlEl = document.getElementById('plex-url');
+            const currentUrl = (urlEl?.value || '').trim();
+            if (_plexPinRelink && currentUrl) {
+                // Re-link keeps the URL that already works (a docker host or a
+                // reverse proxy Plex can't discover) and only saves the new
+                // token once it's proven to reach that server.
+                if (statusEl) statusEl.textContent = 'Authorized. Checking the new token against your server...';
+                const check = await fetch('/api/plex/verify-token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: currentUrl, token: result.token || '' })
+                }).then((r) => r.json()).catch(() => ({ success: false }));
+                if (!check.success) {
+                    if (statusEl) statusEl.textContent = (check.error || "The new token couldn't reach your server")
+                        + '. Nothing was changed.';
+                    showToast("Re-link didn't change anything: that Plex account can't reach your server", 'error');
+                    return;
+                }
+                document.getElementById('plex-token').value = result.token || '';
+            } else {
+                if (statusEl) statusEl.textContent = 'Authorization complete! Saving Plex configuration...';
+                if (urlEl) urlEl.value = result.found_url || '';
+                document.getElementById('plex-token').value = result.token || '';
+            }
+            _plexPinRelink = false;
             if (typeof saveSettings === 'function') {
                 await saveSettings(true);
             }
@@ -2164,11 +4293,19 @@ function cancelPlexPinAuth() {
     const authFlow = document.getElementById('plex-pin-auth-flow');
     if (setupButtons) setupButtons.style.display = '';
     if (authFlow) authFlow.style.display = 'none';
+    if (_plexPinRelink) {
+        // back to the configured view, nothing changed
+        _plexPinRelink = false;
+        const plexSetup = document.getElementById('plex-setup');
+        if (plexSetup) plexSetup.style.display = 'none';
+    }
 }
 
 function restartPlexPinAuth() {
+    const relink = _plexPinRelink;
     cancelPlexPinAuth();
-    startPlexPinAuth();
+    if (relink) startPlexRelink();
+    else startPlexPinAuth();
 }
 
 async function clearPlexConfiguration() {
@@ -2216,19 +4353,36 @@ async function clearPlexConfiguration() {
     }
 }
 
-function toggleServer(serverType) {
-    // Update toggle buttons
-    document.getElementById('plex-toggle').classList.remove('active');
-    document.getElementById('jellyfin-toggle').classList.remove('active');
-    document.getElementById('navidrome-toggle').classList.remove('active');
-    document.getElementById('soulsync-toggle')?.classList.remove('active');
-    document.getElementById(`${serverType}-toggle`)?.classList.add('active');
+// The media server names, in UI order. Refreshed from GET /api/media-servers
+// (the per-server descriptor) when the settings page loads; this list is
+// what the page knew before the endpoint existed and stays the fallback.
+let _mediaServerNames = ['plex', 'jellyfin', 'navidrome', 'soulsync'];
 
-    // Show/hide server containers
-    document.getElementById('plex-container').classList.toggle('hidden', serverType !== 'plex');
-    document.getElementById('jellyfin-container').classList.toggle('hidden', serverType !== 'jellyfin');
-    document.getElementById('navidrome-container').classList.toggle('hidden', serverType !== 'navidrome');
-    document.getElementById('soulsync-container')?.classList.toggle('hidden', serverType !== 'soulsync');
+async function loadMediaServerNames() {
+    try {
+        const res = await fetch('/api/media-servers');
+        if (!res.ok) return;
+        const names = ((await res.json())?.servers || []).map(s => s?.name).filter(Boolean);
+        if (names.length) _mediaServerNames = names;
+    } catch (e) {
+        // fallback list stays
+    }
+}
+
+// The server whose toggle is active, else the first one.
+function activeServerFromToggles() {
+    const hit = _mediaServerNames.find(name => document.getElementById(`${name}-toggle`)?.classList.contains('active'));
+    return hit || _mediaServerNames[0];
+}
+
+function toggleServer(serverType) {
+    // Update toggle buttons and show the matching config container. A
+    // server without a toggle or a container on this page (the standalone
+    // library on the video side) is simply skipped.
+    for (const name of _mediaServerNames) {
+        document.getElementById(`${name}-toggle`)?.classList.toggle('active', name === serverType);
+        document.getElementById(`${name}-container`)?.classList.toggle('hidden', name !== serverType);
+    }
 
     // Show Plex setup when Plex is selected; otherwise hide both Plex panels
     const plexConfig = document.getElementById('plex-configuration');
@@ -2257,16 +4411,9 @@ function toggleServer(serverType) {
 
 function updateDownloadSourceUI() {
     const mode = document.getElementById('download-source-mode').value;
+    // Only the ORDER widget is mode-driven now. The per-source config blocks
+    // moved to the Sources tab and are no longer looked up here at all.
     const hybridContainer = document.getElementById('hybrid-settings-container');
-    const soulseekContainer = document.getElementById('soulseek-settings-container');
-    const tidalContainer = document.getElementById('tidal-download-settings-container');
-    const qobuzContainer = document.getElementById('qobuz-settings-container');
-    const youtubeContainer = document.getElementById('youtube-settings-container');
-    const hifiContainer = document.getElementById('hifi-download-settings-container');
-    const deezerDlContainer = document.getElementById('deezer-download-settings-container');
-    const amazonContainer = document.getElementById('amazon-download-settings-container');
-    const lidarrContainer = document.getElementById('lidarr-download-settings-container');
-    const soundcloudContainer = document.getElementById('soundcloud-download-settings-container');
 
     hybridContainer.style.display = mode === 'hybrid' ? 'block' : 'none';
 
@@ -2281,41 +4428,15 @@ function updateDownloadSourceUI() {
         activeSources.add(mode);
     }
 
-    // In single-source mode the one config block is shown directly. In hybrid
-    // mode there can be many active sources, so we only reveal the one the user
-    // clicked open in the priority list (accordion-style) — no endless stack.
-    const isHybrid = mode === 'hybrid';
-    const showCfg = (src) => activeSources.has(src) && (!isHybrid || _expandedHybridSource === src);
+    // Nothing per-source is hidden from here any more. Driving those blocks off
+    // the active-source set is what made a source impossible to configure until
+    // you had already enabled it: you had to switch Tidal on, saving a
+    // half-configured source into the chain, before its account fields existed
+    // to be filled in. They are plain accordions on the Sources tab now.
 
-    soulseekContainer.style.display = showCfg('soulseek') ? 'block' : 'none';
-    tidalContainer.style.display = showCfg('tidal') ? 'block' : 'none';
-    qobuzContainer.style.display = showCfg('qobuz') ? 'block' : 'none';
-    youtubeContainer.style.display = showCfg('youtube') ? 'block' : 'none';
-    hifiContainer.style.display = showCfg('hifi') ? 'block' : 'none';
-    if (deezerDlContainer) deezerDlContainer.style.display = showCfg('deezer_dl') ? 'block' : 'none';
-    if (amazonContainer) amazonContainer.style.display = showCfg('amazon') ? 'block' : 'none';
-    if (lidarrContainer) lidarrContainer.style.display = showCfg('lidarr') ? 'block' : 'none';
-    if (soundcloudContainer) soundcloudContainer.style.display = showCfg('soundcloud') ? 'block' : 'none';
-    const prowlarrRedirect = document.getElementById('prowlarr-source-redirect');
-    if (prowlarrRedirect) {
-        const showProwlarr = showCfg('torrent') || showCfg('usenet');
-        prowlarrRedirect.style.display = showProwlarr ? 'block' : 'none';
-    }
-
-    // Indexers & Downloaders: torrent/usenet setup (Prowlarr + the Torrent and
-    // Usenet client tiles) is shared config — keep it always reachable on the
-    // Downloads tab for BOTH the music and video sides, like the Advanced /
-    // Appearance tabs. (It used to be gated on an active torrent/usenet source,
-    // which hid it from anyone whose source was something else — and from the video
-    // side entirely, whose source lives on a separate dropdown.) Only tab-gated so
-    // it never leaks onto another tab.
-    const onDownloadsTab = document.querySelector('.stg-tab.active')?.dataset.tab === 'downloads';
-    const indSection = document.getElementById('indexers-downloaders-section');
-    if (indSection) indSection.style.display = onDownloadsTab ? '' : 'none';
-    const torrentTile = document.getElementById('torrent-tile');
-    if (torrentTile) torrentTile.style.display = '';
-    const usenetTile = document.getElementById('usenet-tile');
-    if (usenetTile) usenetTile.style.display = '';
+    // Indexers, the torrent client and the usenet client used to be gated to
+    // the Downloads tab from here. They live on the Sources tab now, as panels
+    // behind their own tiles, so there is nothing to show or hide.
 
     // Quality profile is now a GLOBAL system — the same ranked-target list
     // drives every source (Soulseek, Tidal, Qobuz, HiFi, Deezer, …), so it is
@@ -2329,23 +4450,10 @@ function updateDownloadSourceUI() {
         qualityProfileTile.style.display = onQualityTab ? '' : 'none';
     }
 
-    // Only auto-probe a source's live status when its config panel is visible
-    // (always in single-source mode; only the opened one in hybrid mode).
-    if (showCfg('tidal')) {
-        checkTidalDownloadAuthStatus();
-    }
-    if (showCfg('qobuz')) {
-        checkQobuzAuthStatus();
-    }
-    if (showCfg('hifi')) {
-        testHiFiConnection();
-    }
-    if (showCfg('amazon')) {
-        testAmazonConnection();
-    }
-    if (showCfg('soundcloud')) {
-        testSoundcloudConnection();
-    }
+    // The per-source auth probes used to run from here, gated on the same
+    // active-source test. They belong to a card being OPENED now — see
+    // probeSourceOnOpen — which also stops them firing on every unrelated
+    // settings redraw.
 }
 
 function updateHybridSecondaryOptions() {
@@ -2359,7 +4467,6 @@ function updateHybridSecondaryOptions() {
         { value: 'qobuz', label: 'Qobuz' },
         { value: 'hifi', label: 'HiFi' },
         { value: 'deezer_dl', label: 'Deezer' },
-        { value: 'amazon', label: 'Amazon Music' },
         { value: 'lidarr', label: 'Lidarr' },
         { value: 'soundcloud', label: 'SoundCloud' },
     ];
@@ -2389,12 +4496,9 @@ function updateHybridSecondaryOptions() {
 let currentQualityProfile = null;
 let qualityProfileAutoSaveTimer = null;
 
-// Which profile the tiles currently show. null = "the live default", the
-// only state that existed before profiles were previewable — autosave keeps
-// writing straight into the active default/global config exactly as always.
-// Set to a specific id by previewQualityProfile() when the user clicks a
-// DIFFERENT (non-default) profile's row to look at/edit it; in that state
-// autosave must NOT touch the live default — see debouncedSaveQualityProfile.
+// Which non-default profile the editor currently shows. null means the active
+// default. This is an edit target, not an activation flag: selecting a profile
+// to edit never makes it the default, but every save goes back to this row.
 let _qpEditingProfileId = null;
 
 function _qpDefaultProfileId() {
@@ -2407,18 +4511,15 @@ function _qpDefaultProfileId() {
 function debouncedSaveQualityProfile() {
     if (window._suppressSettingsAutoSave) return;
     if (window._settingsLoadFailed) return;
-    // Previewing a specific NON-default profile: the legacy save endpoint
-    // below always writes the LIVE default row + pushes into global config —
-    // autosaving here would silently overwrite the active profile (and
-    // anything downloading right now under it) while the user is just
-    // looking at/tweaking a different one. Edits only persist once the user
-    // explicitly clicks that profile row's Update (✎) button.
-    if (_qpEditingProfileId !== null && _qpEditingProfileId !== _qpDefaultProfileId()) {
-        qpShowEditingBanner();
-        return;
-    }
     if (qualityProfileAutoSaveTimer) clearTimeout(qualityProfileAutoSaveTimer);
-    qualityProfileAutoSaveTimer = setTimeout(() => saveQualityProfile(), 800);
+    // Capture both target and values now. If the user switches profiles before
+    // the debounce expires, the pending write still belongs to the profile
+    // that was on screen when the edit happened instead of overwriting the
+    // newly selected profile.
+    const targetProfileId = _qpEditingProfileId ?? _qpDefaultProfileId();
+    const profile = collectFullQualityBundleFromUI();
+    qualityProfileAutoSaveTimer = setTimeout(
+        () => saveQualityProfile({ targetProfileId, profile }), 800);
 }
 
 async function loadQualityProfile() {
@@ -2428,7 +4529,10 @@ async function loadQualityProfile() {
 
         if (data.success) {
             currentQualityProfile = data.profile;
+            _qpEditingProfileId = null;
             populateQualityProfileUI(currentQualityProfile);
+            applyFullQualityBundleToDom(currentQualityProfile);
+            qpHideEditingBanner();
         }
     } catch (error) {
         console.error('Error loading quality profile:', error);
@@ -2471,6 +4575,9 @@ function populateQualityProfileUI(profile) {
 
     const rankCandidatesCheckbox = document.getElementById('quality-rank-candidates');
     if (rankCandidatesCheckbox) rankCandidatesCheckbox.checked = profile.rank_candidates_by_quality === true;
+
+    const releaseImportSelect = document.getElementById('quality-release-import-mode');
+    if (releaseImportSelect) releaseImportSelect.value = profile.release_import_mode === 'album_tracks' ? 'album_tracks' : 'requested_tracks';
 
     const upgradePolicySelect = document.getElementById('quality-upgrade-policy');
     if (upgradePolicySelect) {
@@ -2520,12 +4627,14 @@ function onUpgradePolicyChange() {
 // the icon's row to the next .setting-help-body sibling, so it works whether the
 // body is the immediate next element or sits after a control (e.g. a <select>),
 // and regardless of any wrapping container.
-function toggleSettingHelp(iconEl) {
-    // Locate the help body to toggle. Search order:
+function _settingHelpBody(iconEl) {
+    // Locate the help body an info icon belongs to. Search order:
     //  1) the next .setting-help-body sibling after the icon's row (icon + body
     //     both inside the same .form-group / .setting-row),
     //  2) the element right after the enclosing .form-group (help wall that sits
     //     as a sibling just below the group — the common always-visible case).
+    // An icon moved into its one-line summary remembers its body (#1822).
+    if (iconEl.__helpBody) return iconEl.__helpBody;
     const row = iconEl.closest('.setting-row') || iconEl;
     let el = row.nextElementSibling;
     while (el && !el.classList.contains('setting-help-body')) {
@@ -2538,6 +4647,12 @@ function toggleSettingHelp(iconEl) {
         // into the next setting/group.
         if (sib && sib.classList.contains('setting-help-body')) el = sib;
     }
+    return el || null;
+}
+
+function toggleSettingHelp(iconEl) {
+    const row = iconEl.closest('.setting-row') || iconEl;
+    const el = _settingHelpBody(iconEl);
     if (el) {
         el.hidden = !el.hidden;
         // Reflect open state on the icon itself (filled badge) so it's clear
@@ -2690,9 +4805,8 @@ async function applyQualityPreset(presetName) {
     // clicking a Quick-Set button while just looking at a different profile
     // would silently destroy the real default's settings and then swap the
     // tiles to show it instead (looks like the preview "jumps" to a random
-    // profile). Load the preset's values locally instead — read-only, never
-    // touches the server — same as previewQualityProfile; it only persists
-    // once the user explicitly clicks that profile row's Update (✎).
+    // profile). Load the preset's values locally, then save the resulting full
+    // bundle through this profile's id-qualified endpoint.
     if (_qpEditingProfileId !== null && _qpEditingProfileId !== _qpDefaultProfileId()) {
         try {
             const response = await fetch('/api/quality-profile/presets');
@@ -2709,14 +4823,17 @@ async function applyQualityPreset(presetName) {
                 ...preset,
                 search_mode: uiState.search_mode,
                 rank_candidates_by_quality: uiState.rank_candidates_by_quality,
+                release_import_mode: uiState.release_import_mode,
             };
+            currentQualityProfile = merged;
             window._suppressSettingsAutoSave = true;
             try {
                 populateQualityProfileUI(merged);
             } finally {
                 window._suppressSettingsAutoSave = false;
             }
-            showToast(`Previewing '${PRESET_LABELS[presetName] || presetName}' — click ✎ on the profile row to save it here`, 'success');
+            debouncedSaveQualityProfile();
+            showToast(`Applied '${PRESET_LABELS[presetName] || presetName}' to this profile`, 'success');
         } catch (error) {
             console.error('Error loading quality preset:', error);
             showToast('Failed to load preset', 'error');
@@ -2738,7 +4855,7 @@ async function applyQualityPreset(presetName) {
             } finally {
                 window._suppressSettingsAutoSave = false;
             }
-            renderCustomQualityProfiles(_qpProfileRows);
+            await loadCustomQualityProfiles();
             showToast(`Switched to '${PRESET_LABELS[presetName] || presetName}'`, 'success');
         } else {
             showToast(`Failed to apply preset: ${data.error}`, 'error');
@@ -2780,6 +4897,7 @@ async function resetActiveQualityPreset() {
             } finally {
                 window._suppressSettingsAutoSave = false;
             }
+            await loadCustomQualityProfiles();
             showToast(`Reset '${PRESET_LABELS[presetName] || presetName}' to defaults`, 'success');
         } else {
             showToast(`Failed to reset preset: ${data.error}`, 'error');
@@ -2808,40 +4926,47 @@ function collectQualityProfileFromUI() {
         fallback_enabled: document.getElementById('quality-fallback-enabled')?.checked ?? true,
         search_mode: document.getElementById('quality-search-mode')?.value === 'best_quality' ? 'best_quality' : 'priority',
         rank_candidates_by_quality: document.getElementById('quality-rank-candidates')?.checked ?? false,
+        release_import_mode: document.getElementById('quality-release-import-mode')?.value === 'album_tracks' ? 'album_tracks' : 'requested_tracks',
         upgrade_policy: document.getElementById('quality-upgrade-policy')?.value === 'until_cutoff' ? 'until_cutoff' : 'acceptable',
         upgrade_cutoff_index: parseInt(document.getElementById('quality-upgrade-cutoff')?.value || '0', 10) || 0,
         ranked_targets,
     };
 }
 
-async function saveQualityProfile() {
-    // Same guard as debouncedSaveQualityProfile, enforced here too — this is
-    // also called directly by the page-wide "Save Settings" button
-    // (saveSettings), which bypasses the debounce path entirely. Without
-    // this, clicking Save Settings for some unrelated setting while merely
-    // PREVIEWING a different profile would still silently push what's on
-    // screen into the live default. Returns true (not false/"failed") —
-    // the banner already explains the skip; saveSettings() would otherwise
-    // report it as an error toast, which it isn't.
-    if (_qpEditingProfileId !== null && _qpEditingProfileId !== _qpDefaultProfileId()) {
-        qpShowEditingBanner();
-        return true;
-    }
+async function saveQualityProfile({ targetProfileId, profile } = {}) {
     try {
-        const profile = collectQualityProfileFromUI();
+        const resolvedTargetId = targetProfileId ?? _qpEditingProfileId ?? _qpDefaultProfileId();
+        const payload = profile || collectFullQualityBundleFromUI();
 
-        const response = await fetch('/api/quality-profile', {
+        // Named-profile CRUD is the one endpoint that can save the complete
+        // Quality-page bundle to a specific row. The old singleton endpoint
+        // can only safely target the default and is retained as a defensive
+        // fallback while the profile list is unavailable.
+        const url = resolvedTargetId == null
+            ? '/api/quality-profile'
+            : `/api/quality-profile/custom/${resolvedTargetId}/update`;
+
+        const response = await fetch(url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(profile)
+            body: JSON.stringify(payload)
         });
 
         const data = await response.json();
 
         if (data.success) {
-            currentQualityProfile = profile;
+            if (resolvedTargetId === (_qpEditingProfileId ?? _qpDefaultProfileId())) {
+                currentQualityProfile = payload;
+            }
+            if (Array.isArray(data.profiles)) {
+                _qpSetProfileRows(data.profiles);
+                renderCustomQualityProfiles(_qpProfileRows);
+                if (document.getElementById('qp-manager-overlay')) {
+                    renderQualityProfileManager();
+                }
+            }
             console.log('Quality profile saved successfully');
             return true;
         } else {
@@ -2925,8 +5050,13 @@ function qpProfileSummary(profile) {
     }
     if (profile.acoustid_required) parts.push('strict AcoustID');
     if (profile.deep_audio_verify) parts.push('deep verify');
-    if (profile.downsample_enabled) parts.push('downsample');
-    if (profile.lossy_copy_enabled) parts.push(`lossy copy ${(profile.lossy_copy_codec || 'mp3').toUpperCase()}`);
+    if (profile.downsample_enabled) parts.push('retain CD-quality (acquisition remembered)');
+    if (profile.lossy_copy_enabled) {
+        const codec = (profile.lossy_copy_codec || 'mp3').toUpperCase();
+        parts.push(profile.lossy_copy_delete_original
+            ? `retain ${codec} only (acquisition remembered)`
+            : `lossless + ${codec} companion`);
+    }
     if (['until_cutoff', 'until_top'].includes(profile.upgrade_policy)) {
         const cutoffIndex = Math.min(Math.max(parseInt(profile.upgrade_cutoff_index || '0', 10) || 0, 0), Math.max(targets.length - 1, 0));
         const cutoff = targets[cutoffIndex]?.label || 'top target';
@@ -3041,15 +5171,13 @@ function renderCustomQualityProfiles(profiles) {
         };
         actions.appendChild(ren);
 
-        // Update: overwrite this profile's stored settings with whatever is
-        // currently on the page (edit-in-place, keeps the name). Allowed on
-        // every profile, including the starter ones — it's an overwrite,
-        // not a delete.
+        // Optional explicit save-now action. Normal edits already autosave to
+        // the selected row, and the page-wide Save Settings button does too.
         const upd = document.createElement('button');
         upd.type = 'button';
         upd.className = 'qp-profile-action qp-action-update';
         upd.textContent = '✎';
-        upd.title = `Update '${profile.name}' with the current page settings`;
+        upd.title = `Save the current Quality-page settings to '${profile.name}' now`;
         upd.onclick = (e) => {
             e.stopPropagation();
             updateCustomQualityProfile(profile.id, profile.name);
@@ -3216,6 +5344,7 @@ function applyFullQualityBundleToDom(profile) {
     set('import-replace-lower-quality', profile.replace_lower_quality);
     set('lossy-copy-enabled', profile.lossy_copy_enabled);
     set('lossy-copy-codec', profile.lossy_copy_codec);
+    updateLossyBitrateOptions();
     set('lossy-copy-bitrate', profile.lossy_copy_bitrate);
     set('lossy-copy-delete-original', profile.lossy_copy_delete_original);
     const lossyOptions = document.getElementById('lossy-copy-options');
@@ -3352,10 +5481,8 @@ function confirmSetDefaultQualityProfileById(profileId) {
 
 // Load a profile's settings into the tile editor for viewing/editing —
 // purely read-only against the DB (a dedicated GET, not the mutating
-// /apply endpoint) so it can never make the previewed profile the live
-// default or touch anything mid-download. Edits made while previewing are
-// local until the row's Update (✎) button explicitly saves them into THIS
-// profile — see debouncedSaveQualityProfile.
+// /apply endpoint) so selecting it can never make it the live default.
+// Subsequent edits autosave back to this id — see debouncedSaveQualityProfile.
 async function previewQualityProfile(profileId) {
     try {
         const response = await fetch(`/api/quality-profile/custom/${profileId}`);
@@ -3370,7 +5497,7 @@ async function previewQualityProfile(profileId) {
         // before previewing this profile was exactly the kind of drift that made
         // preset actions apply to the wrong thing.
         currentQualityProfile = data.profile;
-        _qpEditingProfileId = profileId;
+        _qpEditingProfileId = data.profile.is_default ? null : profileId;
         window._suppressSettingsAutoSave = true;
         try {
             populateQualityProfileUI(data.profile);
@@ -3379,7 +5506,8 @@ async function previewQualityProfile(profileId) {
             window._suppressSettingsAutoSave = false;
         }
         renderCustomQualityProfiles(_qpProfileRows);
-        qpShowEditingBanner();
+        if (_qpEditingProfileId === null) qpHideEditingBanner();
+        else qpShowEditingBanner();
     } catch (error) {
         console.error('Error previewing quality profile:', error);
         showToast('Failed to load profile', 'error');
@@ -3398,7 +5526,7 @@ function qpShowEditingBanner() {
     // The id not resolving means the cache is stale or the profile is gone —
     // showing a nameless "viewing this profile" is just confusing; hide
     // instead of guessing.
-    if (!profile) {
+    if (!profile || profile.is_default) {
         banner.style.display = 'none';
         return;
     }
@@ -3480,8 +5608,8 @@ async function toggleAutoImportQualityProfile(profileId) {
 // (Settings → Import, falls back to Default when unset). Both assignments
 // are also reachable
 // inline from the row list (the dot / the ⇩ button); this is the overview +
-// explanation surface, not a second way to edit a profile's own settings —
-// that only ever happens via previewQualityProfile + a row's Update (✎).
+// explanation surface, not a second profile editor — selecting a row on the
+// Quality page and changing its controls is the editing path.
 function qpManagerOverlay() {
     let overlay = document.getElementById('qp-manager-overlay');
     if (overlay) return overlay;
@@ -3714,6 +5842,129 @@ function _removeMusicPathRow(btn) {
 
 function collectMusicPaths() {
     const inputs = document.querySelectorAll('.music-path-input');
+    const paths = [];
+    inputs.forEach(input => {
+        const val = input.value.trim();
+        if (val) paths.push(val);
+    });
+    return paths;
+}
+
+// ── Sample Studio folders ──
+// Mirrors the additional-music-folders UI above: a dynamic list of output
+// folders for saved chops. The first entry is the default destination.
+
+function renderSamplePaths(paths) {
+    const container = document.getElementById('sample-paths-list');
+    if (!container) return;
+    if (!paths || paths.length === 0) {
+        container.innerHTML = '<div style="color: rgba(255,255,255,0.3); font-size: 0.85em; padding: 4px 0;">No sample folders configured. Saved chops fall back to the default folder.</div>';
+        return;
+    }
+    container.innerHTML = paths.map((p, i) => `
+        <div class="form-group sample-path-row" style="margin-bottom: 4px;">
+            <input type="text" class="sample-path-input" value="${escapeHtml(p)}" placeholder="/samples or C:\\Samples" style="flex:1;">
+            ${i === 0 ? '<span style="color: rgba(255,255,255,0.4); font-size: 0.8em; padding: 8px 4px;">default</span>' : ''}
+            <button class="test-button" onclick="_removeSamplePathRow(this)" style="padding: 8px 12px; color: #ef5350; border-color: rgba(239,83,80,0.3);">&times;</button>
+        </div>
+    `).join('');
+    // Attach auto-save to dynamically rendered inputs
+    container.querySelectorAll('.sample-path-input').forEach(input => {
+        input.addEventListener('change', () => { if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings(); });
+    });
+}
+
+// --- Spoken-word artists: music downloads filed in the audiobook library ---
+// The artist page and watchlist own the toggle (React); this is only the list.
+
+async function loadAudiobookRoutes() {
+    const list = document.getElementById('audiobook-routes-list');
+    if (!list) return;
+    try {
+        const { artists = [] } = await (await fetch('/api/audiobook-routes')).json();
+        list.innerHTML = artists.length
+            ? artists.map(a => `<div class="abr-row"><span>${escapeHtml(a.label || a.route_key)}</span>
+                <button class="test-button" type="button" data-route="${escapeHtml(a.route_key)}" data-action="move">Move existing…</button>
+                <button class="test-button abr-remove" type="button" data-route="${escapeHtml(a.route_key)}" data-action="remove">&times;</button></div>`).join('')
+            : '<div class="abr-empty">No artists routed. Use “Treat as audiobook” on an artist’s page.</div>';
+        list.onclick = e => {
+            const btn = e.target.closest('button[data-action]');
+            if (btn) audiobookRouteAction(btn.dataset.action, btn.dataset.route);
+        };
+    } catch (e) {
+        list.textContent = 'Could not load the list.';
+    }
+}
+
+async function audiobookRouteAction(action, key) {
+    const url = '/api/audiobook-routes/' + encodeURIComponent(key);
+    const call = (path, init) => fetch(url + path, init).then(async r => {
+        const data = await r.json();
+        if (!data.success) throw new Error(data.error || 'failed');
+        return data;
+    });
+    const post = apply => call('/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apply }),
+    });
+    try {
+        if (action === 'remove') {
+            await call('', { method: 'DELETE' });
+            await loadAudiobookRoutes();
+            return;
+        }
+        const items = (await post(false)).items || [];
+        const todo = items.filter(i => i.action === 'move').length;
+        const clash = items.filter(i => i.action === 'exists').length;
+        if (!todo) {
+            showToast(clash ? `Nothing to move: ${clash} album(s) already exist in the audiobook folder.`
+                            : 'No albums of this artist in the music library.', 'info');
+            return;
+        }
+        if (!await showConfirmDialog({
+            title: 'Move albums',
+            message: `Move ${todo} album folder(s) from the music library to the audiobook folder? `
+                + `${clash ? `${clash} album(s) already exist there and stay as they are. ` : ''}`
+                + 'Your media server needs a library scan afterwards.',
+            confirmText: 'Move',
+        })) return;
+        const done = await post(true);
+        showToast(`Moved ${done.moved} album(s)` + (done.failed ? `, ${done.failed} failed` : ''),
+                  done.failed ? 'error' : 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+function addSamplePathRow() {
+    const container = document.getElementById('sample-paths-list');
+    if (!container) return;
+    // Clear the "no folders" message if present
+    const placeholder = container.querySelector('div[style*="color: rgba"]');
+    if (placeholder && !container.querySelector('.sample-path-row')) placeholder.remove();
+    const row = document.createElement('div');
+    row.className = 'form-group sample-path-row';
+    row.style.marginBottom = '4px';
+    row.innerHTML = `
+        <input type="text" class="sample-path-input" value="" placeholder="/samples or C:\\Samples" style="flex:1;">
+        <button class="test-button" onclick="_removeSamplePathRow(this)" style="padding: 8px 12px; color: #ef5350; border-color: rgba(239,83,80,0.3);">&times;</button>
+    `;
+    container.appendChild(row);
+    const input = row.querySelector('input');
+    input.focus();
+    // Auto-save when the user finishes typing a path
+    input.addEventListener('change', () => { if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings(); });
+}
+
+function _removeSamplePathRow(btn) {
+    btn.closest('.sample-path-row').remove();
+    // Auto-save after removing a path
+    if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
+}
+
+function collectSamplePaths() {
+    const inputs = document.querySelectorAll('.sample-path-input');
     const paths = [];
     inputs.forEach(input => {
         const val = input.value.trim();
@@ -4072,10 +6323,12 @@ async function activateDevMode() {
         });
         const data = await response.json();
         if (data.success) {
+            // Re-broadcast for the React dashboard's Hydrabase orb.
+            window.dispatchEvent(new CustomEvent('ss:dev-mode', { detail: { enabled: true } }));
             document.getElementById('dev-mode-status').textContent = 'Active';
             document.getElementById('dev-mode-status').style.color = 'rgb(var(--accent-light-rgb))';
             document.getElementById('hydrabase-nav').style.display = '';
-            document.getElementById('hydrabase-button-container').style.display = '';
+            // Orb visibility rides the dispatch (React-owned since the flip).
             document.getElementById('dev-mode-password').value = '';
             showToast('Dev mode activated', 'success');
         } else {
@@ -4143,8 +6396,9 @@ async function hydrabaseDisconnect() {
     document.getElementById('hydra-connection-status').style.color = '#888';
     document.getElementById('hydra-connect-btn').textContent = 'Connect';
     // Dev mode is disabled on disconnect — hide Hydrabase nav and update settings status
+    window.dispatchEvent(new CustomEvent('ss:dev-mode', { detail: { enabled: false } }));
     document.getElementById('hydrabase-nav').style.display = 'none';
-    document.getElementById('hydrabase-button-container').style.display = 'none';
+    // Orb visibility rides the dispatch (React-owned since the flip).
     const devStatus = document.getElementById('dev-mode-status');
     if (devStatus) {
         devStatus.textContent = 'Inactive';
@@ -4286,6 +6540,53 @@ function _getTagConfig(path) {
     return el ? el.checked : true;
 }
 
+// ── reading the form without destroying what is not on it ──────────────────
+// `getElementById('x')?.value || ''` looks defensive and is the opposite: when
+// the element is absent it writes an EMPTY STRING over the stored setting. The
+// server sets keys one at a time with no deep merge, so an empty string IS the
+// new value.
+//
+// That is not hypothetical. A broken edit removed the Indexers / Torrent /
+// Usenet block from index.html for a few minutes; the running server serves
+// that file per request, so the settings page rendered without those fields and
+// the next auto-save wiped three URLs out of the database. The API key survived
+// only because the server refuses to overwrite a stored secret with a blank.
+//
+// These return undefined for a missing element, and JSON.stringify drops
+// undefined-valued keys — so the key never reaches the server and the stored
+// value is left exactly as it was. A missing field now means "I have nothing to
+// say about this", which is the truth, instead of "set it to nothing".
+function _cfgStr(id, { trim = false, fallback } = {}) {
+    const el = document.getElementById(id);
+    if (!el) return undefined;              // absent -> say nothing about it
+    let v = el.value ?? '';
+    if (trim) v = String(v).trim();
+    return (v === '' && fallback !== undefined) ? fallback : v;
+}
+
+// `parseFloat(el?.value) || 0` has the same fault as the int version.
+function _cfgFloat(id, fallback) {
+    const el = document.getElementById(id);
+    if (!el) return undefined;
+    const n = parseFloat(el.value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+// Same rule for numbers. `parseInt(el?.value) || 0` writes a ZERO over the
+// stored setting when the element is missing — which for a timeout or a bitrate
+// floor is not a blank, it is a different and usually harmful value.
+function _cfgInt(id, fallback) {
+    const el = document.getElementById(id);
+    if (!el) return undefined;
+    const n = parseInt(el.value, 10);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function _cfgBool(id) {
+    const el = document.getElementById(id);
+    return el ? !!el.checked : undefined;
+}
+
 async function saveSettings(quiet = false) {
     // #879: refuse to save if the settings never loaded successfully — the form
     // is showing defaults, not the user's real config, so saving would wipe it.
@@ -4297,6 +6598,19 @@ async function saveSettings(quiet = false) {
         return;
     }
 
+    // Comma-separated text fields, tolerant of stray spaces and empties.
+    const splitList = (raw) => String(raw || '').split(',')
+        .map(part => part.trim())
+        .filter(Boolean);
+
+    let musicBrainzServerSettings;
+    try {
+        musicBrainzServerSettings = collectMusicBrainzServerSettings();
+    } catch (error) {
+        if (!quiet) showToast(error.message, 'error');
+        return;
+    }
+
     // Validate file organization templates before saving
     const validationErrors = validateFileOrganizationTemplates();
     if (validationErrors.length > 0) {
@@ -4305,14 +6619,7 @@ async function saveSettings(quiet = false) {
     }
 
     // Determine active server from toggle buttons
-    let activeServer = 'plex';
-    if (document.getElementById('jellyfin-toggle').classList.contains('active')) {
-        activeServer = 'jellyfin';
-    } else if (document.getElementById('navidrome-toggle').classList.contains('active')) {
-        activeServer = 'navidrome';
-    } else if (document.getElementById('soulsync-toggle')?.classList.contains('active')) {
-        activeServer = 'soulsync';
-    }
+    let activeServer = activeServerFromToggles();
     // ISOLATION: this page is reused on the video side. Connection details (Plex/
     // Jellyfin creds) ARE shared and save fine — but the video side must NEVER
     // change the MUSIC active server. So when saving from the video side, keep
@@ -4357,7 +6664,7 @@ async function saveSettings(quiet = false) {
     // Validate the optional "Playlist File Naming" template before saving: it's a
     // filename (no path separator) and must include $title — mirrors the server-side
     // rule so a broken value can't be stored. Empty = feature off (allowed).
-    const _plItemTpl = (document.getElementById('template-playlist-item')?.value || '').trim();
+    const _plItemTpl = (_cfgStr('template-playlist-item')).trim();
     if (_plItemTpl) {
         if (_plItemTpl.includes('/') || _plItemTpl.includes('\\')) {
             showToast('Playlist File Naming can\'t contain a folder separator ( / or \\ ) — it names the file, not a path.', 'error');
@@ -4404,31 +6711,51 @@ async function saveSettings(quiet = false) {
             api_key: document.getElementById('soulseek-api-key').value,
             download_path: document.getElementById('download-path').value,
             transfer_path: document.getElementById('transfer-path').value,
-            min_free_disk_gb: Math.max(0, parseFloat(document.getElementById('min-free-disk-gb')?.value) || 0),
+            min_free_disk_gb: _cfgFloat('min-free-disk-gb', 0),
             search_timeout: parseInt(document.getElementById('soulseek-search-timeout').value) || 60,
             search_timeout_buffer: parseInt(document.getElementById('soulseek-search-timeout-buffer').value) || 15,
             search_min_delay_seconds: parseInt(document.getElementById('soulseek-search-min-delay-seconds').value) || 0,
             min_peer_upload_speed: parseInt(document.getElementById('soulseek-min-peer-speed').value) || 0,
             max_peer_queue: parseInt(document.getElementById('soulseek-max-peer-queue').value) || 0,
+            observed_speed_fallback_enabled: document.getElementById('soulseek-observed-speed-fallback-enabled').checked,
+            min_observed_download_speed_kbps: _cfgInt('soulseek-min-observed-download-speed', 250),
+            preferred_version: _cfgStr('preferred-version'),
             download_timeout: (parseInt(document.getElementById('soulseek-download-timeout').value) || 10) * 60,
-            auto_clear_searches: document.getElementById('soulseek-auto-clear-searches').checked
+            auto_clear_searches: document.getElementById('soulseek-auto-clear-searches').checked,
+            cleanup_scope: document.getElementById('soulseek-cleanup-scope').value === 'all' ? 'all' : 'own'
         },
         listenbrainz: {
             base_url: document.getElementById('listenbrainz-base-url').value,
             token: document.getElementById('listenbrainz-token').value,
+            username: _cfgStr('listenbrainz-username', { trim: true }),
             scrobble_enabled: document.getElementById('listenbrainz-scrobble-enabled').checked,
         },
         acoustid: {
             api_key: document.getElementById('acoustid-api-key').value,
             enabled: document.getElementById('acoustid-enabled').checked,
-            require_verified: document.getElementById('acoustid-require-verified')?.checked === true
+            require_verified: _cfgBool('acoustid-require-verified')
+        },
+        concerts: {
+            ticketmaster_api_key: _cfgStr('concerts-ticketmaster-api-key', { trim: true }),
+            setlistfm_api_key: _cfgStr('concerts-setlistfm-api-key', { trim: true }),
+            // ?. not || '': an absent field must stay undefined, or a save wipes it
+            country: _cfgStr('concerts-country', { trim: true })?.toUpperCase()
         },
         lastfm: {
+            // _cfgStr rather than .value: this input is absent on the video
+            // side, and reading .value off a missing element is how a save
+            // wipes a stored setting.
+            username: _cfgStr('lastfm-username', { trim: true }),
             api_key: document.getElementById('lastfm-api-key').value,
             api_secret: document.getElementById('lastfm-api-secret').value,
             scrobble_enabled: document.getElementById('lastfm-scrobble-enabled').checked,
             embed_tags: document.getElementById('embed-lastfm').checked,
             tags: _collectServiceTags('lastfm')
+        },
+        pollinations: {
+            // _cfgStr: undefined when the field is absent (video side), so a
+            // save there doesn't wipe the stored key
+            api_key: _cfgStr('pollinations-api-key', { trim: true }),
         },
         genius: {
             access_token: document.getElementById('genius-access-token').value,
@@ -4440,6 +6767,9 @@ async function saveSettings(quiet = false) {
             embed_tags: document.getElementById('embed-itunes').checked,
             tags: _collectServiceTags('itunes')
         },
+        yandex: {
+            token: _cfgStr('yandex-token'),
+        },
         discogs: {
             token: document.getElementById('discogs-token').value,
         },
@@ -4450,11 +6780,17 @@ async function saveSettings(quiet = false) {
             spotify_free: metadataSource === 'spotify_free',
             // Independent opt-in: run the enrichment worker on Spotify Free even
             // when an official account is connected (spares the official quota).
-            spotify_free_enrichment: document.getElementById('metadata-spotify-free-enrichment')?.checked || false
+            spotify_free_enrichment: _cfgBool('metadata-spotify-free-enrichment')
         },
         experimental: {
-            jiosaavn_enabled: document.getElementById('experimental-jiosaavn-enabled')?.checked === true,
-            bandcamp_enabled: document.getElementById('experimental-bandcamp-enabled')?.checked === true,
+            jiosaavn_enabled: _cfgBool('experimental-jiosaavn-enabled'),
+            bandcamp_enabled: _cfgBool('experimental-bandcamp-enabled'),
+        },
+        image_cache: {
+            // Server-side resizing is opt-in; the cache itself keeps whatever
+            // it was already set to (on, for every install since it shipped).
+            thumbnails: _cfgBool('imgcache-thumbnails'),
+            max_cache_mb: _cfgInt('imgcache-max-mb', 0),
         },
         hydrabase: {
             url: document.getElementById('hydrabase-url').value,
@@ -4469,7 +6805,11 @@ async function saveSettings(quiet = false) {
             stream_source: document.getElementById('stream-source').value,
             max_concurrent: parseInt(document.getElementById('max-concurrent-downloads').value) || 3,
             // #1056 — streaming-source search timeout override; 0 = source defaults
-            source_search_timeout: parseInt(document.getElementById('source-search-timeout')?.value) || 0,
+            source_search_timeout: _cfgInt('source-search-timeout', 0),
+            max_mb_per_minute: (() => {
+                const value = _cfgFloat('music-max-mb-per-minute', 0);
+                return value === undefined ? undefined : Math.max(0, value);
+            })(),
             // Stalled-torrent knobs (rendered in the torrent client section).
             // UI is in MINUTES; stored in SECONDS. Blank/NaN → 10 min default;
             // 0 stays 0 (disabled).
@@ -4477,11 +6817,20 @@ async function saveSettings(quiet = false) {
                 const m = parseInt(document.getElementById('torrent-stall-timeout')?.value, 10);
                 return (Number.isFinite(m) && m >= 0 ? m : 10) * 60;
             })(),
-            torrent_stall_action: document.getElementById('torrent-stall-action')?.value || 'abandon',
+            torrent_stall_action: _cfgStr('torrent-stall-action', { fallback: 'abandon' }),
+            // #1139: don't queue a release nobody is serving. Blank/NaN → 1;
+            // 0 stays 0 (gate off).
+            torrent_min_seeders: (() => {
+                const n = parseInt(document.getElementById('torrent-min-seeders')?.value, 10);
+                return Number.isFinite(n) && n >= 0 ? n : 1;
+            })(),
             // In-container path(s) where SoulSync reads finished torrent/usenet
             // downloads (#857). Rendered in the torrent/usenet client sections.
-            torrent_download_path: document.getElementById('torrent-download-path')?.value || '',
-            usenet_download_path: document.getElementById('usenet-download-path')?.value || '',
+            torrent_download_path: _cfgStr('torrent-download-path'),
+            usenet_download_path: _cfgStr('usenet-download-path'),
+            // #1851: fetch an album through its YouTube Music playlist. Rendered
+            // in the YouTube section; it lives here because the album flow reads it.
+            youtube_album_bundle: _cfgBool('youtube-album-bundle'),
         },
         tidal_download: {
             // quality derived from the global Quality Profile (ranked targets); allow_fallback always true
@@ -4493,40 +6842,44 @@ async function saveSettings(quiet = false) {
             embed_tags: document.getElementById('embed-hifi').checked,
             tags: _collectServiceTags('hifi')
         },
+        // read only when the inputs exist: a missing element must leave the
+        // stored setting alone rather than save over it
+        beatport: document.getElementById('embed-beatport') ? {
+            embed_tags: document.getElementById('embed-beatport').checked,
+            search_all_tracks: _cfgBool('beatport-search-all'),
+            tags: _collectServiceTags('beatport')
+        } : undefined,
         deezer_download: {
             arl: document.getElementById('deezer-download-arl').value || '',
-        },
-        amazon_download: {
-            // quality derived from the global Quality Profile (ranked targets); allow_fallback always true
         },
         lidarr_download: {
             url: document.getElementById('lidarr-url').value || '',
             api_key: document.getElementById('lidarr-api-key').value || '',
         },
         prowlarr: {
-            url: document.getElementById('prowlarr-url')?.value || '',
-            api_key: document.getElementById('prowlarr-api-key')?.value || '',
-            indexer_ids: document.getElementById('prowlarr-indexer-ids')?.value || '',
+            url: _cfgStr('prowlarr-url'),
+            api_key: _cfgStr('prowlarr-api-key'),
+            indexer_ids: _cfgStr('prowlarr-indexer-ids'),
         },
         torrent_client: {
-            type: document.getElementById('torrent-client-type')?.value || 'qbittorrent',
-            url: document.getElementById('torrent-client-url')?.value || '',
-            username: document.getElementById('torrent-client-username')?.value || '',
-            password: document.getElementById('torrent-client-password')?.value || '',
-            category: document.getElementById('torrent-client-category')?.value || 'soulsync',
-            save_path: document.getElementById('torrent-client-save-path')?.value || '',
-            seed_ratio_goal: parseFloat(document.getElementById('music-seed-ratio')?.value) || 0,
-            seed_time_goal_hours: parseInt(document.getElementById('music-seed-hours')?.value, 10) || 0,
+            type: _cfgStr('torrent-client-type', { fallback: 'qbittorrent' }),
+            url: _cfgStr('torrent-client-url'),
+            username: _cfgStr('torrent-client-username'),
+            password: _cfgStr('torrent-client-password'),
+            category: _cfgStr('torrent-client-category', { fallback: 'soulsync' }),
+            save_path: _cfgStr('torrent-client-save-path'),
+            seed_ratio_goal: _cfgFloat('music-seed-ratio', 0),
+            seed_time_goal_hours: _cfgInt('music-seed-hours', 0),
             seed_remove_data: !!(document.getElementById('music-seed-remove-data') || {}).checked,
-            seed_mode: document.getElementById('music-seed-mode')?.value || 'soulsync',
+            seed_mode: _cfgStr('music-seed-mode', { fallback: 'soulsync' }),
         },
         usenet_client: {
-            type: document.getElementById('usenet-client-type')?.value || 'sabnzbd',
-            url: document.getElementById('usenet-client-url')?.value || '',
-            api_key: document.getElementById('usenet-client-api-key')?.value || '',
-            username: document.getElementById('usenet-client-username')?.value || '',
-            password: document.getElementById('usenet-client-password')?.value || '',
-            category: document.getElementById('usenet-client-category')?.value || 'soulsync',
+            type: _cfgStr('usenet-client-type', { fallback: 'sabnzbd' }),
+            url: _cfgStr('usenet-client-url'),
+            api_key: _cfgStr('usenet-client-api-key'),
+            username: _cfgStr('usenet-client-username'),
+            password: _cfgStr('usenet-client-password'),
+            category: _cfgStr('usenet-client-category', { fallback: 'soulsync' }),
         },
         soundcloud_download: {
             // No knobs yet — anonymous-only. Keeping the key present so
@@ -4557,7 +6910,9 @@ async function saveSettings(quiet = false) {
             }
         },
         musicbrainz: {
+            ...musicBrainzServerSettings,
             embed_tags: document.getElementById('embed-musicbrainz').checked,
+            use_original_date_for_date: _cfgBool('mb-use-original-date-for-date'),
             tags: _collectServiceTags('musicbrainz')
         },
         deezer: {
@@ -4567,34 +6922,47 @@ async function saveSettings(quiet = false) {
             embed_tags: document.getElementById('embed-deezer').checked,
             tags: _collectServiceTags('deezer')
         },
-        yandex: {
-            token: document.getElementById('yandex-token').value,
-        },
         audiodb: {
             embed_tags: document.getElementById('embed-audiodb').checked,
             tags: _collectServiceTags('audiodb')
         },
         file_organization: {
             enabled: document.getElementById('file-organization-enabled').checked,
+            auto_disambiguation: document.getElementById('auto-disambiguation').checked,
             disc_label: document.getElementById('disc-label').value,
             collab_artist_mode: document.getElementById('collab-artist-mode').value,
             artistletter_symbol_fallback: document.getElementById('artistletter-symbol-fallback').checked,
+            unicode_substitution: document.getElementById('unicode-substitution').checked,
+            detect_multi_artist_compilations: document.getElementById('detect-multi-artist-compilations').checked,
             templates: {
                 album_path: document.getElementById('template-album-path').value,
+                compilation_path: document.getElementById('template-compilation-path').value,
                 single_path: document.getElementById('template-single-path').value,
                 playlist_path: document.getElementById('template-playlist-path').value,
                 playlist_item: document.getElementById('template-playlist-item').value,
-                video_path: document.getElementById('template-video-path').value
+                video_path: document.getElementById('template-video-path').value,
+                podcast_path: document.getElementById('template-podcast-path').value,
+                audiobook_path: document.getElementById('template-audiobook-path').value,
+                sample_path: document.getElementById('template-sample-path').value
             }
+        },
+        mcp: {
+            enabled: _cfgBool('mcp-enabled'),
+        },
+        lidarr_compat: {
+            enabled: _cfgBool('lidarr-compat-enabled'),
+            profile_id: _cfgInt('lidarr-compat-profile', _lidarrCompatProfileId),
         },
         wishlist: {
             allow_duplicate_tracks: document.getElementById('allow-duplicate-tracks').checked,
             ignore_ttl_days: Math.max(1, Math.min(365,
-                parseInt(document.getElementById('wishlist-ignore-ttl')?.value, 10) || 30)),
+                _cfgInt('wishlist-ignore-ttl', 30))),
+            wing_it_guesses: document.getElementById('wishlist-wing-it-guesses').checked,
         },
         playlist_sync: {
             create_backup: document.getElementById('create-backup').checked,
-            mode: document.getElementById('playlist-sync-mode')?.value || 'replace'
+            mode: _cfgStr('playlist-sync-mode', { fallback: 'reconcile' }),
+            wishlist_missing_tracks: document.getElementById('playlist-sync-wishlist-missing').checked
         },
         content_filter: {
             allow_explicit: document.getElementById('allow-explicit').checked,
@@ -4607,6 +6975,7 @@ async function saveSettings(quiet = false) {
         post_processing: {
             replaygain_enabled: document.getElementById('replaygain-enabled').checked,
             audio_completeness_check: document.getElementById('audio-completeness-check').checked,
+            verify_flac_decode: document.getElementById('verify-flac-decode').checked,
             duration_tolerance_seconds: parseFloat(document.getElementById('duration-tolerance-seconds').value) || 0,
             retry_next_candidate_on_mismatch: document.getElementById('retry-next-candidate').checked,
             retry_exhaustive: document.getElementById('retry-exhaustive').checked,
@@ -4616,13 +6985,89 @@ async function saveSettings(quiet = false) {
         },
         library: {
             music_paths: collectMusicPaths(),
+            sample_paths: collectSamplePaths(),
             music_videos_path: document.getElementById('music-videos-path').value || './MusicVideos',
-            reorganize_preserve_casing: document.getElementById('reorganize-preserve-casing')?.checked !== false
+            podcasts_path: _cfgStr('podcasts-path', { fallback: './podcasts' }),
+            audiobooks_path: _cfgStr('audiobooks-path', { fallback: './audiobooks' }),
+            reorganize_preserve_casing: _cfgBool('reorganize-preserve-casing'),
+            write_artist_nfo: _cfgBool('write-artist-nfo')
+        },
+        podcasts: {
+            download_path: _cfgStr('podcasts-path', { fallback: './podcasts' }),
+            media_format: _cfgStr('podcast-media-format', { fallback: 'audio' }),
+        },
+        audiobooks: {
+            marketplace: _cfgStr('audiobook-marketplace', { fallback: 'us' }),
+            download_path: _cfgStr('audiobooks-path', { fallback: './audiobooks' }),
+            download_source: {
+                mode: _cfgStr('audiobook-download-mode', { fallback: 'hybrid' }),
+                hybrid_order: _audiobookHybrid.filter(s => AUDIOBOOK_SOURCES.includes(s)),
+            },
+            torrent_category: _cfgStr('audiobook-torrent-category', { trim: true, fallback: 'audiobooks' }),
+            // One category covers both: a book is tagged the same way whichever
+            // client fetched it, and two fields to type the same word twice is
+            // two chances to get it wrong.
+            usenet_category: _cfgStr('audiobook-torrent-category', { trim: true, fallback: 'audiobooks' }),
+            prowlarr_categories: (_cfgStr('audiobook-prowlarr-categories') === undefined
+                ? undefined : splitList(_cfgStr('audiobook-prowlarr-categories')))
+                .map(n => parseInt(n, 10))
+                .filter(n => Number.isFinite(n)),
+            completeness_tolerance: Math.min(1, Math.max(0.1,
+                (_cfgInt('audiobook-completeness-tolerance', 92)) / 100)),
+            staging_days: Math.min(90, Math.max(1,
+                _cfgInt('audiobook-staging-days', 7))),
+            renumber_chapters: _cfgBool('audiobook-renumber-chapters'),
+            merge_m4b: _cfgBool('audiobook-merge-m4b'),
+            remove_owned_from_wishlist: _cfgBool('audiobook-remove-owned-from-wishlist'),
+            embed_metadata: _cfgBool('audiobook-embed-metadata'),
+            embed_artwork: _cfgBool('audiobook-embed-artwork'),
+            save_artwork: _cfgBool('audiobook-save-artwork'),
+            write_nfo: _cfgBool('audiobook-write-nfo'),
+            quality: {
+                // The chosen format leads; the default order follows behind it, so
+                // picking MP3 does not silently discard every other format.
+                format_order: (function () {
+                    const first = document.getElementById('audiobook-format-first')?.value || 'm4b';
+                    const rest = ['m4b', 'm4a', 'mp3', 'opus', 'ogg', 'flac']
+                        .filter(f => f !== first);
+                    return [first, ...rest];
+                })(),
+                // Every format on is stored as [] ("no restriction"), so a format
+                // added later is not refused by a list that predates it.
+                // Undefined when the toggles are not on the page, like _cfgBool,
+                // so a missing panel cannot wipe a stored restriction.
+                allowed_formats: (function () {
+                    const group = document.getElementById('audiobook-allowed-formats');
+                    if (!group) return undefined;
+                    const boxes = [...group.querySelectorAll('input')];
+                    const on = boxes.filter(box => box.checked).map(box => box.value);
+                    return on.length === boxes.length ? [] : on;
+                })(),
+                // Exactly one switch on picks that layout; both on, or both off,
+                // means either. Undefined when the switches are not on the page.
+                file_layout: (function () {
+                    const group = document.getElementById('audiobook-file-layout');
+                    if (!group) return undefined;
+                    const on = [...group.querySelectorAll('input')].filter(box => box.checked);
+                    return on.length === 1 ? on[0].value : 'any';
+                })(),
+                min_bitrate_kbps: Math.max(0,
+                    _cfgInt('audiobook-min-bitrate', 0)),
+                max_bitrate_kbps: Math.max(0,
+                    _cfgInt('audiobook-max-bitrate', 0)),
+                allow_dramatized:
+                    document.getElementById('audiobook-allow-dramatized')?.checked !== false,
+            },
+            recycle_deletes:
+                document.getElementById('audiobook-recycle-deletes')?.checked !== false,
+            // 0 turns the bin off; it never means "erase everything now".
+            recycle_keep_days: Math.min(365, Math.max(0,
+                _cfgInt('audiobook-recycle-keep-days', 0))),
         },
         import: {
             replace_lower_quality: document.getElementById('import-replace-lower-quality').checked,
-            folder_artist_override: document.getElementById('import-folder-artist-override')?.checked !== false,
-            transfer_is_permanent: document.getElementById('import-transfer-permanent')?.checked === true,
+            folder_artist_override: _cfgBool('import-folder-artist-override'),
+            transfer_is_permanent: _cfgBool('import-transfer-permanent'),
             staging_path: document.getElementById('staging-path').value || './Staging'
         },
         playlists: {
@@ -4638,7 +7083,8 @@ async function saveSettings(quiet = false) {
         },
         album_downloads: {
             // Atomic album publishing (#999) — opt-in, default off.
-            atomic_publish: document.getElementById('album-atomic-publish')?.checked === true
+            atomic_publish: _cfgBool('album-atomic-publish'),
+            atomic_recover_orphans: _cfgBool('album-atomic-recover')
         },
         listening_stats: {
             enabled: document.getElementById('listening-stats-enabled').checked,
@@ -4653,16 +7099,17 @@ async function saveSettings(quiet = false) {
         },
         m3u_export: {
             enabled: document.getElementById('m3u-export-enabled').checked,
+            relative_paths: _cfgBool('m3u-relative-paths'),
             entry_base_path: document.getElementById('m3u-entry-base-path').value || '',
             rewrite_from: document.getElementById('m3u-rewrite-from').value || '',
             rewrite_to: document.getElementById('m3u-rewrite-to').value || '',
-            library_enabled: document.getElementById('library-m3u-enabled')?.checked === true,
-            library_path: document.getElementById('library-m3u-path')?.value || ''
+            library_enabled: _cfgBool('library-m3u-enabled'),
+            library_path: _cfgStr('library-m3u-path')
         },
         ui_appearance: {
-            accent_preset: document.getElementById('accent-preset')?.value || '#1db954',
-            accent_color: document.getElementById('accent-custom-color')?.value || '#1db954',
-            sidebar_visualizer: document.getElementById('sidebar-visualizer-type')?.value || 'bars',
+            accent_preset: _cfgStr('accent-preset', { fallback: '#1db954' }),
+            accent_color: _cfgStr('accent-custom-color', { fallback: '#1db954' }),
+            sidebar_visualizer: _cfgStr('sidebar-visualizer-type', { fallback: 'bars' }),
             // Read the runtime flags / localStorage, not the checkboxes: while Max
             // Performance is on it locks those boxes visually-off, but the user's real
             // saved prefs live in the flags — so saving must not clobber them.
@@ -4674,16 +7121,37 @@ async function saveSettings(quiet = false) {
         youtube: {
             cookies_browser: document.getElementById('youtube-cookies-browser').value,
             download_delay: parseInt(document.getElementById('youtube-download-delay').value) || 3,
+            transcode: _cfgBool('youtube-transcode'),
+            transcode_codec: _cfgStr('youtube-transcode-codec', { fallback: 'mp3' }),
+            transcode_bitrate: _cfgStr('youtube-transcode-bitrate', { fallback: '320' }),
             // Raw cookies.txt blob — backend validates, writes it to a file, and stores
             // only the path (never echoed back). Blank = keep any already-saved file.
-            cookies_paste: document.getElementById('youtube-cookies-paste')?.value || '',
+            cookies_paste: _cfgStr('youtube-cookies-paste'),
         },
         security: {
-            require_pin_on_launch: document.getElementById('security-require-pin')?.checked || false,
-            cors_origins: document.getElementById('security-cors-origins')?.value?.trim() || '',
-            trust_reverse_proxy: document.getElementById('security-trust-proxy')?.checked || false,
-            auth_proxy_header: document.getElementById('security-auth-proxy-header')?.value?.trim() || '',
-            require_login: document.getElementById('security-require-login')?.checked || false,
+            require_pin_on_launch: _cfgBool('security-require-pin'),
+            cors_origins: _cfgStr('security-cors-origins', { trim: true }),
+            trust_reverse_proxy: _cfgBool('security-trust-proxy'),
+            auth_proxy_header: _cfgStr('security-auth-proxy-header', { trim: true }),
+            require_login: _cfgBool('security-require-login'),
+            plex_signin: _cfgBool('security-plex-signin'),
+            plex_signin_auto_create: _cfgBool('security-plex-signin-auto-create'),
+            plex_signin_default_can_download: _cfgBool('security-plex-signin-can-download'),
+            oidc_signin: _cfgBool('security-oidc-signin'),
+            oidc_issuer: _cfgStr('security-oidc-issuer', { trim: true }),
+            oidc_client_id: _cfgStr('security-oidc-client-id', { trim: true }),
+            oidc_client_secret: _cfgStr('security-oidc-client-secret'),
+            oidc_button_label: _cfgStr('security-oidc-button-label', { trim: true }),
+            oidc_icon_url: _cfgStr('security-oidc-icon-url', { trim: true }),
+            oidc_required_group: _cfgStr('security-oidc-required-group', { trim: true }),
+            oidc_groups_claim: _cfgStr('security-oidc-groups-claim', { trim: true }),
+            oidc_scopes: _cfgStr('security-oidc-scopes', { trim: true }),
+            oidc_redirect_uri: _cfgStr('security-oidc-redirect-uri', { trim: true }),
+            oidc_signin_auto_create: _cfgBool('security-oidc-signin-auto-create'),
+            oidc_signin_default_can_download: _cfgBool('security-oidc-signin-can-download'),
+            signup_sides: _cfgStr('security-signup-sides', { fallback: 'music' }),
+            signup_request_limit: _cfgInt('security-signup-request-limit', 0),
+            signup_request_limit_days: _cfgInt('security-signup-request-limit-days', 7),
         }
     };
 
@@ -4818,6 +7286,11 @@ async function authorizeLastfmScrobbling() {
 
 async function testConnection(service) {
     try {
+        if (typeof settingsAutoSaveTimer !== 'undefined' && settingsAutoSaveTimer) {
+            clearTimeout(settingsAutoSaveTimer);
+            settingsAutoSaveTimer = null;
+            if (typeof saveSettings === 'function') await saveSettings(true);
+        }
         showLoadingOverlay(`Testing ${service} connection...`);
 
         const response = await fetch(API.testConnection, {
@@ -4829,8 +7302,10 @@ async function testConnection(service) {
         const result = await response.json();
 
         if (result.success) {
-            // Use backend's message which contains dynamic source name
-            showToast(result.message || `${service} connection successful`, 'success');
+            // Use backend's message which contains dynamic source name. a pass
+            // can still carry a warning (leading \u26a0), which shouldn't read as green
+            const warned = String(result.message || '').trim().startsWith('\u26a0');
+            showToast(result.message || `${service} connection successful`, warned ? 'warning' : 'success');
 
             // Load music libraries after successful connection
             if (service === 'plex') {
@@ -4846,6 +7321,40 @@ async function testConnection(service) {
     } catch (error) {
         console.error(`Error testing ${service} connection:`, error);
         showToast(`Failed to test ${service} connection`, 'error', 'gs-connecting');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// the deezer card holds two logins: the oauth app (favorites, playlists) and an
+// ARL (playlists + downloads). testConnection('deezer') covers the public api and
+// the oauth token; the ARL has its own check, so run both and say what each found.
+async function testDeezerConnection() {
+    let arl = document.getElementById('deezer-connection-arl')?.value || '';
+    if (!arl.trim()) return testConnection('deezer');
+    // an untouched field holds the redaction mask; empty means "test the saved one" (#870)
+    if (arl === REDACTED_SECRET_SENTINEL) arl = '';
+    try {
+        if (typeof settingsAutoSaveTimer !== 'undefined' && settingsAutoSaveTimer) {
+            clearTimeout(settingsAutoSaveTimer);
+            settingsAutoSaveTimer = null;
+            if (typeof saveSettings === 'function') await saveSettings(true);
+        }
+        showLoadingOverlay('Testing Deezer connection...');
+        const post = (url, body) => fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        }).then(r => r.json()).catch(() => ({ success: false, error: 'request failed' }));
+        const [api, arlRes] = await Promise.all([
+            post(API.testConnection, { service: 'deezer' }),
+            post('/api/deezer-download/test', { arl }),
+        ]);
+        const apiMsg = api.success ? (api.message || 'Deezer reachable') : `Deezer failed: ${api.error}`;
+        const arlMsg = arlRes.success
+            ? `ARL: ${arlRes.user || 'Unknown'} (${arlRes.tier || 'Free'})`
+            : `ARL failed: ${arlRes.error || 'rejected'}`;
+        const ok = api.success && arlRes.success;
+        const warned = String(api.message || '').trim().startsWith('\u26a0');
+        showToast(`${apiMsg} · ${arlMsg}`, !ok ? 'error' : (warned ? 'warning' : 'success'), ok ? undefined : 'gs-connecting');
     } finally {
         hideLoadingOverlay();
     }
@@ -4871,6 +7380,29 @@ async function clearQuarantine() {
 }
 
 // ======================== API Key Management ========================
+
+// the saved profile, so a save before the list loads keeps it
+let _lidarrCompatProfileId = 1;
+
+async function loadLidarrCompatProfiles(selectedId) {
+    _lidarrCompatProfileId = parseInt(selectedId, 10) || 1;
+    const select = document.getElementById('lidarr-compat-profile');
+    if (!select) return;
+    try {
+        const response = await fetch('/api/profiles');
+        const data = await response.json();
+        const profiles = data.profiles || [];
+        if (!profiles.length) return;
+        select.innerHTML = profiles.map(p => {
+            const note = p.can_download === false ? ' (needs approval)' : '';
+            return `<option value="${escapeHtml(String(p.id))}">${escapeHtml(p.name || 'Profile ' + p.id)}${note}</option>`;
+        }).join('');
+        select.value = String(_lidarrCompatProfileId);
+        if (select.value !== String(_lidarrCompatProfileId)) select.value = '1';
+    } catch (e) {
+        console.debug('lidarr profile list failed', e);
+    }
+}
 
 async function loadApiKeys() {
     const container = document.getElementById('api-keys-list');
@@ -4901,7 +7433,9 @@ function renderApiKeys(keys) {
     container.innerHTML = keys.map(k => `
         <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; margin-bottom: 4px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;">
             <div style="flex: 1; min-width: 0;">
-                <div style="font-size: 13px; color: #e0e0e0; font-weight: 500;">${escapeHtml(k.label || 'Unnamed')}</div>
+                <div style="font-size: 13px; color: #e0e0e0; font-weight: 500;">${escapeHtml(k.label || 'Unnamed')}
+                    <span style="margin-left: 6px; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; ${k.scope === 'read' ? 'background: rgba(100,255,218,0.12); color: #64ffda;' : 'background: rgba(255,171,64,0.12); color: #ffab40;'}">${k.scope === 'read' ? 'Read-only' : 'Admin'}</span>
+                </div>
                 <div style="font-size: 11px; color: #666; margin-top: 2px;">
                     <code>${escapeHtml(k.key_prefix || 'sk_...')}...</code>
                     &middot; Created ${k.created_at ? new Date(k.created_at).toLocaleDateString() : 'unknown'}
@@ -4932,12 +7466,14 @@ function _initApiKeyClickHandler() {
 async function generateApiKey() {
     const labelInput = document.getElementById('api-key-label');
     const label = labelInput ? labelInput.value.trim() : '';
+    const scopeInput = document.getElementById('api-key-scope');
+    const scope = scopeInput && scopeInput.value === 'admin' ? 'admin' : 'read';
 
     try {
         const response = await fetch('/api/v1/api-keys-internal/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ label: label || 'Default' })
+            body: JSON.stringify({ label: label || 'Default', scope })
         });
         const data = await response.json();
 
@@ -5212,7 +7748,7 @@ function handleSpotifyRateLimit(rateLimitInfo) {
             // Refresh discover page if user is on it — data source switched back to Spotify
             if (currentPage === 'discover') {
                 console.log('Spotify restored — refreshing discover page data');
-                loadDiscoverPage();
+                if (typeof loadDiscoverPage === 'function') loadDiscoverPage();
             }
         }
         return;
@@ -5228,7 +7764,7 @@ function handleSpotifyRateLimit(rateLimitInfo) {
         // Refresh discover page if user is on it — data source switched to iTunes
         if (currentPage === 'discover') {
             console.log('Spotify rate limited — refreshing discover page with iTunes data');
-            loadDiscoverPage();
+            if (typeof loadDiscoverPage === 'function') loadDiscoverPage();
         }
     }
 }
@@ -5286,7 +7822,7 @@ async function disconnectSpotifyFromRateLimit() {
             syncMetadataSourceSelection(data.source || 'deezer');
             await fetchAndUpdateServiceStatus();
             if (currentPage === 'discover') {
-                loadDiscoverPage();
+                if (typeof loadDiscoverPage === 'function') loadDiscoverPage();
             }
         } else {
             showToast(`Failed to disconnect: ${data.error}`, 'error');
@@ -5857,27 +8393,6 @@ async function testDeezerDownloadConnection() {
     }
 }
 
-async function testAmazonConnection() {
-    const statusEl = document.getElementById('amazon-connection-status');
-    if (!statusEl) return;
-    statusEl.textContent = 'Checking...';
-    statusEl.style.color = '#aaa';
-    try {
-        const resp = await fetch('/api/amazon/test-connection');
-        const data = await resp.json();
-        if (data.connected) {
-            statusEl.textContent = '✓ Connected — T2Tunes up';
-            statusEl.style.color = '#4caf50';
-        } else {
-            statusEl.textContent = '✗ ' + (data.error || 'T2Tunes unreachable');
-            statusEl.style.color = '#f44336';
-        }
-    } catch (e) {
-        statusEl.textContent = '✗ Connection error';
-        statusEl.style.color = '#f44336';
-    }
-}
-
 async function checkTidalDownloadAuthStatus() {
     const statusEl = document.getElementById('tidal-download-auth-status');
     const btn = document.getElementById('tidal-download-auth-btn');
@@ -6190,6 +8705,8 @@ async function logoutQobuz() {
 const PATH_INPUT_IDS = {
     download: 'download-path',
     transfer: 'transfer-path',
+    podcasts: 'podcasts-path',
+    audiobooks: 'audiobooks-path',
     staging: 'staging-path',
     'music-videos': 'music-videos-path',
     'playlists-materialize': 'playlists-materialize-path',
@@ -6215,16 +8732,19 @@ function applyPathsEnvironment(settings) {
 }
 
 function togglePathLock(pathType, btn) {
-    const input = document.getElementById(PATH_INPUT_IDS[pathType]);
+    const inputId = PATH_INPUT_IDS[pathType] || (pathType.endsWith('-path') ? pathType : pathType + '-path');
+    const input = document.getElementById(inputId);
     if (!input) return;
-    const isLocked = input.hasAttribute('readonly');
+    const isLocked = input.hasAttribute('readonly') || input.readOnly;
     if (isLocked) {
         input.removeAttribute('readonly');
+        input.readOnly = false;
         input.focus();
         btn.textContent = 'Lock';
         btn.classList.remove('locked');
     } else {
         input.setAttribute('readonly', '');
+        input.readOnly = true;
         btn.textContent = 'Unlock';
         btn.classList.add('locked');
     }
@@ -6271,3 +8791,1028 @@ async function rebuildPlaylistFolders() {
 
 
 // ===============================
+
+// ============================================================================
+// MEDIA-SERVER LIBRARY PICKERS
+//
+// Moved here verbatim from beatport-ui.js 3648-3931. They were never Beatport
+// code — they drive this page's Plex / Jellyfin / Navidrome selects (the
+// `onchange` handlers at index.html 4392, 4456, 4465, 4492) and are called from
+// three places in this file. They only lived in beatport-ui.js because that is
+// where somebody appended them.
+//
+// The move is a PRECONDITION for the sync port: that file is deleted when the
+// sync page flips to React, and deleting it with these inside would break
+// media-server setup for every user, on a page that has nothing to do with sync.
+//
+// Moved unchanged first, then the six `alert()` calls it carried were
+// converted to showToast in a follow-up — matching the Navidrome path in this
+// same block, which already used
+// `showToast(msg, 'error', 'set-media')`. The move and the edit were kept
+// apart on purpose: a move that also edits is a move you cannot verify.
+// ============================================================================
+
+// ============ Plex Music Library Selection ============
+
+async function loadPlexMusicLibraries() {
+    try {
+        const response = await fetch('/api/plex/music-libraries');
+        const data = await response.json();
+
+        if (data.success && data.libraries && data.libraries.length > 0) {
+            const selector = document.getElementById('plex-music-library');
+            const container = document.getElementById('plex-library-selector-container');
+
+            // Clear existing options
+            selector.innerHTML = '';
+
+            // Add options for each library. ``value`` is the canonical
+            // identifier the backend expects (real libraries: title;
+            // synthetic "All Libraries" entry: the sentinel string).
+            // ``title`` stays the human-readable label.
+            data.libraries.forEach(library => {
+                const option = document.createElement('option');
+                const optionValue = library.value || library.title;
+                option.value = optionValue;
+                option.textContent = library.title;
+
+                // Pre-select match: compare ``value`` against the saved
+                // DB pref (``data.selected``) AND ``title`` against the
+                // live-active library name (``data.current``). Covers
+                // both the sentinel case and the legacy single-library
+                // case.
+                if (optionValue === data.selected
+                        || library.title === data.current
+                        || library.title === data.selected) {
+                    option.selected = true;
+                }
+
+                selector.appendChild(option);
+            });
+
+            // Show the container
+            container.style.display = 'block';
+        } else {
+            // Hide if no libraries found or not connected
+            document.getElementById('plex-library-selector-container').style.display = 'none';
+        }
+    } catch (error) {
+        console.error('Error loading Plex music libraries:', error);
+        document.getElementById('plex-library-selector-container').style.display = 'none';
+    }
+}
+
+async function selectPlexLibrary() {
+    const selector = document.getElementById('plex-music-library');
+    const selectedLibrary = selector.value;
+
+    if (!selectedLibrary) return;
+
+    try {
+        const response = await fetch('/api/plex/select-music-library', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                library_name: selectedLibrary
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            console.log(`Plex music library switched to: ${selectedLibrary}`);
+        } else {
+            console.error('Failed to switch library:', data.error);
+            showToast(`Failed to switch library: ${data.error}`, 'error', 'set-media');
+        }
+    } catch (error) {
+        console.error('Error selecting Plex library:', error);
+        showToast('Error selecting library. Please try again.', 'error', 'set-media');
+    }
+}
+
+// ============ Jellyfin User Selection ============
+
+async function loadJellyfinUsers() {
+    try {
+        const response = await fetch('/api/jellyfin/users');
+        const data = await response.json();
+
+        if (data.success && data.users && data.users.length > 0) {
+            const selector = document.getElementById('jellyfin-user');
+            const container = document.getElementById('jellyfin-user-selector-container');
+
+            // Clear existing options
+            selector.innerHTML = '';
+
+            // Add options for each user
+            data.users.forEach(user => {
+                const option = document.createElement('option');
+                option.value = user.name;
+                option.textContent = user.name;
+
+                // Mark the currently selected user
+                if (user.name === data.current || user.name === data.selected) {
+                    option.selected = true;
+                }
+
+                selector.appendChild(option);
+            });
+
+            // Show the container
+            container.style.display = 'block';
+        } else {
+            // Hide if no users found or not connected
+            document.getElementById('jellyfin-user-selector-container').style.display = 'none';
+        }
+    } catch (error) {
+        console.error('Error loading Jellyfin users:', error);
+        document.getElementById('jellyfin-user-selector-container').style.display = 'none';
+    }
+}
+
+async function selectJellyfinUser() {
+    const selector = document.getElementById('jellyfin-user');
+    const selectedUser = selector.value;
+
+    if (!selectedUser) return;
+
+    try {
+        const response = await fetch('/api/jellyfin/select-user', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                username: selectedUser
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            console.log(`Jellyfin user switched to: ${selectedUser}`);
+            // Refresh library dropdown for the new user
+            loadJellyfinMusicLibraries();
+        } else {
+            console.error('Failed to switch user:', data.error);
+            showToast(`Failed to switch user: ${data.error}`, 'error', 'set-media');
+        }
+    } catch (error) {
+        console.error('Error selecting Jellyfin user:', error);
+        showToast('Error selecting user. Please try again.', 'error', 'set-media');
+    }
+}
+
+// ============ Jellyfin Music Library Selection ============
+
+async function loadJellyfinMusicLibraries() {
+    try {
+        const response = await fetch('/api/jellyfin/music-libraries');
+        const data = await response.json();
+
+        if (data.success && data.libraries && data.libraries.length > 0) {
+            const selector = document.getElementById('jellyfin-music-library');
+            const container = document.getElementById('jellyfin-library-selector-container');
+
+            // Clear existing options
+            selector.innerHTML = '';
+
+            // Add options for each library
+            data.libraries.forEach(library => {
+                const option = document.createElement('option');
+                option.value = library.title;
+                option.textContent = library.title;
+
+                // Mark the currently selected library
+                if (library.title === data.current || library.title === data.selected) {
+                    option.selected = true;
+                }
+
+                selector.appendChild(option);
+            });
+
+            // Show the container
+            container.style.display = 'block';
+        } else {
+            // Hide if no libraries found or not connected
+            document.getElementById('jellyfin-library-selector-container').style.display = 'none';
+        }
+    } catch (error) {
+        console.error('Error loading Jellyfin music libraries:', error);
+        document.getElementById('jellyfin-library-selector-container').style.display = 'none';
+    }
+}
+
+async function selectJellyfinLibrary() {
+    const selector = document.getElementById('jellyfin-music-library');
+    const selectedLibrary = selector.value;
+
+    if (!selectedLibrary) return;
+
+    try {
+        const response = await fetch('/api/jellyfin/select-music-library', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                library_name: selectedLibrary
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            console.log(`Jellyfin music library switched to: ${selectedLibrary}`);
+        } else {
+            console.error('Failed to switch library:', data.error);
+            showToast(`Failed to switch library: ${data.error}`, 'error', 'set-media');
+        }
+    } catch (error) {
+        console.error('Error selecting Jellyfin library:', error);
+        showToast('Error selecting library. Please try again.', 'error', 'set-media');
+    }
+}
+
+// ============ Navidrome Music Folder Selection ============
+
+async function loadNavidromeMusicFolders() {
+    try {
+        const response = await fetch('/api/navidrome/music-folders');
+        const data = await response.json();
+
+        if (data.success && data.folders && data.folders.length > 0) {
+            const selector = document.getElementById('navidrome-music-folder');
+            const container = document.getElementById('navidrome-folder-selector-container');
+
+            selector.innerHTML = '<option value="">All Libraries</option>';
+
+            data.folders.forEach(folder => {
+                const option = document.createElement('option');
+                option.value = folder.title;
+                option.textContent = folder.title;
+
+                if (folder.title === data.current || folder.title === data.selected) {
+                    option.selected = true;
+                }
+
+                selector.appendChild(option);
+            });
+
+            container.style.display = 'block';
+        } else {
+            document.getElementById('navidrome-folder-selector-container').style.display = 'none';
+        }
+    } catch (error) {
+        console.error('Error loading Navidrome music folders:', error);
+        document.getElementById('navidrome-folder-selector-container').style.display = 'none';
+    }
+}
+
+// the admin's own navidrome playlist user (Cremonies). it's the same
+// per-profile login My Account saves for everyone else, so sync already writes
+// as it. kept out of the main settings save on purpose, it's not app config.
+function _paintNavidromePlaylistLogin(username) {
+    const user = document.getElementById('navidrome-playlist-username');
+    const pass = document.getElementById('navidrome-playlist-password');
+    const status = document.getElementById('navidrome-playlist-status');
+    const clear = document.getElementById('navidrome-playlist-clear');
+    if (!user || !status) return;
+    user.value = username || '';
+    if (pass) pass.value = '';
+    if (clear) clear.style.display = username ? '' : 'none';
+    status.textContent = username
+        ? `Your synced playlists go to ${username}.`
+        : 'Your synced playlists go to this Navidrome user instead of the account above. '
+          + 'Leave it empty to use the account above. Other profiles set their own in My Account.';
+}
+
+async function loadNavidromePlaylistLogin() {
+    try {
+        const response = await fetch('/api/profiles/me/server-library');
+        const data = await response.json();
+        _paintNavidromePlaylistLogin(data && data.success ? data.navidrome_username : '');
+    } catch (error) {
+        console.debug('navidrome playlist login load failed:', error);
+    }
+}
+
+async function saveNavidromePlaylistLogin() {
+    const username = (document.getElementById('navidrome-playlist-username')?.value || '').trim();
+    const password = document.getElementById('navidrome-playlist-password')?.value || '';
+    if (!username || !password) {
+        showToast('Enter the playlist account username and password', 'warning');
+        return;
+    }
+    try {
+        const response = await fetch('/api/profiles/me/navidrome-login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password }),
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+            showToast(data.error || 'Could not save the playlist account', 'error');
+            return;
+        }
+        _paintNavidromePlaylistLogin(data.username || username);
+        showToast(`Playlists will sync to ${data.username || username}`, 'success');
+    } catch (error) {
+        showToast('Could not save the playlist account', 'error');
+    }
+}
+
+async function clearNavidromePlaylistLogin() {
+    try {
+        const response = await fetch('/api/profiles/me/navidrome-login', { method: 'DELETE' });
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+            showToast(data.error || 'Could not clear the playlist account', 'error');
+            return;
+        }
+        _paintNavidromePlaylistLogin('');
+        showToast('Playlists will sync to the account above', 'success');
+    } catch (error) {
+        showToast('Could not clear the playlist account', 'error');
+    }
+}
+
+async function selectNavidromeMusicFolder() {
+    const selector = document.getElementById('navidrome-music-folder');
+    const selectedFolder = selector.value;
+
+    try {
+        const response = await fetch('/api/navidrome/select-music-folder', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder_name: selectedFolder })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showToast(data.message, 'success');
+        } else {
+            console.error('Failed to set music folder:', data.error);
+            showToast(`Failed to set music folder: ${data.error}`, 'error', 'set-media');
+        }
+    } catch (error) {
+        console.error('Error selecting Navidrome music folder:', error);
+        showToast('Error selecting music folder. Please try again.', 'error', 'set-media');
+    }
+}
+
+
+// ============================================================
+// == YT-DLP UPDATER (Advanced tab, both sides)              ==
+// ============================================================
+// YouTube changes how it serves video far faster than yt-dlp cuts a stable
+// release, so a copy a few weeks old starts answering "403 Forbidden" on videos
+// that worked yesterday. Without an in-app update, those downloads quietly burn
+// their retry budget and get abandoned for an entirely fixable reason.
+
+async function loadYtdlpStatus() {
+    const chanEl = document.getElementById('ytdlp-channel');
+    const instEl = document.getElementById('ytdlp-installed');
+    const latEl = document.getElementById('ytdlp-latest');
+    const badge = document.getElementById('ytdlp-hint-badge');
+    if (!instEl || !latEl) return;
+    const channel = (chanEl && chanEl.value) || 'nightly';
+    instEl.textContent = 'Loading...';
+    latEl.textContent = 'Loading...';
+    try {
+        const resp = await fetch('/api/ytdlp/status?channel=' + encodeURIComponent(channel));
+        const d = await resp.json();
+        // The running process keeps the yt-dlp it imported at startup, so after
+        // an update these two disagree until a restart. Saying only the loaded
+        // one made a SUCCESSFUL update read as "still behind", while the button
+        // said "already on the newest build" — both true, and together they made
+        // it look like the update had not worked.
+        instEl.textContent = d.restart_pending
+            ? `${d.installed} running — ${d.on_disk} installed, restart to finish`
+            : (d.installed || 'Not installed');
+        instEl.style.color = d.restart_pending ? '#ffb300' : '';
+        // A PyPI outage must not read as "you are up to date" — say we could not
+        // look, which is a different fact from "nothing newer exists".
+        latEl.textContent = d.latest || (d.lookup_error ? "Couldn't check — no connection to PyPI" : 'Unknown');
+        latEl.style.color = d.behind ? '#ffb300' : '';
+        if (badge) {
+            badge.hidden = !(d.behind || d.restart_pending);
+            badge.style.color = '#ffb300';
+            badge.title = d.restart_pending
+                ? 'yt-dlp is updated on disk — restart SoulSync to use it'
+                : (d.behind ? 'A newer yt-dlp is available' : '');
+        }
+    } catch (e) {
+        instEl.textContent = 'Unknown';
+        latEl.textContent = 'Unknown';
+        console.error('yt-dlp status failed:', e);
+    }
+}
+
+async function runYtdlpUpdate() {
+    const btn = document.getElementById('ytdlp-update-btn');
+    const status = document.getElementById('ytdlp-status');
+    const detail = document.getElementById('ytdlp-detail');
+    const chanEl = document.getElementById('ytdlp-channel');
+    const channel = (chanEl && chanEl.value) || 'nightly';
+    if (btn) { btn.disabled = true; btn.textContent = 'Updating...'; }
+    if (detail) { detail.style.display = 'none'; detail.textContent = ''; }
+    if (status) {
+        status.style.display = 'block';
+        status.style.background = 'rgba(255,255,255,0.04)';
+        status.style.color = 'rgba(255,255,255,0.6)';
+        status.textContent = 'Installing the newest ' + channel + ' build — this can take a minute...';
+    }
+    try {
+        const resp = await fetch('/api/ytdlp/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ channel: channel })
+        });
+        const d = await resp.json();
+        if (status) {
+            status.style.color = d.success ? (d.restart_required ? '#ffb300' : '#4caf50') : '#ff5252';
+            status.textContent = d.message || (d.success ? 'Done.' : 'Update failed.');
+        }
+        // pip's own words, kept available but out of the way — every failure mode
+        // here (read-only container, distro-managed Python, wrong user, dead
+        // network) needs a different action, and the output is what says which.
+        if (detail && d.detail) { detail.style.display = 'block'; detail.textContent = d.detail; }
+        // Guarded the way chat.js guards it: showToast is a global owned by
+        // downloads.js, and this tile renders on the video side too.
+        if (typeof showToast === 'function') {
+            if (d.success) {
+                showToast(d.restart_required
+                    ? 'yt-dlp updated — restart SoulSync to use it'
+                    : (d.message || 'Already up to date'),
+                    d.restart_required ? 'info' : 'success');
+            } else {
+                showToast('yt-dlp update failed — see Settings for details', 'error');
+            }
+        }
+        loadYtdlpStatus();
+    } catch (e) {
+        if (status) { status.style.color = '#ff5252'; status.textContent = 'Update request failed: ' + e; }
+        if (typeof showToast === 'function') showToast('yt-dlp update failed', 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Update yt-dlp'; }
+    }
+}
+
+
+// == ARTWORK CACHE (Advanced tab, both sides)               ==
+// One cache serves album covers on the music side and posters on the video
+// side, so this panel is deliberately not marked video-only.
+
+function _imgCacheBytes(n) {
+    if (!n) return '0 MB';
+    const mb = n / (1024 * 1024);
+    return mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(1) + ' MB';
+}
+
+function _imgCacheStatus(message, tone) {
+    const el = document.getElementById('imgcache-status');
+    if (!el) return;
+    el.textContent = message;
+    el.style.display = 'block';
+    el.style.background = tone === 'error' ? 'rgba(255,80,80,.12)' : 'rgba(80,255,150,.10)';
+    el.style.color = tone === 'error' ? '#ff9a9a' : '#8ee7b0';
+}
+
+function onImageCacheSettingChanged() {
+    if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
+}
+
+async function loadImageCacheStatus() {
+    try {
+        const resp = await fetch('/api/image-cache/status');
+        const data = await resp.json();
+        if (!data.success) return;
+        const entries = document.getElementById('imgcache-entries');
+        const size = document.getElementById('imgcache-size');
+        if (entries) entries.textContent = (data.entries || 0).toLocaleString();
+        if (size) {
+            size.textContent = data.max_bytes
+                ? `${_imgCacheBytes(data.bytes)} of ${_imgCacheBytes(data.max_bytes)}`
+                : `${_imgCacheBytes(data.bytes)} (no limit)`;
+        }
+        // Reflect saved config without clobbering something the user is editing.
+        const maxEl = document.getElementById('imgcache-max-mb');
+        if (maxEl && document.activeElement !== maxEl) {
+            maxEl.value = Math.round((data.max_bytes || 0) / (1024 * 1024));
+        }
+        const thumbEl = document.getElementById('imgcache-thumbnails');
+        if (thumbEl) thumbEl.checked = data.thumbnails === true;
+    } catch (e) {
+        console.error('image cache status failed', e);
+    }
+}
+
+async function runImageCachePrune() {
+    const btn = document.getElementById('imgcache-prune-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Reclaiming...'; }
+    try {
+        const resp = await fetch('/api/image-cache/prune', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            const freed = (data.expired || 0) + (data.evicted || 0);
+            _imgCacheStatus(freed
+                ? `Removed ${freed} cached image${freed === 1 ? '' : 's'}.`
+                : 'Nothing to reclaim — the cache is already within its limits.', 'ok');
+            loadImageCacheStatus();
+        } else {
+            _imgCacheStatus(data.error || 'Could not reclaim space.', 'error');
+        }
+    } catch (e) {
+        _imgCacheStatus('Could not reclaim space: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Reclaim space now'; }
+    }
+}
+
+async function runImageCacheClear() {
+    const ok = await showConfirmDialog({
+        title: 'Clear the artwork cache?',
+        message: 'Every cached cover and poster is removed. Nothing is lost permanently — '
+               + 'images are downloaded again as pages need them, so the only cost is a '
+               + 'slower first load.',
+        confirmText: 'Clear cache',
+        cancelText: 'Cancel'
+    });
+    if (!ok) return;
+
+    const btn = document.getElementById('imgcache-clear-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Clearing...'; }
+    try {
+        const resp = await fetch('/api/image-cache/clear', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            _imgCacheStatus(`Cleared ${data.removed || 0} cached image${data.removed === 1 ? '' : 's'}.`, 'ok');
+            loadImageCacheStatus();
+        } else {
+            _imgCacheStatus(data.error || 'Could not clear the cache.', 'error');
+        }
+    } catch (e) {
+        _imgCacheStatus('Could not clear the cache: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Clear cache'; }
+    }
+}
+
+// == SIDEBAR WEATHER (Advanced tab)               ==
+// Opt-in weather line / forecast popover / particle scene in the sidebar.
+// No API keys: the server geocodes the location once and caches Open-Meteo
+// snapshots for 30 minutes.
+
+async function _swApi(method, path, body) {
+    const resp = await fetch('/api/weather' + path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return resp.json();
+}
+
+function _swStatus(text) {
+    const el = document.getElementById('sw-status');
+    if (el) el.textContent = text;
+}
+
+function _swRebootSidebar() {
+    // the shell bundle exports bootSidebarWeather on window; re-run it so the
+    // sidebar line/popover/scene pick up the change without a page reload
+    if (typeof window.bootSidebarWeather === 'function') {
+        try {
+            // bootSidebarWeather is async: a .catch keeps a rejected promise
+            // from surfacing as an unhandled rejection
+            Promise.resolve(window.bootSidebarWeather()).catch(function (e) {
+                console.warn('sidebar weather re-boot failed', e);
+            });
+        } catch (e) {
+            console.warn('sidebar weather re-boot failed', e);
+        }
+    } else {
+        console.warn('sidebar weather re-boot skipped: bootSidebarWeather is not on window');
+    }
+}
+
+async function loadSidebarWeatherSettings() {
+    try {
+        const data = await _swApi('GET', '');
+        // GET /api/weather always answers success:true. A missing snapshot just
+        // means no forecast is cached yet — the sidebar stays empty until then.
+        if (!data || data.success !== true) {
+            _swStatus('Could not load weather settings');
+            return;
+        }
+        const loc = document.getElementById('sw-location');
+        if (loc && document.activeElement !== loc) loc.value = data.location ? data.location.query || '' : '';
+        const en = document.getElementById('sw-enabled');
+        if (en) en.checked = data.enabled !== false;
+        const c = document.getElementById('sw-celsius');
+        if (c) c.checked = data.units === 'celsius';
+        if (data.location && data.snapshot) {
+            const cur = data.snapshot.current;
+            const t = cur && typeof cur.temp === 'number' ? Math.round(cur.temp) : null;
+            const unit = data.units === 'celsius' ? '°C' : '°F';
+            _swStatus(t === null
+                ? `${data.location.name} — waiting for first forecast`
+                : `${data.location.name} — ${t}${unit}, updated ${data.snapshot.fetched_at || 'recently'}`);
+        } else if (data.location) {
+            // enabled=false also yields a null snapshot — say so instead of
+            // implying a fetch failure
+            _swStatus(data.enabled === false
+                ? `${data.location.name} — weather display off`
+                : `${data.location.name} — forecast unavailable right now`);
+        } else {
+            _swStatus('Off — set a location to turn it on');
+        }
+    } catch (e) {
+        console.error('sidebar weather settings failed', e);
+        _swStatus('Could not load weather settings');
+    }
+}
+
+async function saveSidebarWeatherLocation() {
+    const input = document.getElementById('sw-location');
+    const location = input ? input.value.trim() : '';
+    if (!location) {
+        if (typeof showToast === 'function') showToast('Enter a ZIP or city first', 'error');
+        return;
+    }
+    try {
+        const data = await _swApi('PUT', '/location', { location });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast(`Weather location set to ${data.location.name}`, 'success');
+            loadSidebarWeatherSettings();
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not resolve that location', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not save location: ' + e.message, 'error');
+    }
+}
+
+async function clearSidebarWeatherLocation() {
+    try {
+        const data = await _swApi('PUT', '/location', { location: '' });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast('Sidebar weather turned off', 'success');
+            const input = document.getElementById('sw-location');
+            if (input) input.value = '';
+            loadSidebarWeatherSettings();
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not clear the location', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not clear location: ' + e.message, 'error');
+    }
+}
+
+async function toggleSidebarWeatherEnabled() {
+    const el = document.getElementById('sw-enabled');
+    const enabled = el ? el.checked : true;
+    try {
+        const data = await _swApi('PUT', '/display', { enabled });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast(enabled ? 'Sidebar weather on' : 'Sidebar weather off', 'success');
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not update the setting', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not update the setting: ' + e.message, 'error');
+    }
+}
+
+async function saveSidebarWeatherUnits() {
+    const el = document.getElementById('sw-celsius');
+    const use_celsius = el ? el.checked : false;
+    try {
+        const data = await _swApi('PUT', '/units', { use_celsius });
+        if (data.success) {
+            if (typeof showToast === 'function') showToast(`Using °${use_celsius ? 'C' : 'F'}`, 'success');
+            loadSidebarWeatherSettings();
+            _swRebootSidebar();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not update units', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not update units: ' + e.message, 'error');
+    }
+}
+
+// == METASYNC (Advanced tab)               ==
+// Connection to the local MetaSync node: pairing (or a pasted local API
+// key), the pool key SoulSync holds and hands over, live status, and
+// disconnect. All calls go to SoulSync's own /api/metasync endpoints — the
+// server talks to the node, so the browser never has to reach it. Stored
+// secrets are never sent back here: the key fields only ever carry what
+// the user just typed, and an empty field on save means "unchanged".
+
+async function _msApi(method, path, body) {
+    const resp = await fetch('/api/metasync' + path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return resp.json();
+}
+
+function _msStatus(text) {
+    const el = document.getElementById('metasync-status');
+    if (el) el.textContent = text;
+}
+
+function _msDetail(html) {
+    const el = document.getElementById('metasync-status-detail');
+    if (el) el.innerHTML = html;
+}
+
+function _msEscape(text) {
+    const div = document.createElement('div');
+    div.textContent = text == null ? '' : String(text);
+    return div.innerHTML;
+}
+
+let _msAutoDetectTried = false;
+
+// Ask SoulSync to probe the usual places for the MetaSync node. On a find,
+// fill the URL field and return the URL; on no find, return '' and stay
+// quiet — the manual field remains the fallback either way.
+async function metasyncDetect() {
+    try {
+        const data = await _msApi('POST', '/detect');
+        if (data && data.success && data.found && data.node_url) {
+            const field = document.getElementById('metasync-node-url');
+            if (field) field.value = data.node_url;
+            return data.node_url;
+        }
+    } catch (e) {
+        console.error('metasync detect failed', e);
+    }
+    return '';
+}
+
+// Auto-detect runs once per page load, and only while there is nothing to
+// lose: no connection stored yet and no URL typed or saved. A find fills
+// the field and says so; finding nothing changes nothing on screen.
+async function _msMaybeAutoDetect(view) {
+    if (_msAutoDetectTried || view.local_key_set) return;
+    const field = document.getElementById('metasync-node-url');
+    if (!field || field.value.trim()) return;
+    _msAutoDetectTried = true;
+    const found = await metasyncDetect();
+    if (found) _msStatus('Found MetaSync on this machine at ' + found + ' — click Connect to pair with it.');
+}
+
+async function loadMetaSyncSettings() {
+    try {
+        const data = await _msApi('GET', '');
+        if (!data || data.success !== true) {
+            _msStatus('Could not load MetaSync settings');
+            return;
+        }
+        const nodeUrl = document.getElementById('metasync-node-url');
+        if (nodeUrl && document.activeElement !== nodeUrl) nodeUrl.value = data.node_url || '';
+        const poolUrl = document.getElementById('metasync-pool-url');
+        if (poolUrl && document.activeElement !== poolUrl) poolUrl.value = data.pool_url || '';
+        const poolKey = document.getElementById('metasync-pool-key');
+        if (poolKey) {
+            poolKey.placeholder = data.pool_key_set
+                ? 'Saved — type a new key only to replace it'
+                : 'Your pool account key';
+        }
+        const state = document.getElementById('metasync-connect-state');
+        if (state) {
+            state.textContent = data.local_key_set
+                ? 'Connected' + (data.node_fingerprint ? ' — MetaSync ID ' + data.node_fingerprint : '')
+                : 'Not connected';
+        }
+        await refreshMetaSyncStatus();
+        await _msMaybeAutoDetect(data);
+    } catch (e) {
+        console.error('metasync settings load failed', e);
+        _msStatus('Could not load MetaSync settings');
+    }
+}
+
+async function saveMetaSyncSettings() {
+    const body = {
+        node_url: document.getElementById('metasync-node-url')?.value.trim() || '',
+        pool_url: document.getElementById('metasync-pool-url')?.value.trim() || '',
+    };
+    const poolKey = document.getElementById('metasync-pool-key')?.value.trim();
+    if (poolKey) body.pool_key = poolKey;
+    const localKey = document.getElementById('metasync-local-key')?.value.trim();
+    if (localKey) body.local_api_key = localKey;
+    try {
+        const data = await _msApi('PUT', '/settings', body);
+        if (data.success) {
+            if (typeof showToast === 'function') showToast('MetaSync settings saved', 'success');
+            const pk = document.getElementById('metasync-pool-key');
+            if (pk) pk.value = '';
+            const lk = document.getElementById('metasync-local-key');
+            if (lk) lk.value = '';
+            loadMetaSyncSettings();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not save MetaSync settings', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not save MetaSync settings: ' + e.message, 'error');
+    }
+}
+
+async function metasyncPairRequest() {
+    // persist the node URL with the request so claim/handoff use the same one
+    let nodeUrl = document.getElementById('metasync-node-url')?.value.trim() || '';
+    if (!nodeUrl) {
+        // Nothing typed — try to find the node before asking the user for it.
+        nodeUrl = await metasyncDetect();
+    }
+    if (!nodeUrl) {
+        if (typeof showToast === 'function') showToast('Enter the MetaSync URL first', 'error');
+        return;
+    }
+    try {
+        const data = await _msApi('POST', '/pair/request', { node_url: nodeUrl });
+        if (!data.success) {
+            if (typeof showToast === 'function') showToast(data.error || 'Pairing request failed', 'error');
+            return;
+        }
+        const box = document.getElementById('metasync-pair-box');
+        if (box) box.style.display = '';
+        const code = document.getElementById('metasync-pair-code');
+        if (code) code.textContent = data.pairing_code || '';
+        const fp = document.getElementById('metasync-pair-fingerprint');
+        if (fp) fp.textContent = data.node_fingerprint || '';
+        if (typeof showToast === 'function') showToast('Approve the pairing in the MetaSync dashboard', 'success');
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Pairing request failed: ' + e.message, 'error');
+    }
+}
+
+async function metasyncPairClaim() {
+    try {
+        const data = await _msApi('POST', '/pair/claim');
+        if (data.success) {
+            if (typeof showToast === 'function') showToast('MetaSync connected', 'success');
+            const box = document.getElementById('metasync-pair-box');
+            if (box) box.style.display = 'none';
+            loadMetaSyncSettings();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Could not finish connecting', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Could not finish connecting: ' + e.message, 'error');
+    }
+}
+
+async function metasyncHandoff() {
+    // unsaved field values ride along; the server persists what it used
+    const body = {
+        pool_url: document.getElementById('metasync-pool-url')?.value.trim() || '',
+    };
+    const poolKey = document.getElementById('metasync-pool-key')?.value.trim();
+    if (poolKey) body.pool_key = poolKey;
+    try {
+        const data = await _msApi('POST', '/handoff', body);
+        if (!data.success) {
+            if (typeof showToast === 'function') showToast(data.error || 'Handoff failed', 'error');
+            return;
+        }
+        if (data.exchange_status === 'bound') {
+            if (typeof showToast === 'function') showToast('Pool key handed over — MetaSync is bound to the pool', 'success');
+        } else if (data.exchange_status === 'binding_pending') {
+            if (typeof showToast === 'function') showToast('Pool key handed over — waiting for approval in the portal', 'warning');
+        } else if (data.exchange_status === 'error') {
+            if (typeof showToast === 'function') showToast('Pool key handed over, but the pool exchange failed: ' + (data.exchange_error || 'unknown error'), 'error');
+        } else {
+            if (typeof showToast === 'function') showToast('Pool key handed over to MetaSync', 'success');
+        }
+        loadMetaSyncSettings();
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Handoff failed: ' + e.message, 'error');
+    }
+}
+
+// The node's binding words, in plain language for the status readout.
+const _MS_BINDING_TEXT = {
+    bound: 'Bound to the pool',
+    pending_approval: 'Waiting for approval in the portal',
+    auth_failed: 'Pool authentication failed',
+    unbound: 'Not bound yet',
+    not_checked: 'Not checked yet',
+    not_connected: 'No pool key on MetaSync',
+    not_applicable: 'Direct key (no binding)',
+};
+
+async function refreshMetaSyncStatus() {
+    try {
+        const data = await _msApi('GET', '/status');
+        if (!data || data.success !== true) {
+            _msStatus((data && data.error) || 'MetaSync status unavailable');
+            _msDetail('');
+            return;
+        }
+        const s = data.status || {};
+        _msStatus('Step 1: connected — MetaSync ' + (s.version || '') +
+            (s.soulsync_connected ? ' is reading this SoulSync' : ' is not reading this SoulSync yet'));
+        const lines = [];
+        if (s.node_fingerprint) lines.push('MetaSync ID: ' + _msEscape(s.node_fingerprint) +
+            ' (the same ID MetaSync shows in its dashboard)');
+        const pools = Array.isArray(s.pools) ? s.pools : [];
+        if (!pools.length) {
+            lines.push('Step 2: no pool joined yet — send your pool key above to join one.');
+        }
+        pools.forEach(p => {
+            const binding = _MS_BINDING_TEXT[p.binding_status] || p.binding_status || 'Unknown';
+            let line = 'Pool — ' + _msEscape(p.name || p.id || 'Pool') + ' (' + _msEscape(p.url || '') + '): ' +
+                _msEscape(binding);
+            if (p.last_exchange_error) line += ' — last error: ' + _msEscape(p.last_exchange_error);
+            lines.push(line);
+        });
+        if (s.pairing_status === 'pending') lines.push('A pairing request is waiting for approval in the MetaSync dashboard.');
+        _msDetail(lines.join('<br>'));
+    } catch (e) {
+        _msStatus('MetaSync status unavailable');
+        _msDetail('');
+    }
+}
+
+async function metasyncDisconnect() {
+    const ok = await showConfirmDialog({
+        title: 'Disconnect MetaSync?',
+        message: 'The pool key on MetaSync is cleared and the SoulSync key it holds is revoked. ' +
+            'Your pool key stays saved here.',
+        confirmText: 'Disconnect',
+        cancelText: 'Cancel',
+        destructive: true
+    });
+    if (!ok) return;
+    try {
+        const data = await _msApi('POST', '/disconnect');
+        if (data.success) {
+            if (typeof showToast === 'function') {
+                showToast(data.node_notified
+                    ? 'MetaSync disconnected'
+                    : 'Disconnected here — MetaSync could not be reached, so clear its pool key from its dashboard too', 'success');
+            }
+            const box = document.getElementById('metasync-pair-box');
+            if (box) box.style.display = 'none';
+            loadMetaSyncSettings();
+        } else if (typeof showToast === 'function') {
+            showToast(data.error || 'Disconnect failed', 'error');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('Disconnect failed: ' + e.message, 'error');
+    }
+}
+
+// MUSICBRAINZ SERVER SETTINGS
+function loadMusicBrainzServerSettings(settings) {
+    document.getElementById('musicbrainz-base-url').value = settings.musicbrainz?.base_url || '';
+    const interval = Number(settings.musicbrainz?.request_interval ?? 1.05);
+    document.getElementById('musicbrainz-rate-mode').value = interval === 0 ? 'adaptive' : 'fixed';
+    document.getElementById('musicbrainz-request-rate').value = interval > 0
+        ? Number((1 / interval).toPrecision(6)) : 10;
+    updateMusicBrainzRateControls();
+}
+
+function updateMusicBrainzRateControls() {
+    document.getElementById('musicbrainz-request-rate').disabled =
+        document.getElementById('musicbrainz-rate-mode').value === 'adaptive';
+}
+
+function collectMusicBrainzServerSettings() {
+    const base_url = document.getElementById('musicbrainz-base-url').value.trim();
+    const adaptive = document.getElementById('musicbrainz-rate-mode').value === 'adaptive';
+    const rawRate = document.getElementById('musicbrainz-request-rate').value.trim();
+    const request_rate = Number(rawRate);
+    let serverHost = 'musicbrainz.org';
+    if (base_url) {
+        let url;
+        try { url = new URL(base_url); } catch (_) {
+            throw new Error('MusicBrainz server URL must start with http:// or https://.');
+        }
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+            throw new Error('Use a MusicBrainz HTTP(S) URL without credentials, query strings or fragments.');
+        }
+        serverHost = url.hostname.toLowerCase().replace(/\.$/, '');
+    }
+    if (adaptive && (serverHost === 'musicbrainz.org' || serverHost.endsWith('.musicbrainz.org'))) {
+        throw new Error('No limit (adaptive) is only for a self-hosted MusicBrainz server.');
+    }
+    if (!adaptive && (!rawRate || !Number.isFinite(request_rate) || request_rate <= 0)) {
+        throw new Error('MusicBrainz requests/second must be a positive number.');
+    }
+    const request_interval = adaptive ? 0 : 1 / request_rate;
+    return { base_url, request_interval };
+}
+// END MUSICBRAINZ SERVER SETTINGS

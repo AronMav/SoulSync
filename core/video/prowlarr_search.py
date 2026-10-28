@@ -55,9 +55,44 @@ def is_configured() -> bool:
 
 def _indexer_ids() -> List[int]:
     """The optional Prowlarr indexer allowlist (shared ``prowlarr.indexer_ids``)."""
-    from config.settings import config_manager
+    from core.settings import config_manager
     raw = str(config_manager.get("prowlarr.indexer_ids", "") or "").strip()
     return [int(p) for p in (x.strip() for x in raw.split(",")) if p.isdigit()]
+
+
+def _norm_indexer_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _indexer_ids_matching(names: Any, protocol: str) -> Optional[List[int]]:
+    """Resolve a Basic Search provider label (e.g. 1337x) to Prowlarr indexer ids.
+
+    ``None`` means no provider filter was requested. ``[]`` means a filter was
+    requested but no enabled matching indexer exists, so callers should show a
+    clear configured-but-missing message rather than widening the search.
+    """
+    if not names:
+        return None
+    wanted_raw = names if isinstance(names, (list, tuple, set)) else [names]
+    wanted = [_norm_indexer_name(n) for n in wanted_raw if _norm_indexer_name(n)]
+    if not wanted:
+        return None
+    try:
+        known = _client()._get_indexers_sync()
+    except Exception as exc:  # noqa: BLE001 - surface as no concrete source match
+        logger.warning("Prowlarr indexer lookup failed for Basic Search provider %s: %s", wanted, exc)
+        return []
+    protocol = str(protocol or "torrent").lower()
+    matched = []
+    for indexer in known or []:
+        if not getattr(indexer, "enable", False):
+            continue
+        if str(getattr(indexer, "protocol", "") or "").lower() != protocol:
+            continue
+        name = _norm_indexer_name(getattr(indexer, "name", ""))
+        if any(w in name or name in w for w in wanted):
+            matched.append(int(indexer.id))
+    return matched
 
 
 def _imdb_num(imdb_id: Any) -> Optional[str]:
@@ -79,7 +114,7 @@ def _as_int(v: Any) -> Optional[int]:
 def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = None,
                      episode: Any = None, imdb_id: Any = None, tmdb_id: Any = None,
                      tvdb_id: Any = None, air_date: Any = None, absolute: Any = None,
-                     series_type: Any = None) -> List[Tuple[str, str, List[tuple]]]:
+                     series_type: Any = None, alt: Any = None) -> List[Tuple[str, str, List[tuple]]]:
     """The set of Prowlarr searches to run for one request, as ``(type, query, extra)``.
 
     Pure (no I/O) so it's unit-tested. Always includes the scene-formatted text search;
@@ -103,11 +138,24 @@ def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = 
         strat.append(("movie", t, extra))
         strat.append(("search", build_query("movie", t, year=year), []))
     elif scope == "episode":
+        # a tvdbid asks the indexer in TVDB's numbering, so when the scene
+        # (TVDB) numbering differs from TMDB's (``alt``), that's what goes with it
+        alt_s = alt_e = None
+        if alt:
+            try:
+                alt_s, alt_e = int(alt[0]), int(alt[1])
+            except (TypeError, ValueError, IndexError):
+                alt_s = alt_e = None
+        if alt_s is not None and len(alt) > 2 and alt[2]:
+            # exclusive: the TMDB number names another episode in the scene's
+            # numbering, so searching it only finds the wrong one
+            season, episode, s_i, e_i = alt_s, alt_e, alt_s, alt_e
+        q_s, q_e = (alt_s, alt_e) if (tvdb and alt_s is not None) else (s_i, e_i)
         extra = []
-        if s_i is not None:
-            extra.append(("season", s_i))
-        if e_i is not None:
-            extra.append(("ep", e_i))
+        if q_s is not None:
+            extra.append(("season", q_s))
+        if q_e is not None:
+            extra.append(("ep", q_e))
         if tvdb:
             extra.append(("tvdbid", tvdb))
         if imdb:
@@ -122,6 +170,8 @@ def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = 
         q_std = build_query("episode", t, season=season, episode=episode)
         if q_std != q_typed:
             strat.append(("search", q_std, []))
+        if alt_s is not None:
+            strat.append(("search", build_query("episode", t, season=alt_s, episode=alt_e), []))
     elif scope == "season":
         extra = []
         if s_i is not None:
@@ -156,7 +206,12 @@ def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = 
 
 
 def _project(r: Any, url: str, want_proto: str) -> dict:
-    """One Prowlarr result → the slskd-shaped hit ``_evaluate_hits`` consumes."""
+    """One Prowlarr result → the slskd-shaped hit ``_evaluate_hits`` consumes.
+
+    ``magnet_uri`` rides along beside ``download_url`` (#1139, video side). The
+    URL is now preferred so SoulSync can fetch the real .torrent server-side and
+    push the file; the magnet is what ``add_torrent_smart`` falls back to when
+    that fetch fails, so preferring the URL is never a downgrade."""
     size = int(getattr(r, "size", 0) or 0)
     seeders = getattr(r, "seeders", None)
     return {
@@ -169,35 +224,61 @@ def _project(r: Any, url: str, want_proto: str) -> dict:
         "filename": r.title,                 # the grab uses the URL carriers below, not this
         "files": [], "file_count": 0, "folder_size_bytes": size,
         "download_url": url,
+        "magnet_uri": getattr(r, "magnet_uri", None),
         "protocol": getattr(r, "protocol", want_proto),
         "indexer_id": getattr(r, "indexer_id", None),
         "guid": getattr(r, "guid", None),
+        # Facts the indexer already stated and this projection used to drop on the
+        # floor. An indexer cannot give a poster or a rating, but it CAN say how old
+        # a release is and how many people have taken it - which is most of what you
+        # judge a release on when there is no artwork to look at.
+        "published_at": getattr(r, "publish_date", None),
+        "grabs": getattr(r, "grabs", None),
+        "info_url": getattr(r, "info_url", None),
     }
 
 
 def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = None,
                     episode: Any = None, source: str = "torrent", imdb_id: Any = None,
                     tmdb_id: Any = None, tvdb_id: Any = None, air_date: Any = None,
-                    absolute: Any = None, series_type: Any = None) -> dict:
+                    absolute: Any = None, series_type: Any = None,
+                    max_wait_seconds: Any = None, indexer_names: Any = None,
+                    alt: Any = None) -> dict:
     """Search Prowlarr for a video release with the multi-strategy (structured + text)
     approach. ``source`` picks the protocol to keep (``torrent`` | ``usenet``). Returns
-    ``{configured, error?, hits:[...]}`` — the hit shape ``_evaluate_hits`` consumes."""
+    ``{configured, error?, hits:[...]}`` — the hit shape ``_evaluate_hits`` consumes.
+
+    ``max_wait_seconds`` bounds how long this will sit in the shared Prowlarr
+    budget (core.prowlarr_throttle) before giving up. Pass it from anything a
+    person is waiting on: the background drain is happy to queue, a manual
+    search should say "busy" rather than hold a request worker for a minute."""
     client = _client()
     if not client.is_configured():
         return {"configured": False, "hits": []}
     want_proto = "usenet" if str(source or "").lower() == "usenet" else "torrent"
-    cats = _categories(scope)
-    ids = _indexer_ids()
+    # Basic Search is intentionally old-school: when the UI targets a named public
+    # tracker, do not send Radarr/Sonarr category filters. Some Jackett/Prowlarr
+    # public tracker adapters either ignore or reject those categories, which made
+    # obvious searches like "interstellar" return zero on The Pirate Bay.
+    cats = [] if indexer_names else _categories(scope)
+    target_ids = _indexer_ids_matching(indexer_names, want_proto)
+    if target_ids == []:
+        label = ", ".join(str(n) for n in (indexer_names if isinstance(indexer_names, (list, tuple, set)) else [indexer_names]))
+        return {"configured": True, "error": "No enabled Prowlarr indexer matches " + label, "hits": []}
+    ids = target_ids if target_ids is not None else _indexer_ids()
     strategies = build_strategies(scope, title, year=year, season=season, episode=episode,
                                   imdb_id=imdb_id, tmdb_id=tmdb_id, tvdb_id=tvdb_id,
-                                  air_date=air_date, absolute=absolute, series_type=series_type)
+                                  air_date=air_date, absolute=absolute, series_type=series_type,
+                                  alt=alt)
     if not strategies:
         return {"configured": True, "hits": []}
 
     def _run(strat):
         st_type, q, extra = strat
         try:
-            return client._search_sync(q, cats, ids, 100, search_type=st_type, extra_params=extra)
+            return client._search_sync(q, cats, ids, 100, search_type=st_type,
+                                       extra_params=extra,
+                                       max_wait_seconds=max_wait_seconds)
         except Exception as e:   # noqa: BLE001 - one strategy failing shouldn't sink the rest
             logger.warning("prowlarr %s search failed for %r: %s", st_type, q, e)
             return e
@@ -216,7 +297,10 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
         for r in res:
             if getattr(r, "protocol", "") != want_proto:
                 continue
-            url = getattr(r, "magnet_uri", None) or getattr(r, "download_url", None)
+            # .torrent URL first, magnet second (#1139): a magnet hands the
+            # client an info-hash and nothing else, and one that cannot reach
+            # the swarm parks on "downloading metadata" indefinitely.
+            url = getattr(r, "download_url", None) or getattr(r, "magnet_uri", None)
             if not url:
                 continue
             keyv = getattr(r, "guid", None) or url

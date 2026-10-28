@@ -17,6 +17,8 @@ import json
 import logging
 from typing import Any, Optional
 
+from core.automation.migrate_repair_jobs import mirror_automation_toggle
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,7 +102,7 @@ def _check_update_cycle(
     if not _has_signal_concern(trigger_type, then_actions):
         return None
 
-    all_autos = database.get_automations()
+    all_autos = database.get_all_automations()
     test_autos = []
     for a in all_autos:
         if a['id'] == automation_id:
@@ -277,12 +279,19 @@ def bulk_toggle(
 
     updated = database.bulk_set_enabled(automation_ids, bool(enabled))
 
+    if updated > 0:
+        for aid in automation_ids:
+            mirror_automation_toggle(database, aid)
+
     if automation_engine and updated > 0:
         for aid in automation_ids:
             auto = database.get_automation(aid)
             if auto:
                 if auto.get('enabled'):
-                    automation_engine.schedule_automation(auto)
+                    # H17: schedule_automation takes the integer id, not the
+                    # row dict — passing `auto` crashed inside and the timer
+                    # stayed silent, so the automation never fired.
+                    automation_engine.schedule_automation(aid)
                 else:
                     automation_engine.cancel_automation(aid)
     return {'success': True, 'updated': updated}, 200
@@ -337,6 +346,7 @@ def toggle_automation(database, automation_engine, automation_id: int) -> tuple[
     success = database.toggle_automation(automation_id)
     if not success:
         return {'error': 'Automation not found'}, 404
+    mirror_automation_toggle(database, automation_id)
 
     if automation_engine:
         auto = database.get_automation(automation_id)
@@ -375,3 +385,16 @@ def get_history(database, automation_id: int, *, limit: int, offset: int) -> dic
                 pass
     data['automation_id'] = automation_id
     return data
+
+
+def system_automation_for(action_type: str) -> Optional[dict]:
+    """The system-seeded automation row for one action type, or None.
+
+    Lives here and not in the caller because the automation store IS the music
+    database, and core/video may not import it (pinned by
+    ``test_core_video_imports_nothing_from_music``). Automations are shared by
+    both sides, so the automation package is the honest owner of the lookup and
+    the video side asks it rather than reaching across the wall itself.
+    """
+    from database.music_database import MusicDatabase
+    return MusicDatabase().get_system_automation_by_action(action_type)

@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from types import SimpleNamespace
@@ -64,6 +65,7 @@ def _make_soulsync_db():
             file_size INTEGER,
             track_artist TEXT,
             musicbrainz_recording_id TEXT,
+            recording_disambiguation TEXT,
             isrc TEXT,
             quality_profile_id INTEGER,
             server_source TEXT,
@@ -109,6 +111,8 @@ def test_record_soulsync_library_entry_writes_artist_album_and_track(tmp_path, m
             "name": "Song One",
             "track_number": 7,
             "duration_ms": 210000,
+            "musicbrainz_recording_id": "rec-acoustic",
+            "disambiguation": "Connect Sets acoustic",
             "artists": [{"name": "Guest Artist"}],
             "_source": "spotify",
         },
@@ -148,6 +152,8 @@ def test_record_soulsync_library_entry_writes_artist_album_and_track(tmp_path, m
     assert track_row["track_number"] == 7
     assert track_row["duration"] == 210000
     assert track_row["track_artist"] == "Guest Artist"
+    assert track_row["musicbrainz_recording_id"] == "rec-acoustic"
+    assert track_row["recording_disambiguation"] == "Connect Sets acoustic"
     assert track_row["album_id"] == album_row["id"]
     assert track_row["file_path"] == str(final_path)
     # File size in bytes — populates the Library Disk Usage card on Stats.
@@ -157,6 +163,80 @@ def test_record_soulsync_library_entry_writes_artist_album_and_track(tmp_path, m
     # No override on this item — NULL means "follow the app-wide default at
     # read time" (same semantics as wishlist_tracks.quality_profile_id).
     assert track_row["quality_profile_id"] is None
+
+
+def test_recording_identity_does_not_pair_a_stale_selected_comment_with_new_mbid():
+    context = {
+        "source": "musicbrainz",
+        "track_info": {"id": "rec-old", "disambiguation": "acoustic"},
+        "_embedded_id_tags": {"MUSICBRAINZ_RECORDING_ID": "rec-new"},
+    }
+    assert side_effects._recording_identity(context) == ("rec-new", None)
+
+
+def test_recording_identity_keeps_selected_musicbrainz_comment_without_tagging():
+    context = {
+        "source": "musicbrainz",
+        "track_info": {"id": "rec-acoustic", "disambiguation": "acoustic"},
+    }
+    assert side_effects._recording_identity(context) == ("rec-acoustic", "acoustic")
+
+    # A final MusicBrainz response with an empty value is authoritative.
+    context["_recording_disambiguation"] = ""
+    assert side_effects._recording_identity(context) == ("rec-acoustic", None)
+
+
+def test_record_soulsync_library_entry_estimates_opus_bitrate(tmp_path, monkeypatch):
+    """mutagen.oggopus has no bitrate field. The library enhanced table was
+    storing 0 and rendering a red dash, while completed-download chips
+    already estimated from size/duration."""
+    conn = _make_soulsync_db()
+    fake_db = _FakeDB(conn)
+    final_path = tmp_path / "Autumnal Embrace.opus"
+    final_path.write_bytes(b"x" * 40_000)
+
+    class _Info:
+        length = 2.0
+        channels = 2
+
+    class _Opus:
+        def __init__(self, _p, easy=False):
+            self.info = _Info()
+            self.tags = None
+
+    monkeypatch.setattr(side_effects, "get_database", lambda: fake_db)
+    monkeypatch.setattr(
+        side_effects,
+        "_get_config_manager",
+        lambda: SimpleNamespace(get_active_media_server=lambda: "soulsync"),
+    )
+    monkeypatch.setattr("mutagen.File", _Opus)
+
+    import core.genre_filter as genre_filter
+
+    monkeypatch.setattr(genre_filter, "filter_genres", lambda genres, _cfg: genres)
+
+    context = {
+        "source": "spotify",
+        "artist": {"id": "sp-artist", "name": "Skyforest"},
+        "album": {"id": "sp-album", "name": "Autumn's Dawn"},
+        "track_info": {
+            "id": "sp-track",
+            "name": "Autumnal Embrace",
+            "track_number": 3,
+            "duration_ms": 2000,
+            "_source": "spotify",
+        },
+        "original_search_result": {"title": "Autumnal Embrace", "_source": "spotify"},
+        "_final_processed_path": str(final_path),
+    }
+
+    side_effects.record_soulsync_library_entry(
+        context, {"name": "Skyforest", "genres": []}, {"is_album": True, "album_name": "Autumn's Dawn"},
+    )
+
+    track_row = conn.execute("SELECT bitrate FROM tracks").fetchone()
+    assert track_row["bitrate"] == 160
 
 
 def test_record_soulsync_library_entry_persists_quality_profile_id(tmp_path, monkeypatch):
@@ -739,6 +819,37 @@ def test_provenance_labels_auto_import(monkeypatch):
     }
     side_effects.record_download_provenance(context)
     assert captured.get("source_service") == "auto_import"
+
+
+def test_download_provenance_carries_retention_policy_for_media_server(monkeypatch):
+    """The media-server path returns before the standalone track insert, so
+    track_downloads must carry the transform truth until the server scan adds
+    its tracks row."""
+    captured = {}
+
+    class _DBStub:
+        def record_track_download(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(side_effects, "get_database", lambda: _DBStub())
+    context = {
+        "track_info": {"name": "Portable", "artists": [{"name": "Artist"}]},
+        "_final_processed_path": "/library/Portable.mp3",
+        "_acquired_audio_quality": {
+            "format": "flac", "bit_depth": 24, "sample_rate": 96000,
+        },
+        "_retention_transforms": [{
+            "type": "lossy_copy", "source_replaced": True,
+        }],
+    }
+
+    side_effects.record_download_provenance(context)
+
+    assert json.loads(captured["acquired_quality_json"])["format"] == "flac"
+    assert json.loads(captured["retention_json"])[0] == {
+        "source_replaced": True,
+        "type": "lossy_copy",
+    }
 
 
 def test_is_active_media_server_ready_standalone_always_ready(monkeypatch):

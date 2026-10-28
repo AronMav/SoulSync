@@ -2,8 +2,10 @@
 
 GET  /api/video/libraries -> discover the active server's Movies/TV libraries
                              + the user's current selection.
-POST /api/video/libraries -> save {movies, tv} (library titles) for the active
-                             server. The scanner then reads only those.
+POST /api/video/libraries -> save {movies, tv, tv_more?, anime?} (library titles)
+                             for the active server. The scanner then reads only
+                             those: the main TV pick plus ``tv_more``. ``anime``
+                             marks TV libraries whose shows are anime.
 """
 
 from __future__ import annotations
@@ -20,10 +22,13 @@ def register_routes(bp):
     def video_libraries():
         from . import get_video_db
         try:
-            from core.video.sources import list_video_libraries, resolve_video_server
+            from core.video.sources import (_auto_pick_single_libraries, list_video_libraries,
+                                             resolve_video_server)
             libs = list_video_libraries() or {"server": None, "movies": [], "tv": []}
             server = libs.get("server") or resolve_video_server()
-            libs["selected"] = (get_video_db().get_library_selection(server)
+            libs["selected"] = (_auto_pick_single_libraries(
+                                    libs.get("server"), libs, get_video_db().get_library_selection(server),
+                                    db=get_video_db())
                                 if server else {"movies": None, "tv": None})
             return jsonify(libs)
         except Exception:
@@ -96,21 +101,43 @@ def register_routes(bp):
 
     @bp.route("/server-config", methods=["GET"])
     def video_server_config_get():
-        """The video side's OWN server connection — its stored creds when set, else
-        the values INHERITED (read-only) from music. 'inherited' flags tell the UI a
-        field is a placeholder it can override; tokens/keys are returned masked."""
+        """What the settings form shows: video's OWN stored creds when it has any,
+        else the values INHERITED (read-only) from music. Deliberately the stored
+        override and not the effective config - a half-filled override (url typed,
+        key not yet) has to stay on screen, or the field the user just typed gets
+        replaced by the inherited value and looks like it vanished. 'inherited'
+        flags tell the UI a field is a placeholder it can override; tokens/keys
+        are returned masked."""
+        from . import get_video_db
         try:
             from core.video.sources import video_plex_config, video_jellyfin_config
-            p, j = video_plex_config(), video_jellyfin_config()
+            db = get_video_db()
+
+            def own(key):
+                try:
+                    return (db.get_setting(key) or "").strip()
+                except Exception:
+                    return ""
+
+            def view(url_key, secret_key, inherited):
+                url, secret = own(url_key), own(secret_key)
+                if url or secret:
+                    return url, secret, False   # video's own, even half-filled
+                return (inherited.get("base_url") or "",
+                        inherited.get("token") or inherited.get("api_key") or "", True)
 
             def mask(v):
                 v = v or ""
                 return ("•" * 12) if v else ""
+
+            pu, pt, p_inh = view("video_plex_url", "video_plex_token", video_plex_config(db))
+            ju, jk, j_inh = view("video_jellyfin_url", "video_jellyfin_key",
+                                 video_jellyfin_config(db))
             return jsonify({
-                "plex": {"base_url": p.get("base_url") or "", "token": mask(p.get("token")),
-                         "has_token": bool(p.get("token")), "inherited": p.get("source") == "music"},
-                "jellyfin": {"base_url": j.get("base_url") or "", "api_key": mask(j.get("api_key")),
-                             "has_key": bool(j.get("api_key")), "inherited": j.get("source") == "music"},
+                "plex": {"base_url": pu, "token": mask(pt),
+                         "has_token": bool(pt), "inherited": p_inh},
+                "jellyfin": {"base_url": ju, "api_key": mask(jk),
+                             "has_key": bool(jk), "inherited": j_inh},
             })
         except Exception:
             logger.exception("video server-config get failed")
@@ -155,12 +182,13 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "bad server"}), 400
         try:
             if which == "plex":
-                from core.video.sources import video_plex_config, PLEX_SCAN_TIMEOUT
+                from core.video.sources import video_plex_config, PLEX_CONNECT_TIMEOUT, invalidate_video_source_cache
                 cfg = video_plex_config()
                 if not cfg.get("base_url") or not cfg.get("token"):
                     return jsonify({"success": False, "error": "Plex URL/token not set"})
                 from plexapi.server import PlexServer
-                srv = PlexServer(cfg["base_url"], cfg["token"], timeout=PLEX_SCAN_TIMEOUT)
+                srv = PlexServer(cfg["base_url"], cfg["token"], timeout=PLEX_CONNECT_TIMEOUT)
+                invalidate_video_source_cache()
                 return jsonify({"success": True, "message": "Connected to " + (srv.friendlyName or "Plex")})
             from core.video.sources import video_jellyfin_config, video_jellyfin_test
             ok, message = video_jellyfin_test(video_jellyfin_config())
@@ -184,7 +212,8 @@ def register_routes(bp):
             if not base or not key:
                 return jsonify({"success": False, "users": []})
             import requests
-            r = requests.get(base + "/Users", headers={"X-Emby-Token": key}, timeout=8)
+            from core.jellyfin_client import jellyfin_auth_headers
+            r = requests.get(base + "/Users", headers=jellyfin_auth_headers(key), timeout=8)
             if r.status_code != 200:
                 return jsonify({"success": False, "users": [], "error": "HTTP %d" % r.status_code})
             users = r.json() or []
@@ -213,7 +242,12 @@ def register_routes(bp):
             server = resolve_video_server()
             if not server:
                 return jsonify({"error": "no video server"}), 400
-            get_video_db().set_library_selection(server, body.get("movies"), body.get("tv"))
+            # tv_more / anime are optional: an older client that sends only
+            # movies + tv leaves them as they are
+            get_video_db().set_library_selection(
+                server, body.get("movies"), body.get("tv"),
+                tv_more=body.get("tv_more") if isinstance(body.get("tv_more"), list) else None,
+                anime=body.get("anime") if isinstance(body.get("anime"), list) else None)
             return jsonify({"status": "saved", "server": server})
         except Exception:
             logger.exception("Failed to save video library selection")

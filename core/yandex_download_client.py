@@ -45,7 +45,7 @@ class YandexDownloadClient(DownloadSourcePlugin):
     """Yandex Music download source (search: yandex_music lib, download: ymdl CLI)."""
 
     def __init__(self, download_path: str = None):
-        from config.settings import config_manager
+        from core.settings import config_manager
         self._config = config_manager
 
         if download_path is None:

@@ -69,19 +69,15 @@ class TestOneSidedBareMismatch:
 
 class TestNonLiveOneSidedMismatchStaysStrict:
     """Other version markers (instrumental / remix / acoustic / etc)
-    have distinct fingerprints AND MB usually annotates them in the
-    recording title, so one-sided differences stay a real mismatch in
-    most directions — reject regardless of how high the supporting
-    scores are.
+    have distinct fingerprints AND MB always annotates them in the
+    recording title. When AcoustID returns one of these for a bare
+    expected (or vice versa), the file genuinely IS that version —
+    the user asked for the wrong cut. Reject regardless of how high
+    the supporting scores are.
 
-    ONE deliberate fork exception (commit 83a7fe56): a one-sided
-    ``'original' -> 'instrumental'/'remix'`` difference (user asked
-    for the bare cut; AcoustID's linked recording carries the marker)
-    with fingerprint >= 0.90 and agreeing title/artist is accepted as
-    a MusicBrainz/AcoustID annotation error — that valve removed
-    ~387/530 false quarantines on a real discography scan.  The
-    reverse direction (user explicitly wanted the instrumental/remix,
-    file is the vocal) stays strict."""
+    This narrowness is what keeps the existing
+    test_acoustid_version_mismatch suite passing — instrumental
+    vs vocal etc. stays a real mismatch."""
 
     def test_remix_vs_original_rejected_at_high_confidence(self):
         assert is_acceptable_version_mismatch(
@@ -102,16 +98,15 @@ class TestNonLiveOneSidedMismatchStaysStrict:
             artist_similarity=0.99,
         ) is False
 
-    def test_original_vs_instrumental_accepted_as_annotation_error(self):
-        # 83a7fe56 valve: bare expected, AcoustID recording carries an
-        # "instrumental" marker, fingerprint 0.99 with agreeing
-        # title/artist -> treated as an MB/AcoustID metadata error.
+    def test_original_vs_instrumental_rejected_at_high_confidence(self):
+        # Reverse direction: caller asked for vocal, file is
+        # instrumental.
         assert is_acceptable_version_mismatch(
             'original', 'instrumental',
             fingerprint_score=0.99,
             title_similarity=0.99,
             artist_similarity=0.99,
-        ) is True
+        ) is False
 
     def test_acoustic_vs_original_rejected_at_high_confidence(self):
         assert is_acceptable_version_mismatch(
@@ -215,16 +210,6 @@ class TestThresholdGates:
             artist_similarity=0.599,  # default threshold 0.60
         ) is False
 
-    def test_original_vs_instrumental_below_loose_threshold_rejected(self):
-        # The annotation-error valve for original -> instrumental needs
-        # fp >= 0.90 (83a7fe56); below it the mismatch stays strict.
-        assert is_acceptable_version_mismatch(
-            'original', 'instrumental',
-            fingerprint_score=0.89,  # valve requires >= 0.90
-            title_similarity=0.99,
-            artist_similarity=0.99,
-        ) is False
-
 
 class TestCustomThresholds:
     def test_custom_score_threshold_accepts_when_loosened(self):
@@ -243,67 +228,4 @@ class TestCustomThresholds:
             title_similarity=0.95,
             artist_similarity=1.0,
             score_threshold=0.95,
-        ) is False
-
-
-class TestAdvisoryLabelMismatchAccepted:
-    """``(Explicit)``/``(Clean)`` are lyrics-treatment labels on the same
-    recording, not version cuts — MusicBrainz carries them inconsistently,
-    so comparing them as versions quarantined correct downloads (live case:
-    Qobuz "Welcome 2 Detroit (Album Version (Explicit))" vs a bare MB title,
-    fingerprint 0.98 / title 1.00 / artist 0.95). Any combination of
-    explicit/clean/bare on the two sides must be accepted outright."""
-
-    def test_explicit_vs_original_accepted(self):
-        assert is_acceptable_version_mismatch(
-            'explicit', 'original',
-            fingerprint_score=0.98,
-            title_similarity=1.0,
-            artist_similarity=0.95,
-        ) is True
-
-    def test_original_vs_explicit_accepted(self):
-        assert is_acceptable_version_mismatch(
-            'original', 'explicit',
-            fingerprint_score=0.98,
-            title_similarity=1.0,
-            artist_similarity=0.95,
-        ) is True
-
-    def test_clean_vs_original_accepted(self):
-        assert is_acceptable_version_mismatch(
-            'clean', 'original',
-            fingerprint_score=0.98,
-            title_similarity=1.0,
-            artist_similarity=0.95,
-        ) is True
-
-    def test_clean_vs_explicit_accepted(self):
-        # Both are advisory labels on the same recording — the pair is
-        # accepted regardless of which side carries which label.
-        assert is_acceptable_version_mismatch(
-            'clean', 'explicit',
-            fingerprint_score=0.98,
-            title_similarity=1.0,
-            artist_similarity=0.95,
-        ) is True
-
-    def test_advisory_vs_genuine_version_stays_strict(self):
-        # "(Explicit live)" vs "(Clean)" — one side carries a genuine
-        # version marker, the other doesn't: the real version gate applies.
-        assert is_acceptable_version_mismatch(
-            'explicit', 'live',
-            fingerprint_score=0.98,
-            title_similarity=1.0,
-            artist_similarity=0.95,
-        ) is False
-
-    def test_genuine_version_vs_advisory_stays_strict(self):
-        # Instrumental vs an advisory-labeled original: real mismatch
-        # (wrong cut), the advisory fold must not weaken this.
-        assert is_acceptable_version_mismatch(
-            'instrumental', 'explicit',
-            fingerprint_score=0.99,
-            title_similarity=0.99,
-            artist_similarity=0.99,
         ) is False

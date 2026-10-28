@@ -102,7 +102,8 @@ def register_routes(bp):
         if scope not in ("movie", "episode"):
             return jsonify({"success": False, "error": "Choose a movie or an episode."}), 400
 
-        paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
+        from .downloads import _PATH_KEYS, _series_type_for
+        paths = {k: db.get_setting(k) or "" for k in _PATH_KEYS}
         if not paths["movies_path"]:
             paths["movies_path"] = db.get_setting("transfer_path") or ""
         override = {
@@ -113,25 +114,69 @@ def register_routes(bp):
             "episode": body.get("episode"),
             "episode_title": body.get("episode_title"),
             "media_id": body.get("media_id"),
-            "target_dir": target_dir_for(_KIND_FOR_SCOPE[scope], paths),
+            # the chosen identity's show decides anime vs TV. The place screen
+            # sends the picked result's TMDB id as media_id (video-import.js), so
+            # read it as one; an id that isn't resolves to 'standard' -> TV folder.
+            "target_dir": target_dir_for(
+                _KIND_FOR_SCOPE[scope], paths,
+                _series_type_for(db, _KIND_FOR_SCOPE[scope],
+                                 {"media_id": body.get("media_id"),
+                                  "media_source": body.get("media_source") or "tmdb"})),
         }
         settings = organization.load(db)
         prober = probe if settings.get("verify_with_ffprobe", True) else None
         from core.video.recycle import discarder
-        patch = run_import(row, src, fs=real_fs(), prober=prober, settings=settings,
-                           force=True, override=override, recycle=discarder(db, settings))
+        from core.video.importer import plan_import
+        from core.video.download_monitor import _expected_duration_sec, _reclaim_source
+        fs = real_fs()
+        # Plan first and persist the destination BEFORE the file moves (same
+        # crash-window reasoning as the automatic path in download_monitor).
+        try:
+            probe_info = prober(src) if prober is not None else None
+        except Exception:   # noqa: BLE001 - a probe crash must not block the import
+            probe_info = None
+        plan = plan_import(row, src, list_dir=fs.list_dir, probe=probe_info,
+                           settings=settings, force=True, override=override,
+                           expected_duration_sec=_expected_duration_sec(db, row))
+        if plan["action"] in ("import", "upgrade") and plan.get("dest"):
+            try:
+                db.update_video_download(dl_id, dest_path=plan["dest"]["path"])
+            except Exception:   # noqa: BLE001, S110 - best-effort
+                pass
+        patch = run_import(row, src, fs=fs, settings=settings,
+                           force=True, override=override, recycle=discarder(db, settings),
+                           plan=plan)
         try:
             db.update_video_download(dl_id, **patch)
         except Exception:
             logger.exception("manual place: failed to persist import %s", dl_id)
             return jsonify({"success": False, "error": "Couldn't save the result."}), 500
+        # The row is persisted — now reclaim the download copy (see run_import).
+        if patch.get("status") == "completed":
+            _reclaim_source(patch.get("_cleanup_source"))
         ok = patch.get("status") == "completed"
         if ok:
+            # The row now carries the USER's chosen identity, not the grab's:
+            # the subtitle hook (and the worker's residue check) resolve
+            # per-show overrides by re-reading the download row from the DB —
+            # without this the worker would see the stale grab identity,
+            # degrade to the global list, and delete the hook's rows as
+            # residue. Best-effort; the hook falls back to global without it.
+            if override.get("media_id") is not None:
+                try:
+                    db.update_video_download(dl_id, media_source="tmdb",
+                                             media_id=override.get("media_id"))
+                except Exception:   # noqa: BLE001, S110 - best-effort
+                    pass
             # Write NFO + artwork sidecars for the chosen identity (best-effort), then
             # refresh the server + DB the same way the auto-download path does
             # (batch-complete → scan chain), so the manually-placed title shows up
             # without waiting for a scheduled scan.
-            sidecar_dl = {"kind": _KIND_FOR_SCOPE[scope], "media_source": "tmdb",
+            # "id" threads the real download id through: write_subtitles_for keys its
+            # subtitle_wanted rows on it. The row itself now carries the user's
+            # chosen identity (persisted above), so the hook's DB re-read and
+            # the worker's residue check resolve the same per-show override.
+            sidecar_dl = {"id": dl_id, "kind": _KIND_FOR_SCOPE[scope], "media_source": "tmdb",
                           "media_id": override.get("media_id"),
                           "poster_url": row.get("poster_url"),
                           "search_ctx": json.dumps({"scope": scope, "season": override.get("season"),

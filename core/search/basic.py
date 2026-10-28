@@ -13,7 +13,31 @@ from __future__ import annotations
 import logging
 from typing import Callable, Optional
 
+from core.search.warnings import collect as collect_search_warnings
+
 logger = logging.getLogger(__name__)
+
+
+def _quality_score(result) -> float:
+    """Read ``result.quality_score`` as a plain float.
+
+    ``quality_score`` is a ``@property`` on both ``SearchResult`` and
+    ``AlbumResult``, so it is NOT in ``__dict__`` and does not survive the
+    ``__dict__.copy()`` serialisation below — it has to be read off the
+    object and written onto the dict explicitly. Without this the score
+    reaches neither the sort here nor the browser, which is why the Quality
+    sort and the quality term of the frontend's relevance score both did
+    nothing.
+
+    Defensive because the property computes: it calls ``.lower()`` on
+    ``quality``/``dominant_quality``, which a source is free to leave None.
+    A single odd result must not take down the whole search.
+    """
+    try:
+        return float(result.quality_score)
+    except Exception as exc:  # noqa: BLE001 - one bad result must not kill a search
+        logger.debug("quality_score unavailable for %r: %s", type(result).__name__, exc)
+        return 0.0
 
 
 def run_basic_search(
@@ -22,6 +46,7 @@ def run_basic_search(
     run_async: Callable,
     *,
     source: Optional[str] = None,
+    warnings: Optional[list] = None,
 ) -> list[dict]:
     """Search ``source`` (or the active/first hybrid source) for ``query``.
 
@@ -36,6 +61,10 @@ def run_basic_search(
         ``"soulseek"``, ``"tidal"``, ``"qobuz"``). When ``None``, behaviour
         is unchanged from before: orchestrator.search() picks the active
         source (single mode) or the first in chain (hybrid).
+    warnings:
+        Optional list the caller passes in. Filled with ``{source, indexer,
+        error}`` for each prowlarr indexer that failed while others answered,
+        so the page can say the results are incomplete (#1831).
     """
     # A pasted SoundCloud link only resolves on the SoundCloud source (its
     # share URL carries the access token; no other source can find an
@@ -67,24 +96,31 @@ def run_basic_search(
                 raise ValueError("SoundCloud isn't connected — enable it in "
                                  "Settings to resolve a SoundCloud link.")
             logger.warning("basic search: no client for source %r — falling back to orchestrator", source)
-            tracks, albums = run_async(download_orchestrator.search(query))
+            search = download_orchestrator.search(query)
         else:
             logger.info("basic search: targeting %r for %r", source, query)
-            tracks, albums = run_async(client.search(query))
+            search = client.search(query)
     else:
-        tracks, albums = run_async(download_orchestrator.search(query))
+        search = download_orchestrator.search(query)
+    (tracks, albums), noted = run_async(collect_search_warnings(search))
+    if warnings is not None:
+        warnings.extend(noted)
 
     processed_albums = []
     for album in albums:
         album_dict = album.__dict__.copy()
-        album_dict['tracks'] = [track.__dict__ for track in album.tracks]
+        album_dict['tracks'] = [
+            dict(track.__dict__, quality_score=_quality_score(track)) for track in album.tracks
+        ]
         album_dict['result_type'] = 'album'
+        album_dict['quality_score'] = _quality_score(album)
         processed_albums.append(album_dict)
 
     processed_tracks = []
     for track in tracks:
         track_dict = track.__dict__.copy()
         track_dict['result_type'] = 'track'
+        track_dict['quality_score'] = _quality_score(track)
         processed_tracks.append(track_dict)
 
     return sorted(

@@ -1,7 +1,7 @@
 .backdrop {
   position: fixed;
   inset: 0;
-  z-index: 10999;
+  z-index: var(--z-dialog-backdrop);
   background: rgba(5, 9, 16, 0.86);
   backdrop-filter: blur(18px);
 }
@@ -9,7 +9,7 @@
 .viewport {
   position: fixed;
   inset: 0;
-  z-index: 11000;
+  z-index: var(--z-dialog);
   display: grid;
   place-items: center;
   padding: 18px;
@@ -22,9 +22,9 @@
   display: flex;
   flex-direction: column;
   border-radius: 28px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--white-a10);
   background: linear-gradient(180deg, rgba(16, 22, 34, 0.98), rgba(12, 16, 25, 0.98));
-  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 28px 90px var(--black-a45);
 }
 
 .header {
@@ -33,7 +33,7 @@
   justify-content: space-between;
   gap: 18px;
   padding: 20px 22px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--white-a08);
 }
 
 .headerContent {
@@ -53,10 +53,10 @@
   flex-shrink: 0;
   width: 40px;
   height: 40px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.05);
-  color: #fff;
+  border: 1px solid var(--white-a08);
+  border-radius: var(--radius-card);
+  background: var(--white-a05);
+  color: var(--text-1);
   font-size: 16px;
   cursor: pointer;
 }
@@ -77,7 +77,7 @@
   flex-wrap: wrap;
   gap: 8px;
   padding: 16px 22px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  border-top: 1px solid var(--white-a06);
 }
 
 @media (max-width: 640px) {

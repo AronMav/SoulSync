@@ -53,6 +53,30 @@ def test_align_ids_coerced_to_str():
     assert out == ["3", "1", "2"]
 
 
+def test_align_shared_server_track_is_written_once():
+    # #1852: two source rows can pair with one server track (pass 0), so the
+    # editor sends its id twice. the playlist holds it once, so it stays once.
+    out = plan_align_rewrite(current_ids=["A", "S", "B"], matched_ids=["S", "A", "S", "B"])
+    assert out == ["S", "A", "B"]
+
+
+def test_align_shared_track_with_extras_adds_nothing():
+    out = plan_align_rewrite(current_ids=["A", "S", "X"], matched_ids=["S", "A", "S"], keep_extras=True)
+    assert out == ["S", "A", "X"]
+
+
+def test_align_keeps_a_song_the_playlist_really_holds_twice():
+    out = plan_align_rewrite(current_ids=["D", "A", "D"], matched_ids=["A", "D", "D"])
+    assert out == ["A", "D", "D"]
+
+
+def test_align_keep_extras_keeps_an_unmatched_second_copy():
+    # the playlist holds D twice, only one is matched: the other is an extra
+    out = plan_align_rewrite(current_ids=["D", "A", "D"], matched_ids=["A", "D"], keep_extras=True)
+    assert out == ["A", "D", "D"]
+    assert plan_align_rewrite(current_ids=["D", "A", "D"], matched_ids=["A", "D"]) == ["A", "D"]
+
+
 # ── plan_playlist_add: link must not duplicate ────────────────────────────
 
 def test_link_to_existing_track_does_not_insert():
@@ -196,9 +220,9 @@ def test_normalize_request_overrides_config():
 
 
 def test_normalize_falls_back_for_unknown():
-    assert normalize_sync_mode('bogus', 'replace') == 'replace'
-    assert normalize_sync_mode(None, None) == 'replace'
-    assert normalize_sync_mode(None, 'also-bogus') == 'replace'
+    assert normalize_sync_mode('bogus', 'replace') == 'reconcile'  # invalid -> default
+    assert normalize_sync_mode(None, None) == 'reconcile'  # #1289: safer default
+    assert normalize_sync_mode(None, 'also-bogus') == 'reconcile'
 
 
 def test_normalize_all_real_modes_pass_through():
@@ -239,3 +263,63 @@ def test_append_stringifies_ids():
 
 def test_append_ignores_empty_ids():
     assert plan_playlist_append(['a'], ['', 'b']) == ['b']
+
+
+# ── playlist_backup_enabled: replace-sync "<name> Backup" copies (#1406) ─────
+
+class _Cfg:
+    def __init__(self, data):
+        self._data = data
+
+    def get(self, key, default=None):
+        node = self._data
+        for part in key.split('.'):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+
+def test_playlist_backup_is_off_unless_turned_on():
+    """cremonies #1406: navidrome filled up with "<name> Backup" playlists
+    nobody asked for. off unless the setting says true."""
+    from core.sync.playlist_edit import playlist_backup_enabled
+    assert playlist_backup_enabled(_Cfg({})) is False
+    assert playlist_backup_enabled(_Cfg({'playlist_sync': {}})) is False
+    assert playlist_backup_enabled(_Cfg({'playlist_sync': {'create_backup': False}})) is False
+    assert playlist_backup_enabled(_Cfg({'playlist_sync': {'create_backup': True}})) is True
+
+
+def test_fresh_install_default_has_backups_off():
+    from core.settings import ConfigManager
+    defaults = ConfigManager._get_default_config(ConfigManager.__new__(ConfigManager))
+    assert defaults['playlist_sync']['create_backup'] is False
+
+
+def _navidrome_with_existing_playlist(copies):
+    from types import SimpleNamespace
+    from core.navidrome_client import NavidromeClient
+    c = NavidromeClient.__new__(NavidromeClient)
+    c.ensure_connection = lambda: True
+    c.get_playlists_by_name = lambda name: [SimpleNamespace(id='PL1')]
+    c.copy_playlist = lambda src, dst: copies.append((src, dst)) or True
+    c.create_playlist = lambda name, tracks, playlist_id=None: True
+    c._make_request = lambda *a, **k: {'status': 'ok'}
+    return c
+
+
+def test_replace_sync_makes_no_server_backup_when_the_key_is_unset(monkeypatch):
+    """the real seam: navidrome's replace path reads the setting through the
+    helper, so an install that never set it gets no Backup playlist."""
+    import core.settings
+    from core.navidrome_client import NavidromeClient
+    monkeypatch.setattr(core.settings, 'config_manager', _Cfg({}))
+    copies = []
+    c = _navidrome_with_existing_playlist(copies)
+    assert NavidromeClient.update_playlist.__wrapped__(c, 'Road Trip', ['t']) is True
+    assert copies == []
+
+    monkeypatch.setattr(core.settings, 'config_manager',
+                        _Cfg({'playlist_sync': {'create_backup': True}}))
+    assert NavidromeClient.update_playlist.__wrapped__(c, 'Road Trip', ['t']) is True
+    assert copies == [('Road Trip', 'Road Trip Backup')]

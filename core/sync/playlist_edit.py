@@ -22,6 +22,7 @@ returned plan to the media-server client.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import List, Optional, Tuple
 
 
@@ -137,6 +138,70 @@ def plan_playlist_append(
     return out
 
 
+def _artist_keys(value) -> List[str]:
+    from core.text.normalize import normalize_key
+    names = value if isinstance(value, (list, tuple)) else [value]
+    return [k for k in (normalize_key(str(n or '')) for n in names) if k]
+
+
+def _shares_artist(source_keys, entry_keys) -> bool:
+    # substring both ways: "El Puffin; Brendan Mills" holds "El Puffin".
+    # a loose overlap only keeps more, never drops more
+    entry_joined = ''.join(entry_keys)
+    source_joined = ''.join(source_keys)
+    return (any(s in entry_joined for s in source_keys)
+            or any(e in source_joined for e in entry_keys))
+
+
+def plan_append_superseded(current_entries, source_hints, desired_ids) -> List[str]:
+    """Which entries an append should drop because they were a wrong match
+    that the right track has since replaced (#1801).
+
+    append never removes, so a track an older broken sync put on the
+    playlist stays there forever, next to the right one. kevin2xk's
+    "Seville" by El Puffin sat in the playlist for a Sami Kaur "Seville"
+    through #1715, #1721 and #1754.
+
+    an entry goes only when all of these hold:
+    - it is not something this sync wants on the playlist
+    - its title is the same as a source track's title
+    - that source track is matched to a different id that is on the playlist
+    - none of its artists line up with that source track's artists
+
+    anything else is left alone, so a track the user added by hand stays.
+    an entry with no artist to compare stays too.
+
+    ``current_entries``: ``(id, title, artist)`` per playlist entry, artist a
+    string or a list of names. ``source_hints``: ``(title, artists, matched_id)``
+    per matched source track. Returns ids, each once, in playlist order.
+    """
+    from core.text.normalize import normalize_key
+    desired = {str(d) for d in desired_ids if str(d)}
+    by_title: dict = {}
+    for title, artists, matched_id in source_hints or ():
+        tkey = normalize_key(str(title or ''))
+        mid = str(matched_id or '')
+        if not tkey or mid not in desired:
+            continue
+        by_title.setdefault(tkey, []).append((_artist_keys(artists or []), mid))
+
+    out: List[str] = []
+    for entry_id, title, artist in current_entries or ():
+        eid = str(entry_id or '')
+        if not eid or eid in desired or eid in out:
+            continue
+        hits = by_title.get(normalize_key(str(title or '')))
+        if not hits:
+            continue
+        entry_keys = _artist_keys(artist)
+        if not entry_keys:
+            continue
+        if any(source_keys and mid != eid and not _shares_artist(source_keys, entry_keys)
+               for source_keys, mid in hits):
+            out.append(eid)
+    return out
+
+
 def plan_align_rewrite(current_ids, matched_ids, keep_extras: bool = False):
     """Plan the ordered server-track id list to rewrite a playlist as, to align its
     ORDER to the source. Pure — no I/O, no metadata. Used only by the "Align
@@ -160,17 +225,31 @@ def plan_align_rewrite(current_ids, matched_ids, keep_extras: bool = False):
     matched = [str(m) for m in matched_ids]
     if any(m not in current_set for m in matched):
         return None
-    ordered = list(matched)
+    # an id goes in at most as many times as the playlist holds it. two
+    # source rows can share one server track (pass 0, #1852), so matched_ids
+    # can name it twice, and writing both would add a copy the playlist
+    # never had. a song the playlist really holds twice keeps both.
+    room = Counter(current)
+    ordered = []
+    for m in matched:
+        if room[m] > 0:
+            room[m] -= 1
+            ordered.append(m)
     if keep_extras:
-        matched_set = set(matched)
-        ordered.extend(c for c in current if c not in matched_set)
+        # whatever the aligned block didn't use, in current order
+        placed = Counter(ordered)
+        for c in current:
+            if placed[c] > 0:
+                placed[c] -= 1
+            else:
+                ordered.append(c)
     return ordered
 
 
 VALID_SYNC_MODES = ("replace", "append", "reconcile")
 
 
-def normalize_sync_mode(requested, configured, default: str = "replace") -> str:
+def normalize_sync_mode(requested, configured, default: str = "reconcile") -> str:
     """Resolve the effective playlist sync mode.
 
     An explicit per-request value wins; otherwise the configured default
@@ -178,9 +257,22 @@ def normalize_sync_mode(requested, configured, default: str = "replace") -> str:
     ``default``. Keeping ``reconcile`` in ``VALID_SYNC_MODES`` is load-bearing —
     a validation list that omits it silently downgrades reconcile to replace,
     which is exactly the #792 regression this helper exists to prevent.
+
+    #1289: default is reconcile (safer — preserves server edits) rather than
+    replace (wipes them). Existing saved settings are untouched.
     """
     mode = (requested or "") or (configured or "") or default
     return mode if mode in VALID_SYNC_MODES else default
+
+
+def resolve_sync_mode(own, configured, default: str = "reconcile") -> str:
+    """The mode a sync runs in, given a playlist's or pipeline's OWN mode (#1704).
+
+    Unlike a per-request value, a stored own mode that isn't a real one (a stale
+    or hand-edited row) falls back to the global setting, not the hardcoded
+    default: null or junk both mean "use global".
+    """
+    return normalize_sync_mode(own if own in VALID_SYNC_MODES else None, configured, default)
 
 
 __all__ = [
@@ -190,5 +282,16 @@ __all__ = [
     "plan_playlist_append",
     "plan_align_rewrite",
     "normalize_sync_mode",
+    "resolve_sync_mode",
     "VALID_SYNC_MODES",
 ]
+
+
+def playlist_backup_enabled(config) -> bool:
+    """should a replace sync copy the server playlist to "<name> Backup" first.
+
+    off unless someone turned it on (#1406). it clutters the server with
+    backup playlists, and soulsync already keeps its own copy of the source.
+    one place so plex / jellyfin / navidrome can't disagree on the default.
+    """
+    return bool(config.get('playlist_sync.create_backup', False))

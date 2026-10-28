@@ -25,12 +25,20 @@ _video_db_lock = threading.Lock()
 def get_video_db():
     """Return the shared VideoDatabase instance (created on first use)."""
     global _video_db
-    if _video_db is None:
+    db = _video_db
+    if db is None:
         with _video_db_lock:
-            if _video_db is None:
+            db = _video_db
+            if db is None:
                 from database.video_database import VideoDatabase
-                _video_db = VideoDatabase()
-    return _video_db
+                db = VideoDatabase()
+                # Anyone installing a handle from outside must hold
+                # _video_db_lock, and an installed handle outranks a lazily
+                # built one — publish only if the slot is still empty, and
+                # yield to an install that beat us to it.
+                if _video_db is None:
+                    _video_db = db
+    return db
 
 
 def create_video_blueprint() -> Blueprint:
@@ -66,7 +74,7 @@ def create_video_blueprint() -> Blueprint:
         # Per-profile side access: a music-only profile gets NOTHING from the
         # video blueprint (its whole UI is hidden for them — any request here is
         # a deep link or a probe). Admins always have both sides.
-        if not is_admin and getattr(g, "allowed_sides", "both") == "music":
+        if not is_admin and getattr(g, "allowed_sides", "both") not in ("video", "both"):
             return jsonify({"error": "Video access is disabled for this profile."}), 403
 
         # Management surfaces + credential/settings-only endpoints — admin for ANY
@@ -90,11 +98,31 @@ def create_video_blueprint() -> Blueprint:
             # (delete/sync/clear-match/delete-batch) + the download blocklist config. Content
             # views only READ metadata (the detail GET stays open); these MUTATE the library.
             admin = admin or _p("/api/video/bulk", "/api/video/monitor",
-                                 "/api/video/poster/set", "/api/video/downloads/blocklist") \
+                                 # single-episode monitor flip from the calendar
+                                 "/api/video/episode/monitor",
+                                 "/api/video/poster/set", "/api/video/downloads/blocklist",
+                                 # manual "I have this" links — library matching
+                                 # management, same as the overrides below. The
+                                 # GETs (search/status) stay open.
+                                 "/api/video/manual-match",
+                                 # per-movie/per-show subtitle language overrides
+                                 # (Phase 3) — per-title management, same as the
+                                 # acquisition overrides. The GET stays open.
+                                 "/api/video/subtitles/overrides",
+                                 # whisper model download (Phase 4): writes to
+                                 # server disk + pulls ~500MB from the net —
+                                 # admin-only. The status GET stays open.
+                                 "/api/video/subtitles/whisper/download") \
                 or path.endswith(("/metadata", "/lock", "/refresh-art",
+                                  # season-wide monitor flip — same library
+                                  # management as /api/video/monitor above
+                                  "/monitor",
                                   # per-title acquisition settings (P2/P8) — management,
                                   # same as the metadata edits above
                                   "/quality-profile", "/series-type",
+                                  # per-title acquisition overrides (sources,
+                                  # release groups, season packs)
+                                  "/overrides",
                                   # per-show Synchronize — mutates library rows
                                   "/sync"))
         if admin and not is_admin:
@@ -102,8 +130,26 @@ def create_video_blueprint() -> Blueprint:
 
         if writing and not getattr(g, "can_download", True) and _p(
                 "/api/video/downloads/grab", "/api/video/downloads/retry",
-                "/api/video/youtube/download", "/api/video/wishlist/add",
-                "/api/video/watchlist/add", "/api/video/youtube/wishlist/add"):
+                # clients-tab match & import: following a download is a grab
+                "/api/video/downloads/adopt",
+                "/api/video/youtube/download",
+                # manual subtitle download (Phase 3): an explicit user download
+                # action, same permission as a grab
+                "/api/video/subtitles/manual-download",
+                # the tab's bulk action — spends the same disk and bandwidth as
+                # the per-row grab above, so it takes the same permission
+                "/api/video/wishlist/youtube/download-all",
+                "/api/video/wishlist/add",
+                "/api/video/watchlist/add", "/api/video/youtube/wishlist/add",
+                "/api/video/watch/grab",
+                # the wishlist and watchlist are shared by the household: a
+                # profile that can't add to them can't empty them either (it
+                # used to, and that dropped every approved request with it),
+                # and searching/retrying spends the same indexer budget as a grab
+                "/api/video/wishlist/remove", "/api/video/wishlist/clear",
+                "/api/video/wishlist/search", "/api/video/wishlist/retry",
+                "/api/video/watchlist/remove", "/api/video/watchlist/person",
+                "/api/video/watchlist/studio", "/api/video/youtube/wishlist/remove"):
             return jsonify({"error": "Downloads are disabled for this profile."}), 403
 
     from .dashboard import register_routes as reg_dashboard
@@ -130,6 +176,9 @@ def create_video_blueprint() -> Blueprint:
     from .requests import register_routes as reg_requests
     from .notifications import register_routes as reg_notifications
     from .backups import register_routes as reg_backups
+    from .watch import register_routes as reg_watch
+    from .manual_match import register_routes as reg_manual_match
+    from .subtitles import register_routes as reg_subtitles
     reg_dashboard(bp)
     reg_scan(bp)
     reg_library(bp)
@@ -154,5 +203,8 @@ def create_video_blueprint() -> Blueprint:
     reg_requests(bp)
     reg_notifications(bp)
     reg_backups(bp)
+    reg_watch(bp)
+    reg_manual_match(bp)
+    reg_subtitles(bp)
 
     return bp

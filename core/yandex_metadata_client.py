@@ -22,7 +22,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from config.settings import config_manager
+from core.settings import config_manager
 
 logger = logging.getLogger(__name__)
 

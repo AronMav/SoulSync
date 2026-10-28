@@ -182,6 +182,26 @@ def test_tasks_sorted_by_track_index():
     assert [t['track_index'] for t in out['tasks']] == [0, 1, 2]
 
 
+def test_completed_task_exposes_only_its_verified_final_file_path():
+    deps, _ = _build_deps()
+    download_tasks['done'] = {
+        'track_index': 0,
+        'status': 'completed',
+        'track_info': {'name': 'Ready'},
+        'final_file_path': '/music/Ready.flac',
+    }
+    download_tasks['working'] = {
+        'track_index': 1,
+        'status': 'post_processing',
+        'track_info': {'name': 'Working'},
+        'final_file_path': '/staging/Working.flac',
+    }
+    batch = {'phase': 'downloading', 'queue': ['done', 'working']}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['tasks'][0]['final_file_path'] == '/music/Ready.flac'
+    assert out['tasks'][1]['final_file_path'] is None
+
+
 def test_missing_task_in_queue_is_skipped():
     deps, _ = _build_deps()
     download_tasks['t1'] = {'track_index': 0, 'status': 'queued', 'track_info': {}}
@@ -449,7 +469,11 @@ def test_safety_valve_stuck_searching_marks_not_found():
     assert 'Search stuck' in download_tasks['t1']['error_message']
 
 
-def test_safety_valve_stuck_downloading_with_recovered_file_routes_to_post_processing():
+def test_safety_valve_stuck_downloading_with_recovered_file_routes_to_post_processing(monkeypatch):
+    # This unit test calls the formatter without its HTTP lock. Execute the
+    # recovery inline; threaded HTTP/cancellation coverage lives in #1245 tests.
+    from types import SimpleNamespace
+    monkeypatch.setattr(st, '_recovery_pool', SimpleNamespace(submit=lambda fn: fn()))
     deps, submitted = _build_deps(
         config=_FakeConfig({'soulseek.download_timeout': 1, 'soulseek.download_path': '/d', 'soulseek.transfer_path': '/t'}),
         find_completed=lambda *a, **kw: ('/found.flac', 'transfer'),
@@ -465,7 +489,11 @@ def test_safety_valve_stuck_downloading_with_recovered_file_routes_to_post_proce
     assert submitted == [('t1', 'b1')]
 
 
-def test_safety_valve_stuck_downloading_no_file_marks_failed():
+def test_safety_valve_stuck_downloading_no_file_marks_failed(monkeypatch):
+    # This unit test calls the formatter without its HTTP lock. Execute the
+    # recovery inline; threaded HTTP/cancellation coverage lives in #1245 tests.
+    from types import SimpleNamespace
+    monkeypatch.setattr(st, '_recovery_pool', SimpleNamespace(submit=lambda fn: fn()))
     deps, _ = _build_deps(config=_FakeConfig({'soulseek.download_timeout': 1}))
     download_tasks['t1'] = {
         'track_index': 0, 'status': 'downloading', 'track_info': {},
@@ -628,6 +656,42 @@ def test_unified_response_album_dict_extracted_to_name():
     assert out['downloads'][0]['artwork'] == 'http://thumb.jpg'
 
 
+def test_unified_response_position_comes_from_the_batch_queue_not_track_index():
+    """#1183: track_index is an identity (original wishlist/playlist position,
+    what cancel addresses), not an ordinal. a 2-track album sub-batch carrying
+    wishlist-wide indexes rendered "Track 4930 of 2"."""
+    deps, _ = _build_deps()
+    download_batches['b1'] = {'queue': ['t_a', 't_b'], 'playlist_name': 'They Live OST'}
+    download_tasks['t_a'] = {
+        'track_index': 4929, 'status': 'downloading', 'batch_id': 'b1',
+        'track_info': {'name': 'Bonus Track'},
+    }
+    download_tasks['t_b'] = {
+        'track_index': 4938, 'status': 'queued', 'batch_id': 'b1',
+        'track_info': {'name': 'Wake Up'},
+    }
+    out = st.build_unified_downloads_response(100, deps)
+    by_title = {d['title']: d for d in out['downloads']}
+    assert by_title['Bonus Track']['batch_position'] == 1
+    assert by_title['Wake Up']['batch_position'] == 2
+    assert by_title['Bonus Track']['batch_total'] == 2
+    # the identity still rides along for cancel addressing
+    assert by_title['Bonus Track']['track_index'] == 4929
+
+
+def test_unified_response_position_is_none_when_task_missing_from_queue():
+    """a pruned queue (cancel rewrites it) must yield no position rather
+    than a wrong one."""
+    deps, _ = _build_deps()
+    download_batches['b1'] = {'queue': ['t_other']}
+    download_tasks['t_a'] = {
+        'track_index': 7, 'status': 'queued', 'batch_id': 'b1',
+        'track_info': {'name': 'X'},
+    }
+    out = st.build_unified_downloads_response(100, deps)
+    assert out['downloads'][0]['batch_position'] is None
+
+
 def test_unified_response_completed_task_progress_is_100():
     deps, _ = _build_deps()
     download_tasks['t1'] = {
@@ -736,6 +800,37 @@ def test_unified_response_includes_persistent_download_history():
     assert item['progress'] == 100
     assert item['batch_name'] == 'Deezer'
     assert item['is_persistent_history'] is True
+
+
+def test_history_rows_carry_kind_acoustid_and_what_was_asked_for():
+    # the downloads page detail sheet reads these. a podcast row has to say
+    # it's a podcast, and a wrong-file grab has to show what we asked for.
+    deps, _ = _build_deps(
+        persistent_history=lambda limit: [
+            {
+                'id': 7,
+                'event_type': 'podcast',
+                'title': 'Episode',
+                'acoustid_result': 'verified',
+                'source_track_title': 'Asked Title',
+                'source_artist': 'Asked Artist',
+                'created_at': '2026-05-24 12:34:56',
+            },
+            {'id': 8, 'title': 'Bare', 'created_at': '2026-05-24 12:00:00'},
+        ]
+    )
+
+    out = st.build_unified_downloads_response(100, deps)
+
+    rich, bare = out['downloads']
+    assert rich['event_type'] == 'podcast'
+    assert rich['acoustid_result'] == 'verified'
+    assert rich['expected_title'] == 'Asked Title'
+    assert rich['expected_artist'] == 'Asked Artist'
+    # old rows without the columns get empty strings, never None
+    assert bare['event_type'] == ''
+    assert bare['acoustid_result'] == ''
+    assert bare['expected_title'] == ''
 
 
 def test_unified_response_dedupes_history_against_live_task():
@@ -915,3 +1010,23 @@ def test_manual_pick_rejected_fails_immediately_without_grace():
     out = st.build_batch_status_data('b1', batch, live, deps)
     assert out['tasks'][0]['status'] == 'failed'  # immediate, no 60s wait
     assert download_tasks['t1']['status'] == 'failed'
+
+
+def test_external_audiobook_progress_survives_music_timeout_and_serializes():
+    import time
+    from core.audiobook_download_state import register_download, update_progress, mark_status, BATCH_ID
+    register_download('book', 'Rhythm of War', protocol='soulseek')
+    # The monitor sets status separately from transfer counters.
+    mark_status('book', 'downloading')
+    download_tasks['book']['status_change_time'] = time.time() - 3600
+    update_progress('book', percent=37.5, bytes_done=375000, bytes_total=1000000, speed=25000)
+    deps, submitted = _build_deps()
+    result = st.build_batch_status_data(BATCH_ID, download_batches[BATCH_ID], {}, deps)
+    assert result['tasks'][0]['progress'] == 37.5
+    assert result['tasks'][0]['status'] == 'downloading'
+    assert download_tasks['book']['error_message'] is None
+    assert submitted == []
+    unified = st.build_unified_downloads_response(20, deps)
+    row = next(item for item in unified['downloads'] if item['task_id'] == 'book')
+    assert row['progress'] == 37.5
+    assert row['status'] == 'downloading'

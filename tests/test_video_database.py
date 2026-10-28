@@ -195,25 +195,31 @@ def test_dashboard_stats_counts_content_and_downloads(db):
         # airing library show → on the curated watchlist by default
         conn.execute("INSERT INTO shows(id,title,monitored,tmdb_id,status) VALUES (1,'S',1,555,'continuing')")
         conn.execute("INSERT INTO seasons(id,show_id,season_number) VALUES (1,1,1)")
-        conn.execute("INSERT INTO episodes(id,show_id,season_id,season_number,episode_number) "
-                     "VALUES (1,1,1,1,1)")
+        conn.execute("INSERT INTO episodes(id,show_id,season_id,season_number,episode_number,has_file) "
+                     "VALUES (1,1,1,1,1,1)")
+        # backfilled from tmdb, not on disk: not a library episode
+        conn.execute("INSERT INTO episodes(id,show_id,season_id,season_number,episode_number,has_file) "
+                     "VALUES (2,1,1,1,2,0)")
         conn.execute("INSERT INTO media_files(movie_id,relative_path,size_bytes) VALUES (1,'m.mkv',1000)")
-        conn.execute("INSERT INTO downloads(movie_id,title,status,download_speed_bps) "
-                     "VALUES (1,'d','downloading',500)")
+        # the live queue is video_downloads; the old downloads table is never written
+        for title, status, speed in [("d", "downloading", 500), ("q", "queued", 0),
+                                     ("c", "completed", 0), ("f", "failed", 0)]:
+            conn.execute("INSERT INTO video_downloads(kind,title,status,speed_bps) VALUES ('movie',?,?,?)",
+                         (title, status, speed))
         conn.commit()
     s = db.dashboard_stats()
     assert s["library"] == {"movies": 1, "shows": 1, "episodes": 1, "size_bytes": 1000}
-    assert s["downloads"]["active"] == 1 and s["downloads"]["speed_bps"] == 500
+    assert s["downloads"] == {"active": 2, "finished": 1, "speed_bps": 500}
     # watchlist = the airing show (curated default); wishlist is cleared for now
     assert s["watchlist"] == 1 and s["wishlist"] == 0
 
 
 def test_library_selection_roundtrip(db):
-    assert db.get_library_selection("plex") == {"movies": None, "tv": None}
+    assert db.get_library_selection("plex") == {"movies": None, "tv": None, "tv_more": [], "anime": []}
     db.set_library_selection("plex", "Movies", "TV Shows")
-    assert db.get_library_selection("plex") == {"movies": "Movies", "tv": "TV Shows"}
+    assert db.get_library_selection("plex") == {"movies": "Movies", "tv": "TV Shows", "tv_more": [], "anime": []}
     # Per-server keys don't collide.
-    assert db.get_library_selection("jellyfin") == {"movies": None, "tv": None}
+    assert db.get_library_selection("jellyfin") == {"movies": None, "tv": None, "tv_more": [], "anime": []}
 
 
 def test_settings_kv_roundtrip(db):
@@ -789,6 +795,34 @@ def test_backfill_inserts_missing_episodes_as_unowned(db):
     assert by[2]["title"] == "Two" and by[2]["air_date"] == "2020-01-08"
 
 
+def test_backfill_overwrite_air_date_moves_rescheduled_premiere(db):
+    # a rescheduled premiere: the stored air_date must move when the refresh
+    # re-pulls (gap-fill kept it stale forever)
+    sid = db.upsert_show_tree("plex", {"server_id": "s1", "title": "S", "seasons": [
+        {"season_number": 1, "episodes": [{"episode_number": 1}]}]})
+    db.backfill_episodes(sid, 1, [{"episode_number": 1, "air_date": "2020-01-08"}])
+    with db.connect() as c:
+        assert c.execute("SELECT air_date FROM episodes WHERE show_id=? AND episode_number=1",
+                         (sid,)).fetchone()[0] == "2020-01-08"
+    # default (gap-fill): the reschedule does NOT move
+    db.backfill_episodes(sid, 1, [{"episode_number": 1, "air_date": "2020-02-01"}])
+    with db.connect() as c:
+        assert c.execute("SELECT air_date FROM episodes WHERE show_id=? AND episode_number=1",
+                         (sid,)).fetchone()[0] == "2020-01-08"
+    # refresh with overwrite: the reschedule moves
+    db.backfill_episodes(sid, 1, [{"episode_number": 1, "air_date": "2020-02-01"}],
+                         overwrite_air_date=True)
+    with db.connect() as c:
+        assert c.execute("SELECT air_date FROM episodes WHERE show_id=? AND episode_number=1",
+                         (sid,)).fetchone()[0] == "2020-02-01"
+    # a blank incoming date never blanks a stored one
+    db.backfill_episodes(sid, 1, [{"episode_number": 1, "air_date": ""}],
+                         overwrite_air_date=True)
+    with db.connect() as c:
+        assert c.execute("SELECT air_date FROM episodes WHERE show_id=? AND episode_number=1",
+                         (sid,)).fetchone()[0] == "2020-02-01"
+
+
 def test_apply_ratings_and_payload(db):
     mid = db.upsert_movie("plex", {"server_id": "m1", "title": "Dune"})
     db.apply_ratings("movie", mid, {"imdb_rating": 8.4, "rt_rating": 95, "metacritic": 74})
@@ -1062,6 +1096,24 @@ def test_wishlist_episodes_group_into_show_tree(db):
     assert [e["episode_number"] for e in show["seasons"][0]["episodes"]] == [1, 2]
     counts = db.wishlist_counts()
     assert counts == {"movie": 0, "show": 1, "episode": 3, "total": 3}
+
+
+def test_add_episodes_returns_new_rows_only(db):
+    # the "Added N episodes" count must be genuinely-new rows, not attempted —
+    # a re-cover run re-wishing the same episodes reports 0, not phantoms.
+    n = db.add_episodes_to_wishlist(1396, "Breaking Bad", [
+        {"season_number": 1, "episode_number": 1},
+        {"season_number": 1, "episode_number": 2}])
+    assert n == 2
+    n = db.add_episodes_to_wishlist(1396, "Breaking Bad", [
+        {"season_number": 1, "episode_number": 1},   # already wished → 0
+        {"season_number": 1, "episode_number": 3}])  # new → 1
+    assert n == 1
+    n = db.add_episodes_to_wishlist(1396, "Breaking Bad", [
+        {"season_number": 1, "episode_number": 1}])   # all already wished
+    assert n == 0
+    assert db.wishlist_has_episode(1396, 1, 1) is True
+    assert db.wishlist_has_episode(1396, 9, 9) is False
 
 
 def test_wishlist_remove_scopes(db):

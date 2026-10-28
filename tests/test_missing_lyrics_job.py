@@ -47,10 +47,12 @@ def test_has_remote_lyrics_false_when_none():
     assert _client_with_api(api).has_remote_lyrics("Instrumental", "Artist") is False
 
 
-def test_has_remote_lyrics_false_when_no_api():
+def test_has_remote_lyrics_unknown_when_no_api():
+    # #1879 tri-state: no API client is an UNKNOWN, not a definitive
+    # negative — "we couldn't ask" must not read as "no lyrics exist".
     c = LyricsClient.__new__(LyricsClient)
     c.api = None
-    assert c.has_remote_lyrics("Song", "Artist") is False
+    assert c.has_remote_lyrics("Song", "Artist") is None
 
 
 # ── sidecar detection ────────────────────────────────────────────────────────
@@ -246,8 +248,8 @@ def test_apply_track_plans_lyrics_never_writes_tags(tmp_path, monkeypatch):
               "lyrics_meta": {"title": "Song", "artist": "Artist", "album": "Al"}}]
     res = library_retag.apply_track_plans(plans, lyrics_action=True)
     assert res["lyrics_written"] == 1
-    # write_tags_to_file was called with an EMPTY db_data — no title/artist leaked in.
-    assert written == [{}]
+    # write_tags_to_file is never called for lyrics-only plans — no tags written at all.
+    assert written == []
 
 
 def test_apply_track_plans_no_lyrics_when_disabled(tmp_path, monkeypatch):

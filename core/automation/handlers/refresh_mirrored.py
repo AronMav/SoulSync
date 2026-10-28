@@ -6,7 +6,8 @@ unification). The pre-extraction handler had ~190 lines of per-source
 if/elif branches; this version delegates to the adapter for each
 source, leaving the handler responsible only for:
 
-- filtering sources that can't be refreshed (``file``, ``beatport``),
+- filtering mirrors that can't be refreshed (``file``, user playlists, a
+  beatport mirror that isn't a live list),
 - extracting upstream URLs from the stored ``description`` for URL-
   backed sources (``spotify_public``, ``youtube``),
 - the Spotify-public → authenticated-Spotify fallback (uses the
@@ -24,8 +25,11 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from core.automation.deps import AutomationDeps
+from core.profile_context import get_background_profile
 from core.playlists.source_refs import require_refresh_url
 from core.playlists.sources import PlaylistDetail, to_mirror_track_dict
+from core.playlists import auto_identify
+from core.playlists.user_playlists import has_upstream
 from core.playlists.sources.base import (
     SOURCE_SPOTIFY,
     SOURCE_SPOTIFY_PUBLIC,
@@ -63,15 +67,18 @@ def auto_refresh_mirrored(config: Dict[str, Any], deps: AutomationDeps) -> Dict[
     skip_discovery = bool(config.get('skip_discovery', False))
 
     if refresh_all:
-        playlists = db.get_mirrored_playlists()
+        # the playlists-page pipeline passes profile_id; automations don't, so
+        # use the profile the engine is running this as (the owner), not admin
+        owner = config.get('profile_id') or get_background_profile()
+        playlists = db.get_mirrored_playlists(int(owner)) if owner else db.get_mirrored_playlists()
     elif playlist_id:
         p = db.get_mirrored_playlist(int(playlist_id))
         playlists = [p] if p else []
     else:
         return {'status': 'error', 'reason': 'No playlist specified'}
 
-    # Filter out sources that can't be refreshed (no external API).
-    playlists = [pl for pl in playlists if pl.get('source', '') not in ('file', 'beatport')]
+    # Filter out mirrors that can't be refreshed (nothing upstream to pull).
+    playlists = [pl for pl in playlists if has_upstream(pl)]
 
     refreshed = 0
     errors: List[str] = []
@@ -113,7 +120,16 @@ def auto_refresh_mirrored(config: Dict[str, Any], deps: AutomationDeps) -> Dict[
             )
 
             tracks = [to_mirror_track_dict(t) for t in detail_tracks]
-            refreshed += _commit_refresh(pl, source, source_id, tracks, db, deps, auto_id)
+            # a source that reports skips (tidal) sets the key, the rest leave the stored counts alone
+            meta_extra = getattr(detail.meta, 'extra', None) or {}
+            mirror_kwargs = (
+                {'source_skipped': meta_extra['source_skipped']}
+                if 'source_skipped' in meta_extra else {}
+            )
+            refreshed += _commit_refresh(
+                pl, source, source_id, tracks, db, deps, auto_id, mirror_kwargs,
+                identify=not skip_discovery,
+            )
         except _SkipPlaylist:
             # Source-specific soft-skip (e.g. Tidal not authenticated).
             # Logging was already emitted; do not count as error.
@@ -178,8 +194,15 @@ def _fetch_detail(
     if registry is None:
         return None
 
+    # For request lists, use upstream_playlist_id if available,
+    # or strip the _req_ suffix from source_id so the upstream adapter
+    # resolves the actual upstream collection/playlist.
+    playlist_input = pl.get('upstream_playlist_id') or source_id
+    if pl.get('is_request_list') or '_req_' in str(playlist_input):
+        import re
+        playlist_input = re.sub(r'_req_[a-f0-9]+$', '', str(playlist_input))
+
     # URL-backed sources: pull the upstream URL out of `description`.
-    playlist_input = source_id
     if source in _URL_BACKED_SOURCES:
         # ``require_refresh_url`` raises ValueError on missing URL.
         # The outer try/except in the loop catches it and reports as
@@ -261,8 +284,15 @@ def _commit_refresh(
     db: Any,
     deps: AutomationDeps,
     auto_id: Optional[str],
+    mirror_kwargs: Optional[Dict[str, Any]] = None,
+    identify: bool = True,
 ) -> int:
     """Persist the refreshed track list + emit playlist_changed when delta.
+
+    New tracks get a quiet background identify, the same one My Playlists
+    use (core/playlists/auto_identify), so a mirror is ready to sync after
+    every refresh. Pipeline runs pass ``identify=False``: their own
+    discovery phase does it next.
 
     Returns 1 when a refresh successfully landed, 0 otherwise. The
     caller is responsible for incrementing the running tally."""
@@ -281,7 +311,7 @@ def _commit_refresh(
         if sid and sid in old_extra_map and 'extra_data' not in t:
             t['extra_data'] = old_extra_map[sid]
 
-    db.mirror_playlist(
+    saved_id = db.mirror_playlist(
         source=source,
         source_playlist_id=source_id,
         name=pl['name'],
@@ -290,7 +320,10 @@ def _commit_refresh(
         description=pl.get('description'),
         owner=pl.get('owner'),
         image_url=pl.get('image_url'),
+        **(mirror_kwargs or {}),
     )
+    if identify and saved_id:
+        auto_identify.request_if_unmatched(saved_id, tracks)
 
     # Membership just changed — if this playlist is organize-by-playlist, rebuild
     # its folder (with prune) so a track that LEFT the playlist has its symlink

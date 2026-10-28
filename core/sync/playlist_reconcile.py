@@ -5,7 +5,10 @@ Lifted verbatim from the inline three-pass matcher in
 two #768 fixes live in importable, covered code:
 
   Pass 0  user-confirmed overrides (``sync_match_cache``), applied first.
-  Pass 1  exact normalized-title match.
+  Pass 1  exact normalized-title match, gated on artist agreement — or on
+          duration corroboration when the artist strings share nothing
+          (#1164: title alone pinned "XO" by John Mayer to "XO" by Eden
+          Project at 100%).
   Pass 2  fuzzy match on ``"artist title"`` (SequenceMatcher >= 0.75).
   Extra   server tracks no source claimed -> ``match_status='extra'``.
 
@@ -39,6 +42,20 @@ from core.text.source_title import canonical_source_track
 
 _FUZZY_THRESHOLD = 0.75
 
+# Pass-1 artist gate (#1164). Same normalized title is NOT the same track:
+# a playlist with "XO" by John Mayer matched the library's "XO" by Eden
+# Project and the badge said 100%. The threshold is deliberately loose —
+# it only has to tell "Eden Project" from "John Mayer", while letting
+# spelling drift ("Beyonce"/"Beyoncé") through; containment handles the
+# channel shapes ("The Killers" in "The KillersVEVO").
+_ARTIST_AGREE_THRESHOLD = 0.6
+# When the artist strings share nothing ("mgk" vs "Machine Gun Kelly",
+# aliases and channel names), equal-length recordings are accepted as the
+# same track — but reported below 1.0, because it is a corroborated guess,
+# not a certainty.
+_DURATION_TOLERANCE_MS = 5000
+_DURATION_RESCUE_CONFIDENCE = 0.9
+
 _FEAT_RE = re.compile(r'\s*[\(\[](?:feat|ft)\.?[^\)\]]*[\)\]]', re.IGNORECASE)
 _REMASTER_RE = re.compile(
     r'\s*[\(\[](?:\d{4}\s+)?remaster(?:ed)?(?:\s+version)?\s*[\)\]]', re.IGNORECASE)
@@ -57,17 +74,63 @@ def norm_title(t: str) -> str:
 
 
 def _src_entry(src: Dict[str, Any], position_fallback: int) -> Dict[str, Any]:
+    # Positions are 1-based everywhere the user sees them: mirrored rows are
+    # stored i+1 (music_database mirror insert) and the editor's server column
+    # is always ordinal (index + 1). ``position_fallback`` is the 0-based
+    # enumerate index, so a source with no stored position (sync-history
+    # entries carry a 0-based 'index' and no 'position' at all) must fall back
+    # to fallback + 1 — falling back to the raw index numbered the first
+    # source track 0 against the server's 1, shifting every paired row by one
+    # and making a 55-track source read as numbered 0..54 (#1852).
+    # Anything that is not a positive int (missing, None, a stray 0, a bool,
+    # a string) is not a usable 1-based position either — the row's own
+    # ordinal is the only honest number for it. This assumes a list's stored
+    # positions are homogeneous (every row has one, or none do): both real
+    # producers are — mirrored rows all carry one, sync-history rows carry
+    # none — so a fallback ordinal never collides with a neighbour's stored
+    # position in practice.
+    position = src.get('position')
+    if not isinstance(position, int) or isinstance(position, bool) or position < 1:
+        position = position_fallback + 1
     return {
         'name': src.get('name', ''),
         'artist': src.get('artist', ''),
         'album': src.get('album', ''),
         'image_url': src.get('image_url', ''),
         'duration_ms': src.get('duration_ms', 0),
-        'position': src.get('position', position_fallback),
+        'position': position,
         # #768 Bug B: echo the source id back so the editor can persist a
         # manual "Find & add" override against it.
         'source_track_id': src.get('source_track_id', '') or '',
     }
+
+
+def _artists_agree(src_artist: str, svr_artist: str) -> bool:
+    """Whether two artist strings plausibly name the same artist.
+
+    Vacuously true when either side is empty — there is no information to
+    refute with (file imports often carry no artist), and refusing to match
+    would regress every artist-less source that title-matched before."""
+    a = (src_artist or '').lower().strip()
+    b = (svr_artist or '').lower().strip()
+    if not a or not b:
+        return True
+    if a in b or b in a:
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= _ARTIST_AGREE_THRESHOLD
+
+
+def _durations_agree(src_ms: Any, svr_ms: Any) -> bool:
+    """True only when BOTH durations are known and within tolerance —
+    an unknown duration corroborates nothing."""
+    try:
+        a = int(src_ms or 0)
+        b = int(svr_ms or 0)
+    except (TypeError, ValueError):
+        return False
+    if a <= 0 or b <= 0:
+        return False
+    return abs(a - b) <= _DURATION_TOLERANCE_MS
 
 
 def _resolved_artist(src: Dict[str, Any]) -> str:
@@ -83,13 +146,21 @@ def reconcile_playlist(
     source_tracks: List[Dict[str, Any]],
     server_tracks: List[Dict[str, Any]],
     override_pairs: Optional[Dict[int, int]] = None,
+    rejected_pairs: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """Return the combined matched/missing/extra view (list of dicts).
 
     Each combined entry has ``source_track``, ``server_track``,
     ``match_status`` ('matched'|'missing'|'extra'), ``confidence``, and
-    ``override: True`` on override hits."""
+    ``override: True`` on override hits.
+
+    ``rejected_pairs`` is ``{(source_track_id, server_track_id)}`` the user
+    unmatched; passes 1 and 2 never pair those two again."""
     override_pairs = override_pairs or {}
+    rejected_pairs = rejected_pairs or set()
+
+    def _rejected(src_id: str, j: int) -> bool:
+        return bool(src_id) and (src_id, str(server_tracks[j].get('id'))) in rejected_pairs
     combined: List[Dict[str, Any]] = []
     used_server_indices: set[int] = set()
     unmatched_source: List[tuple[int, Dict[str, Any], str]] = []
@@ -118,15 +189,36 @@ def reconcile_playlist(
 
         # Pass 1: exact normalized-title match — try the raw source title AND
         # the canonicalized one (strips "Artist - " prefix / channel artist).
+        # A bare title hit is not enough on its own (#1164): the artist has to
+        # agree too, or — when the artist strings share nothing (aliases,
+        # channel names) — the durations have to corroborate. Among several
+        # unused same-title server tracks this also picks the artist-agreeing
+        # one instead of blindly the first, so two "XO"s pair with the right
+        # owners instead of crossing.
         canon_title, _canon_artist = canonical_source_track(src_name, src_artist)
         candidates = {norm_title(src_name), norm_title(canon_title)}
         best_idx = -1
+        confidence = 1.0
+        duration_idx = -1
         for j, svr_norm in enumerate(server_norm):
             if j in used_server_indices:
                 continue
-            if svr_norm in candidates:
+            if svr_norm not in candidates:
+                continue
+            if _rejected(src_entry['source_track_id'], j):
+                continue
+            svr_artist = server_tracks[j].get('artist', '')
+            if _artists_agree(src_artist, svr_artist) or (
+                    _canon_artist and _canon_artist != src_artist
+                    and _artists_agree(_canon_artist, svr_artist)):
                 best_idx = j
                 break
+            if duration_idx < 0 and _durations_agree(
+                    src.get('duration_ms'), server_tracks[j].get('duration')):
+                duration_idx = j
+        if best_idx < 0 and duration_idx >= 0:
+            best_idx = duration_idx
+            confidence = _DURATION_RESCUE_CONFIDENCE
 
         if best_idx >= 0:
             used_server_indices.add(best_idx)
@@ -134,7 +226,7 @@ def reconcile_playlist(
                 'source_track': src_entry,
                 'server_track': server_tracks[best_idx],
                 'match_status': 'matched',
-                'confidence': 1.0,
+                'confidence': confidence,
                 'server_index': best_idx,
             })
         else:
@@ -172,11 +264,23 @@ def reconcile_playlist(
         src_key = f"{canon_artist} {norm_title(canon_title)}".strip().lower()
         best_score = 0.0
         best_j = -1
+        artist_agreements = {}
         for j, sm in enumerate(server_matchers):
             if j in used_server_indices:
                 continue
+            if _rejected(src_entry['source_track_id'], j):
+                continue
             sm.set_seq1(src_key)
             if sm.real_quick_ratio() < _FUZZY_THRESHOLD or sm.quick_ratio() < _FUZZY_THRESHOLD:
+                continue
+            # A long shared title must not overwhelm the artist disagreement
+            # that rejected this pair in pass 1. Reuse comparisons for repeated
+            # artists, after the cheap title-score bounds have rejected misses.
+            server_artist = server_tracks[j].get('artist', '')
+            if server_artist not in artist_agreements:
+                artist_agreements[server_artist] = _artists_agree(canon_artist, server_artist)
+            if not (artist_agreements[server_artist]
+                    or _durations_agree(src_entry.get('duration_ms'), server_tracks[j].get('duration'))):
                 continue
             score = sm.ratio()
             if score > best_score and score >= _FUZZY_THRESHOLD:
@@ -223,25 +327,45 @@ def compute_order_status(combined: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     Reads each matched entry's ``server_index`` (its position in the server
     playlist) off the combined view — which is already in source order — and checks
-    that sequence is strictly ascending. Relative order is used on purpose: missing
+    that the DISTINCT positions, in first-occurrence order, are strictly ascending.
+    Relative order is used on purpose: missing
     and extra tracks shift absolute positions, so comparing positions directly would
     false-flag any playlist that isn't a perfect 1:1. The model is one-way (source
     order is truth; the server may have drifted), so we only ever report whether the
     server is *behind* the source order — never the reverse.
 
     Returns ``{matched, in_order, out_of_order}``. ``out_of_order`` is True only when
-    there are >= 2 matched tracks AND their server positions aren't ascending — so a
-    playlist with 0 or 1 matches (nothing to compare) is never flagged.
+    there are >= 2 DISTINCT matched server positions AND they aren't ascending — so a
+    playlist with 0 or 1 distinct matched positions (nothing to compare) is never
+    flagged. ``matched`` still counts every matched entry, shared pairings included.
+
+    A server position can repeat: pass 0 deliberately pairs two source rows
+    with ONE server track (two provider ids for the same song, both
+    user-confirmed — see ``resolve_match_overrides``), so a shared track's
+    index appears twice in the sequence. A repeat is not disorder — the
+    shared track sits in exactly one place on the server — so the check
+    runs over each position's first occurrence. Without that, any playlist
+    with a shared pairing (55 source rows matched to 54 server tracks) was
+    flagged out of order no matter how the server was actually ordered
+    (#1852).
+
+    One shape this deliberately does not flag is a straddle: a shared
+    track whose two source slots sit on opposite sides of another track
+    (A B A). No single server placement can satisfy both slots, and
+    flagging it would re-break legitimate duplicate-song playlists over
+    something reordering the server cannot fix — so first-occurrence
+    order is the verdict, and a straddle reads as in order.
     """
     positions = [
         e['server_index'] for e in combined
         if e.get('match_status') == 'matched' and e.get('server_index') is not None
     ]
-    in_order = all(a < b for a, b in zip(positions, positions[1:], strict=False))
+    distinct = list(dict.fromkeys(positions))
+    in_order = all(a < b for a, b in zip(distinct, distinct[1:], strict=False))
     return {
         'matched': len(positions),
         'in_order': in_order,
-        'out_of_order': len(positions) >= 2 and not in_order,
+        'out_of_order': len(distinct) >= 2 and not in_order,
     }
 
 

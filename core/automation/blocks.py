@@ -8,7 +8,7 @@ Three top-level lists:
   event triggers (track_downloaded, batch_complete, etc.), signal_received,
   webhook_received.
 - `ACTIONS` — DO blocks: process_wishlist, scan_library, etc.
-- `NOTIFICATIONS` — THEN blocks: discord/pushbullet/telegram/webhook,
+- `NOTIFICATIONS` — THEN blocks: discord/pushbullet/telegram/ntfy/gotify/webhook,
   plus fire_signal and run_script then-actions.
 
 Each block carries an optional ``scope`` tag so the SAME definitions can
@@ -20,6 +20,19 @@ Use :func:`blocks_for_scope` to get the filtered lists for one side.
 """
 
 from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+# a pipeline's own sync mode (#1704), '' = the global setting. the builder
+# reads these labels from here, the sync page's card menu matches them
+_SYNC_MODE_OPTIONS = [
+    {"value": "", "label": "Use global setting"},
+    {"value": "reconcile", "label": "Reconcile (match the source)"},
+    {"value": "append", "label": "Append only (never remove tracks)"},
+    {"value": "replace", "label": "Replace (delete and recreate)"},
+]
 
 TRIGGERS: list[dict] = [
     {"type": "schedule", "label": "Schedule", "icon": "clock", "scope": "both", "description": "Run on a timer interval", "available": True,
@@ -58,7 +71,7 @@ TRIGGERS: list[dict] = [
     {"type": "batch_complete", "label": "Batch Complete", "icon": "check-circle", "description": "When an album/playlist download finishes", "available": True,
      "has_conditions": True,
      "condition_fields": ["playlist_name"],
-     "variables": ["playlist_name", "total_tracks", "completed_tracks", "failed_tracks"]},
+     "variables": ["playlist_name", "artist", "title", "album", "total_tracks", "completed_tracks", "failed_tracks"]},
     {"type": "watchlist_new_release", "label": "New Release Found", "icon": "bell", "description": "When watchlist detects new music", "available": True,
      "has_conditions": True,
      "condition_fields": ["artist"],
@@ -71,7 +84,7 @@ TRIGGERS: list[dict] = [
      "has_conditions": True,
      "condition_fields": ["playlist_name"],
      "variables": ["playlist_name", "old_count", "new_count", "added", "removed"]},
-    {"type": "discovery_completed", "label": "Discovery Complete", "icon": "search", "description": "When playlist track discovery finishes", "available": True,
+    {"type": "discovery_completed", "label": "Identification Complete", "icon": "search", "description": "When playlist track identification finishes", "available": True,
      "has_conditions": True,
      "condition_fields": ["playlist_name"],
      "variables": ["playlist_name", "total_tracks", "discovered_count", "failed_count", "skipped_count"]},
@@ -96,6 +109,14 @@ TRIGGERS: list[dict] = [
      "description": "When AcoustID verification fails", "available": True,
      "has_conditions": True, "condition_fields": ["artist", "title"],
      "variables": ["artist", "title", "reason"]},
+    {"type": "deezer_signin_failed", "label": "Deezer Sign-in Failed", "icon": "x-circle",
+     "description": "When Deezer rejects the ARL (expired or signed out). Once per failure, not on every retry.",
+     "available": True, "scope": "music",
+     "variables": ["reason", "detail"]},
+    {"type": "deezer_signin_restored", "label": "Deezer Sign-in Restored", "icon": "check-circle",
+     "description": "When Deezer takes an ARL again after a failure, or a new ARL signs in",
+     "available": True, "scope": "music",
+     "variables": ["user", "tier"]},
     {"type": "wishlist_item_added", "label": "Wishlist Item Added", "icon": "plus-circle",
      "description": "When a track is added to wishlist", "available": True,
      "has_conditions": True, "condition_fields": ["artist", "title"],
@@ -112,6 +133,57 @@ TRIGGERS: list[dict] = [
      "description": "When album/track import finishes", "available": True,
      "has_conditions": True, "condition_fields": ["artist", "album_name"],
      "variables": ["track_count", "album_name", "artist"]},
+    {"type": "import_needs_attention", "label": "Import Needs Attention", "icon": "upload",
+     "description": "When auto-import cannot finish a folder on its own (needs review, could not identify, or failed)",
+     "available": True,
+     "has_conditions": True, "condition_fields": ["status", "artist", "album_name"],
+     "variables": ["folder_name", "status", "reason", "album_name", "artist", "confidence", "track_count"]},
+    # Audiobooks — twins of the music triggers above. Separate types rather than
+    # reused ones, so a music automation never fires for a book (and a
+    # "Track Downloaded" alert never reads as a book). A finished audiobook
+    # import fires import_completed itself.
+    {"type": "audiobook_grab_started", "label": "Audiobook Grabbed", "icon": "download",
+     "description": "When an audiobook release is sent to a download client", "available": True,
+     "has_conditions": True, "condition_fields": ["title", "author", "series", "protocol"],
+     "variables": ["title", "author", "series", "protocol", "release_title"]},
+    {"type": "audiobook_download_failed", "label": "Audiobook Download Failed", "icon": "x-circle",
+     "description": "When an audiobook download fails or can't be imported (the book goes back to the wishlist)",
+     "available": True,
+     "has_conditions": True, "condition_fields": ["title", "author", "error"],
+     "variables": ["title", "author", "error"]},
+    {"type": "audiobook_import_needs_attention", "label": "Audiobook Import Held", "icon": "alert-triangle",
+     "description": "When a finished audiobook download is held back, e.g. because the completeness check found missing parts. Fires once per hold",
+     "available": True,
+     "has_conditions": True, "condition_fields": ["title", "author", "reason"],
+     "variables": ["title", "author", "reason"]},
+    {"type": "audiobook_wishlist_item_added", "label": "Audiobook Wishlist Item Added", "icon": "plus-circle",
+     "description": "When a book is added to the audiobook wishlist (by hand or by a followed author)",
+     "available": True,
+     "has_conditions": True, "condition_fields": ["title", "author", "series"],
+     "variables": ["title", "author", "series", "asin"]},
+    {"type": "audiobook_wishlist_processing_completed", "label": "Audiobook Wishlist Processed", "icon": "check-circle",
+     "description": "After an audiobook wishlist pass that searched for at least one book", "available": True,
+     "variables": ["checked", "found", "grabbed", "errors", "freed", "unstuck", "already_owned"]},
+    {"type": "audiobook_new_release", "label": "Audiobook New Release Found", "icon": "bell",
+     "description": "When a followed author, narrator or series has new audiobooks", "available": True,
+     "has_conditions": True, "condition_fields": ["artist", "role"],
+     "variables": ["artist", "role", "count", "wishlisted", "titles"]},
+    {"type": "audiobook_watchlist_scan_completed", "label": "Audiobook Watchlist Scan Done", "icon": "check-circle",
+     "description": "After the followed authors, narrators and series were checked for new releases",
+     "available": True,
+     "variables": ["authors", "found", "wishlisted", "errors"]},
+    {"type": "audiobook_author_followed", "label": "Audiobook Author Followed", "icon": "user-plus",
+     "description": "When an author, narrator or series is followed", "available": True,
+     "has_conditions": True, "condition_fields": ["name", "role"],
+     "variables": ["name", "role"]},
+    {"type": "audiobook_author_unfollowed", "label": "Audiobook Author Unfollowed", "icon": "user-minus",
+     "description": "When an author, narrator or series is unfollowed", "available": True,
+     "has_conditions": True, "condition_fields": ["name", "role"],
+     "variables": ["name", "role"]},
+    {"type": "audiobook_library_scan_completed", "label": "Audiobook Library Scan Done", "icon": "hard-drive",
+     "description": "When a scan of the audiobook folder finishes", "available": True,
+     "has_conditions": True, "condition_fields": ["status"],
+     "variables": ["status", "checked", "adopted", "updated", "moved", "removed", "errors", "duration"]},
     {"type": "mirrored_playlist_created", "label": "Playlist Mirrored", "icon": "copy",
      "description": "When a new playlist is mirrored", "available": True,
      "has_conditions": True, "condition_fields": ["playlist_name", "source"],
@@ -131,8 +203,8 @@ TRIGGERS: list[dict] = [
     {"type": "music_repair_scan_completed", "label": "Maintenance Scan Done", "icon": "tool",
      "description": "When a Library Maintenance job finishes a scan", "available": True,
      "has_conditions": True,
-     "condition_fields": ["job_id", "status"],
-     "variables": ["job_id", "job_name", "status", "scanned", "findings_created", "errors"]},
+     "condition_fields": ["job_id", "status", "run_status"],
+     "variables": ["job_id", "job_name", "status", "run_status", "scanned", "findings_created", "errors"]},
     # Signal trigger
     {"type": "signal_received", "label": "Signal Received", "icon": "zap", "scope": "both",
      "description": "When another automation fires a named signal", "available": True,
@@ -140,6 +212,38 @@ TRIGGERS: list[dict] = [
          {"key": "signal_name", "type": "signal_input", "label": "Signal Name"}
      ],
      "variables": ["signal_name"]},
+    # Music requests: a profile without download rights asked for something.
+    {"type": "music_request_approved", "label": "Music Request Approved", "icon": "check-circle", "scope": "music",
+     "description": "When an admin approves a music request and it's queued for download", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "artist", "requester"],
+     "variables": ["kind", "title", "artist", "requester"]},
+    {"type": "music_request_declined", "label": "Music Request Declined", "icon": "x-circle", "scope": "music",
+     "description": "When an admin declines a music request", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "artist", "requester"],
+     "variables": ["kind", "title", "artist", "requester", "reason"]},
+    {"type": "music_request_available", "label": "Music Request Arrived", "icon": "check-circle", "scope": "music",
+     "description": "When music somebody requested is in the library", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "artist", "requester"],
+     "variables": ["kind", "title", "artist", "requester"]},
+    # Issues: reports from the people using the library (music and video).
+    {"type": "issue_created", "label": "Issue Reported", "icon": "alert-circle", "scope": "both",
+     "description": "When someone reports a problem with a track, album, artist, movie, show or episode", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["side", "category", "title", "reporter"],
+     "variables": ["side", "issue_id", "category", "title", "entity_type", "reporter"]},
+    {"type": "issue_status_changed", "label": "Issue Status Changed", "icon": "alert-circle", "scope": "both",
+     "description": "When an admin moves an issue to in progress, fixed or closed", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["side", "status", "category", "title"],
+     "variables": ["side", "issue_id", "status", "category", "title", "reporter"]},
+    {"type": "issue_commented", "label": "Issue Reply", "icon": "message-circle", "scope": "both",
+     "description": "When someone replies on an issue", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["side", "title", "author"],
+     "variables": ["side", "issue_id", "title", "author", "body"]},
     # Webhook trigger
     {"type": "webhook_received", "label": "Webhook Received", "icon": "globe", "scope": "both",
      "description": "When an external API request is received (POST /api/v1/request)", "available": True,
@@ -172,6 +276,16 @@ TRIGGERS: list[dict] = [
      "has_conditions": True,
      "condition_fields": ["title", "kind", "requester"],
      "variables": ["kind", "title", "requester"]},
+    {"type": "video_request_denied", "label": "Request Declined", "icon": "x-circle", "scope": "video",
+     "description": "When an admin declines a request (everyone who asked for the title)", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind", "requester"],
+     "variables": ["kind", "title", "requester", "reason"]},
+    {"type": "video_request_available", "label": "Request Arrived", "icon": "check-circle", "scope": "video",
+     "description": "When a title somebody requested shows up in the library", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind", "requester"],
+     "variables": ["kind", "title", "requester"]},
     {"type": "video_download_completed", "label": "Video Downloaded", "icon": "download", "scope": "video",
      "description": "When one movie, episode or YouTube video finishes downloading and lands in the library", "available": True,
      "has_conditions": True,
@@ -187,7 +301,7 @@ TRIGGERS: list[dict] = [
      "has_conditions": True,
      "condition_fields": ["title", "kind", "error"],
      "variables": ["kind", "title", "error", "dest_path"]},
-    {"type": "video_upgrade_completed", "label": "Quality Upgrade Landed", "icon": "trending-up", "scope": "video",
+    {"type": "video_upgrade_completed", "label": "Quality Upgrade Landed", "icon": "bar-chart", "scope": "video",
      "description": "When a download REPLACED an existing library copy with a better one", "available": True,
      "has_conditions": True,
      "condition_fields": ["title", "kind"],
@@ -236,6 +350,14 @@ ACTIONS: list[dict] = [
     {"type": "process_wishlist", "label": "Process Wishlist", "icon": "list", "description": "Retry failed downloads from wishlist", "available": True,
      "config_fields": [{"key": "category", "type": "select", "label": "Category", "options": [{"value": "all", "label": "All"}, {"value": "albums", "label": "Albums"}, {"value": "singles", "label": "Singles"}], "default": "all"}]},
     {"type": "scan_watchlist", "label": "Scan Watchlist", "icon": "eye", "description": "Check watched artists AND followed labels for new releases", "available": True},
+    {"type": "scan_watchlist_podcasts", "label": "Scan Watchlist Podcasts", "icon": "mic", "description": "Check watchlisted podcasts for new episodes and prune expired", "available": True},
+    {"type": "audiobook_scan_library", "label": "Scan Audiobook Library", "icon": "headphones",
+     "description": "Scan the audiobook folder set in Settings, including books added outside SoulSync. Read tags and sidecars, index local books, and reconcile missing files without changing files on disk.",
+     "available": True, "config_fields": [
+         {"key": "match_catalog", "type": "checkbox", "label": "Find catalogue matches after scanning", "default": True},
+         {"key": "match_batch_size", "type": "number", "label": "Books to match per run", "default": 25, "min": 1, "max": 100},
+     ]},
+    {"type": "metasync_refresh_charts", "label": "Refresh MetaSync Charts", "icon": "bar-chart", "description": "Fetch the SoulSync network's weekly charts from MetaSync and match them, ready to open. Never syncs or downloads.", "available": True},
     {"type": "scan_library", "label": "Scan Library", "icon": "refresh", "description": "Trigger media server library scan", "available": True},
     {"type": "refresh_mirrored", "label": "Refresh Mirrored Playlist", "icon": "copy", "description": "Re-fetch playlist from source and update mirror", "available": True,
      "config_fields": [
@@ -244,20 +366,25 @@ ACTIONS: list[dict] = [
      ]},
     {"type": "sync_playlist", "label": "Sync Playlist", "icon": "sync", "description": "Sync mirrored playlist to media server", "available": True,
      "config_fields": [
-         {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"}
+         {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"},
+         {"key": "all", "type": "checkbox", "label": "Sync all mirrored playlists", "default": False}
      ]},
-    {"type": "discover_playlist", "label": "Discover Playlist", "icon": "search", "description": "Find official Spotify/iTunes metadata for mirrored playlist tracks", "available": True,
+    {"type": "sync_downloaded_playlists", "label": "Sync Downloaded Playlists", "icon": "sync",
+     "description": "Automatically sync playlists whose downloaded batches just finished and were updated in the database",
+     "available": True},
+    {"type": "discover_playlist", "label": "Identify Playlist Tracks", "icon": "search", "description": "Find official Spotify/iTunes metadata for mirrored playlist tracks", "available": True,
      "config_fields": [
          {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"},
-         {"key": "all", "type": "checkbox", "label": "Discover all mirrored playlists", "default": False}
+         {"key": "all", "type": "checkbox", "label": "Identify all mirrored playlists", "default": False}
      ]},
     {"type": "playlist_pipeline", "label": "Playlist Pipeline", "icon": "rocket",
-     "description": "Full lifecycle: refresh → discover → sync → download missing. One automation for the entire flow.",
+     "description": "Full lifecycle: refresh → identify → sync → download missing. One automation for the entire flow.",
      "available": True,
      "config_fields": [
          {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"},
          {"key": "all", "type": "checkbox", "label": "Process all mirrored playlists", "default": False},
          {"key": "skip_wishlist", "type": "checkbox", "label": "Skip wishlist processing", "default": False},
+         {"key": "sync_mode", "type": "select", "label": "Sync mode", "options": _SYNC_MODE_OPTIONS, "default": ""},
      ]},
     {"type": "personalized_pipeline", "label": "Personalized Playlist Pipeline", "icon": "sparkles",
      "description": "Sync personalized / discover-page playlists (Hidden Gems, Time Machine, Fresh Tape, etc.) to your media server + queue missing tracks for download.",
@@ -267,6 +394,21 @@ ACTIONS: list[dict] = [
           "description": "Multi-select: Hidden Gems, Discovery Shuffle, Time Machine (per decade), Genre playlists, Fresh Tape, The Archives, Seasonal Mix (per season)"},
          {"key": "refresh_first", "type": "checkbox", "label": "Refresh playlists before sync (regenerate snapshots)", "default": False},
          {"key": "skip_wishlist", "type": "checkbox", "label": "Skip wishlist processing", "default": False},
+         {"key": "sync_mode", "type": "select", "label": "Sync mode", "options": _SYNC_MODE_OPTIONS, "default": ""},
+     ]},
+    {"type": "import_lastfm_listening", "label": "Import Last.fm Listening", "icon": "activity",
+     "description": "Pull Last.fm scrobbles into SoulSync listening history so Stats and discovery stay current.",
+     "available": True,
+     "config_fields": [
+         {"key": "username", "type": "text", "label": "Username", "placeholder": "Blank = authorized Last.fm user"},
+         {"key": "full", "type": "checkbox", "label": "Force full backfill", "default": False},
+     ]},
+    {"type": "import_listenbrainz_listening", "label": "Import ListenBrainz Listening", "icon": "activity",
+     "description": "Pull ListenBrainz / Maloja listens into SoulSync listening history so Stats and discovery stay current.",
+     "available": True,
+     "config_fields": [
+         {"key": "username", "type": "text", "label": "Username", "placeholder": "Blank = authorized user or token user"},
+         {"key": "full", "type": "checkbox", "label": "Force full backfill", "default": False},
      ]},
     {"type": "notify_only", "label": "Notify Only", "icon": "bell", "scope": "both", "description": "No action — just send notification", "available": True},
     # Phase 3 actions
@@ -279,12 +421,40 @@ ACTIONS: list[dict] = [
      "description": "Scan for and remove duplicate files", "available": True},
     {"type": "clear_quarantine", "label": "Clear Quarantine", "icon": "trash",
      "description": "Delete all quarantined files", "available": True},
+    {"type": "library_cleanup", "label": "Clear Quarantine + Empty Recycle Bin", "icon": "trash",
+     "description": "One sweep for both bins: delete the download quarantine, then empty the recycle bin "
+                    "(files deleted by the duplicate cleaner and repair tools). The recycle bin honours the keep "
+                    "window set on the Downloads page's Recycle Bin tab; with the window on 'keep forever' it "
+                    "empties the whole bin. Either half can be switched off. The seeded 'Weekly Cleanup' "
+                    "automation runs this and ships switched off.",
+     "available": True,
+     "config_fields": [
+         {"key": "quarantine", "type": "checkbox", "label": "Clear the download quarantine", "default": True},
+         {"key": "recycle_bin", "type": "checkbox", "label": "Empty the recycle bin", "default": True},
+     ]},
     {"type": "cleanup_wishlist", "label": "Clean Up Wishlist", "icon": "filter",
      "description": "Remove duplicate/owned tracks from wishlist", "available": True},
     {"type": "update_discovery_pool", "label": "Update Discovery", "icon": "compass",
      "description": "Refresh discovery pool with new tracks", "available": True},
     {"type": "start_quality_scan", "label": "Run Quality Scan", "icon": "bar-chart",
      "description": "Run the Quality Upgrade Finder (scope is set in Library Maintenance)", "available": True},
+    # Library Maintenance from an automation (music twin of video_run_repair_job).
+    # The job list is filled from the repair-job registry in blocks_for_scope.
+    {"type": "run_repair_job", "label": "Run Maintenance Job", "icon": "tool",
+     "description": "Run one Library Maintenance job (or every job switched on in Tools). Findings appear on the Tools page; pair with the 'Maintenance Finding Raised' trigger for alerts.",
+     "available": True,
+     "config_fields": [
+         {"key": "job_id", "type": "select", "label": "Job",
+          "options": [{"value": "all", "label": "All enabled jobs"}],
+          "default": "all"}]},
+    {"type": "apply_quality_upgrades", "label": "Apply Quality Upgrades", "icon": "arrow-up-circle",
+     "description": "Queue the Quality Upgrade Finder's better versions on the wishlist, only for tracks whose quality profile is set to keep upgrading until its cutoff. Pair with a nightly schedule.",
+     "available": True,
+     "config_fields": [{"key": "limit", "label": "Most per run", "type": "number", "default": 100}]},
+    {"type": "check_deezer_signin", "label": "Check Deezer Sign-in", "icon": "key",
+     "description": "Ask Deezer whether the ARL still signs in. A dead ARL fires 'Deezer Sign-in Failed'; "
+                    "a dropped connection does not. The seeded 'Check Deezer Sign-in' runs this every 6 hours.",
+     "available": True, "scope": "music"},
     {"type": "backup_database", "label": "Backup Database", "icon": "save",
      "description": "Create timestamped database backup", "available": True},
     {"type": "refresh_beatport_cache", "label": "Refresh Beatport Cache", "icon": "music",
@@ -297,10 +467,20 @@ ACTIONS: list[dict] = [
      "description": "Radarr's seed-until-done tail for music torrents: once a completed torrent grab reaches your seed ratio or seed time goal (Settings → Downloads), remove it from the torrent client — including the client's copy of the file (your imported library copy is separate and never touched). Off until you set a goal. Pair with a half-hourly schedule.", "available": True},
     {"type": "full_cleanup", "label": "Full Cleanup", "icon": "trash",
      "description": "Clear quarantine, download queue, import folder, and search history in one sweep", "available": True},
+    {"type": "start_database_update_hourly", "label": "Update Database (Hourly)", "icon": "database",
+     "description": "The same incremental server-read on an hourly schedule, so music added to the library by hand (which Plex/Jellyfin/Navidrome index on their own) appears within the hour instead of waiting for the weekly deep scan. Pair with a 1-hour Schedule trigger.", "available": True},
     {"type": "deep_scan_library", "label": "Deep Scan Library", "icon": "search",
      "description": "Full library comparison without losing enrichment data", "available": True},
     {"type": "run_script", "label": "Run Script", "icon": "terminal", "scope": "both",
      "description": "Execute a script from the scripts folder", "available": True},
+    {"type": "complete_incomplete_albums", "label": "Complete Incomplete Albums", "icon": "disc",
+     "description": "Queue missing tracks for incomplete albums using their pinned canonical releases. Requires an Album Completeness scan; never replaces existing tracks.",
+     "available": True, "scope": "music",
+     "config_fields": [
+         {"key": "max_albums", "type": "number", "label": "Maximum albums per run", "default": 3},
+         {"key": "target_album_id", "type": "text", "label": "Target Album ID (optional)",
+          "placeholder": "Leave blank to complete any eligible album"}
+     ]},
     {"type": "search_and_download", "label": "Search & Download", "icon": "download",
      "description": "Search for a track and download the best match", "available": True,
      "config_fields": [
@@ -373,6 +553,8 @@ ACTIONS: list[dict] = [
      ]},
     {"type": "video_clean_youtube_episodes", "label": "Clean Old YouTube Episodes", "icon": "trash", "scope": "video",
      "description": "Delete downloaded YouTube channel episodes that fall outside each channel's keep window (set per channel via its cog → Keep: e.g. last 30 episodes / last 3–6 months). Removes the video + its sidecars but keeps the history record so it's never re-downloaded. No-op for channels left on 'keep everything' (the default). Playlists are excluded. Pair with a daily Schedule.", "available": True},
+    {"type": "video_purge_recycle_bin", "label": "Empty Recycle Bin", "icon": "trash", "scope": "video",
+     "description": "Delete recycled files older than the keep window set in Settings, Library Organization. The bin is where every video delete lands (upgrade replaces, YouTube retention, watched cleanup) so this is what actually reclaims the disk. Age is measured from when the file was recycled, not its original date.", "available": True},
     {"type": "video_add_airing_episodes", "label": "Wishlist Today's Airings", "icon": "calendar", "scope": "video",
      "description": "Sonarr-style: add every episode airing today (for shows you follow) to the wishlist, skipping ones you already own. Also tidies the watchlist by dropping shows that have ended/been canceled.", "available": True,
      "config_fields": [
@@ -390,17 +572,26 @@ ACTIONS: list[dict] = [
      "description": "For every YouTube playlist you follow, wishlist the newest N (the 'videos to grab' setting on Settings → Library) on the first scan, then only videos newly added to it — the same rule as channels, no whole-list flood. Each playlist becomes its own show in the library (playlist-as-show). Shorts excluded. Pair with a schedule.", "available": True},
     # Stage 2 — processors that DRAIN the wishlist by downloading.
     {"type": "video_process_movie_wishlist", "label": "Process Movie Wishlist", "icon": "download", "scope": "video",
-     "description": "Auto-grab your wished, released MOVIES from Soulseek: searches each, picks the best release per your quality profile, and downloads it (the monitor finishes + organises it). Skips unreleased ('monitored') ones and any already downloading. Needs the Movie library folder + slskd set. Pair with an hourly schedule.", "available": True,
+     "description": "Auto-grab your wished, released MOVIES from Soulseek: searches each, picks the best release per your quality profile, and downloads it (the monitor finishes + organises it). Skips unreleased ('monitored') ones and any already downloading. Needs the Movie library folder + slskd set. Pair with an hourly schedule. One run hands at most 'Max downloads per run' items (default 3) to the download clients — the rest stay wishlisted for the next run.", "available": True,
      "config_fields": [
-         {"key": "max_concurrent", "type": "number", "label": "Max simultaneous searches", "default": 3, "min": 1}
+         {"key": "max_concurrent", "type": "number", "label": "Max simultaneous searches", "default": 3, "min": 1},
+         {"key": "max_simultaneous_downloads", "type": "number", "label": "Max downloads per run", "default": 3, "min": 1,
+          "description": "Caps how many items one drain run hands to the download clients; the rest wait for the next run. Does not affect RSS Sync or manual grabs."}
      ]},
     {"type": "video_process_episode_wishlist", "label": "Process Episode Wishlist", "icon": "download", "scope": "video",
-     "description": "Auto-grab your wished EPISODES from Soulseek: searches each, picks the best release per your quality profile, and downloads it. Fed by the 'Wishlist Today's Airings' scan. Needs the TV library folder + slskd set. Pair with an hourly schedule.", "available": True,
+     "description": "Auto-grab your wished EPISODES from Soulseek: searches each, picks the best release per your quality profile, and downloads it. Fed by the 'Wishlist Today's Airings' scan. Needs the TV library folder + slskd set. Pair with an hourly schedule. One run hands at most 'Max downloads per run' items (default 3) to the download clients — the rest wait for the next run.", "available": True,
      "config_fields": [
-         {"key": "max_concurrent", "type": "number", "label": "Max simultaneous searches", "default": 3, "min": 1}
+         {"key": "max_concurrent", "type": "number", "label": "Max simultaneous searches", "default": 3, "min": 1},
+         {"key": "max_simultaneous_downloads", "type": "number", "label": "Max downloads per run", "default": 3, "min": 1,
+          "description": "Caps how many items one drain run hands to the download clients; the rest wait for the next run. Does not affect RSS Sync or manual grabs."}
      ]},
     {"type": "video_rss_sync", "label": "RSS Sync (Instant Grabs)", "icon": "download", "scope": "video",
-     "description": "Sonarr-speed acquisition: every few minutes, pull your indexers' newest releases from Prowlarr (one aggregate call, no searching) and instantly grab any that match your wishlist — a wanted episode lands minutes after it's posted instead of at the next hourly drain. Respects your quality profile, upgrade cutoff, blocklist and download mode (needs torrent/usenet enabled + Prowlarr). Pair with a 15-minute schedule.", "available": True},
+     "description": "Sonarr-speed acquisition: every few minutes, pull your indexers' newest releases from Prowlarr (one aggregate call, no searching) and instantly grab any that match your wishlist — a wanted episode lands minutes after it's posted instead of at the next hourly drain. Respects your quality profile, upgrade cutoff, blocklist and download mode (needs torrent/usenet enabled + Prowlarr). Pair with a 15-minute schedule. Grabs new feed matches on sight — it is NOT subject to the Process Movie/Episode Wishlist 'Max downloads per run' cap.", "available": True},
+    {"type": "video_extto_fresh_refresh", "label": "Refresh Fresh Releases", "icon": "download", "scope": "video",
+     "description": "Keep Search \u2192 Fresh Releases warm: pull the EXT.to board, match every release against its own detail page (poster, IMDb id + rating, genres, runtime), and store the result so the tab opens instantly instead of waiting on Cloudflare. Matched releases are cached by release, so an hourly run only pays for what is genuinely new \u2014 the first run is the slow one. The Refresh button on the tab does exactly this on demand. Needs FlareSolverr. Pair with an hourly schedule.", "available": True,
+     "config_fields": [
+         {"key": "max_new_details", "type": "number", "label": "Max new releases to match per run", "default": 40, "min": 1}
+     ]},
     {"type": "video_import_lists", "label": "Sync Import Lists", "icon": "list", "scope": "video",
      "description": "Radarr/Sonarr Import Lists: everything on your configured external lists (TMDB lists, TMDB/IMDb charts, IMDb user lists, your Plex account watchlist) enters acquisition automatically — movies wishlist, shows follow with the list's monitor policy. Only NEW list members are added, so removing something you didn't want never boomerangs back. Configure lists on Settings → Downloads. Pair with a 6-hourly schedule.", "available": True},
     {"type": "video_seeding_sweep", "label": "Seeding Sweep", "icon": "download", "scope": "video",
@@ -449,7 +640,8 @@ ACTIONS: list[dict] = [
                       {"value": "wishlist_audit", "label": "Wishlist Audit"},
                       {"value": "youtube_ghosts", "label": "YouTube Ghost Files"},
                       {"value": "watched_cleanup", "label": "Watched Cleanup"},
-                      {"value": "naming_conformance", "label": "Naming Conformance"}],
+                      {"value": "naming_conformance", "label": "Naming Conformance"},
+                      {"value": "missing_subtitles", "label": "Missing Subtitles"}],
           "default": "all"}
      ]},
 ]
@@ -461,6 +653,10 @@ NOTIFICATIONS: list[dict] = [
     {"type": "pushbullet", "label": "Pushbullet", "icon": "push", "scope": "both", "description": "Push notification to phone/desktop", "available": True,
      "variables": ["time", "name", "run_count", "status"]},
     {"type": "telegram", "label": "Telegram", "icon": "message", "scope": "both", "description": "Send a Telegram message", "available": True,
+     "variables": ["time", "name", "run_count", "status"]},
+    {"type": "ntfy", "label": "ntfy", "icon": "push", "scope": "both", "description": "Publish to an ntfy topic", "available": True,
+     "variables": ["time", "name", "run_count", "status"]},
+    {"type": "gotify", "label": "Gotify", "icon": "push", "scope": "both", "description": "Send a message to your Gotify server", "available": True,
      "variables": ["time", "name", "run_count", "status"]},
     {"type": "webhook", "label": "Webhook (POST)", "icon": "globe", "scope": "both", "description": "Send a POST request to any URL", "available": True,
      "variables": ["time", "name", "run_count", "status"]},
@@ -487,14 +683,99 @@ def _in_scope(block: dict, scope: str) -> bool:
     return s == "both" or s == scope
 
 
+# Which drawer of the builder palette a block belongs in.
+#
+# The sidebar was three flat, unsearchable lists — 45 triggers and 52 actions,
+# every one a full-width row. Finding "Playlist Synced" meant scrolling past
+# twenty other triggers.
+#
+# Rules rather than 100 hand-written entries: ORDER MATTERS, first match wins,
+# and the whole taxonomy stays readable in one screen. A type that matches
+# nothing lands in "Other", which is visible rather than silent —
+# tests/test_automation_block_categories.py fails if anything ends up there.
+_CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
+    # Exact-ish first: these would otherwise be caught by a keyword below.
+    ("Timing", ("schedule", "daily_time", "weekly_time", "monthly_time", "app_started")),
+    ("External", ("signal_received", "webhook_received", "fire_signal")),
+    ("Notify", ("discord_webhook", "pushbullet", "telegram", "ntfy", "gotify", "webhook", "notify_only")),
+    ("Advanced", ("run_script",)),
+    # Then keywords, most specific first.
+    ("Maintenance", ("repair", "duplicate", "quality", "cleanup", "clean_", "_clean",
+                     "expired", "backup", "cache", "overlays", "plex_images",
+                     # emptying the recycle bin is cleanup; the EXT.to fresh-board
+                     # refresh is a cache warmer (same family as refresh_beatport_cache)
+                     "recycle", "extto_fresh")),
+    ("Wishlist", ("wishlist",)),
+    ("Watchlist", ("watchlist", "author", "new_release")),
+    ("Playlists", ("playlist", "mirrored", "discover", "collections", "personalized",
+                   # MetaSync's SIN charts arrive as playlists
+                   "metasync")),
+    ("Downloads", ("download", "grab", "batch", "import", "rss", "seeding", "deezer_signin",
+                   "quarantine", "request", "search_and", "upgrade")),
+    ("Library", ("scan", "database", "library", "enrich", "airing", "retag", "youtube", "issue",
+                 # filling out albums you already own (#1711)
+                 "incomplete_albums")),
+]
+
+
+def block_category(block_type: str) -> str:
+    """The palette drawer a block sits in. Unknown types are grouped, not hidden."""
+    name = block_type or ""
+    for category, needles in _CATEGORY_RULES:
+        if any(needle in name for needle in needles):
+            return category
+    return "Other"
+
+
+#: Drawer order in the sidebar — timing first because every automation starts
+#: with "when", then the things people automate most.
+CATEGORY_ORDER = [
+    "Timing", "Downloads", "Library", "Playlists", "Wishlist", "Watchlist",
+    "Maintenance", "External", "Notify", "Advanced", "Other",
+]
+
+
+def _repair_job_options() -> list[dict]:
+    """Every registered music maintenance job, for the Run Maintenance Job picker.
+
+    Read from the registry rather than typed out, so a new job is selectable
+    the day it ships. Falls back to "All" alone if the jobs can't be imported.
+    """
+    options = [{"value": "all", "label": "All enabled jobs"}]
+    try:
+        from core.repair_jobs import get_all_jobs
+        jobs = sorted(get_all_jobs().values(), key=lambda job: job.display_name.lower())
+        options += [{"value": job.job_id, "label": job.display_name} for job in jobs]
+    except Exception as exc:                                # noqa: BLE001
+        logger.debug("Could not load repair-job options: %s", exc)
+    return options
+
+
+def _with_live_options(block: dict) -> dict:
+    if block.get("type") != "run_repair_job":
+        return block
+    fields = [dict(field, options=_repair_job_options()) if field.get("key") == "job_id" else field
+              for field in block.get("config_fields", [])]
+    return {**block, "config_fields": fields}
+
+
 def blocks_for_scope(scope: str = "music") -> dict:
     """Return the trigger/action/notification lists filtered to one side.
 
     ``scope="music"`` reproduces the pre-scope behaviour (everything except
     video-only blocks); ``scope="video"`` returns generic + video-only blocks.
+
+    Each block is copied with a ``category`` so the builder can group the
+    palette without re-deriving the taxonomy in JavaScript — one source of
+    truth, and the video builder gets it for free.
     """
+    def _tagged(blocks):
+        return [{**_with_live_options(b), "category": block_category(b.get("type", ""))}
+                for b in blocks if _in_scope(b, scope)]
+
     return {
-        "triggers": [b for b in TRIGGERS if _in_scope(b, scope)],
-        "actions": [b for b in ACTIONS if _in_scope(b, scope)],
-        "notifications": [b for b in NOTIFICATIONS if _in_scope(b, scope)],
+        "triggers": _tagged(TRIGGERS),
+        "actions": _tagged(ACTIONS),
+        "notifications": _tagged(NOTIFICATIONS),
+        "category_order": CATEGORY_ORDER,
     }
