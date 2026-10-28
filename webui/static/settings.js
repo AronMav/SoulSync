@@ -752,7 +752,7 @@ const SERVICE_GLYPHS = {
 const SERVICE_GROUPS = {
     music: [
         { label: 'Metadata', hint: 'artists, albums and tracks',
-          ids: ['musicbrainz', 'spotify', 'itunes', 'deezer', 'discogs', 'tidal', 'qobuz', 'hydrabase'] },
+          ids: ['musicbrainz', 'spotify', 'itunes', 'deezer', 'yandex', 'discogs', 'tidal', 'qobuz', 'hydrabase'] },
         { label: 'Scrobbling', hint: 'listening history and recommendations',
           ids: ['lastfm', 'listenbrainz'] },
         { label: 'Extras', hint: 'lyrics, concerts, fingerprint checks and cover art',
@@ -6768,7 +6768,7 @@ async function saveSettings(quiet = false) {
             tags: _collectServiceTags('itunes')
         },
         yandex: {
-            token: document.getElementById('yandex-token')?.value || '',
+            token: _cfgStr('yandex-token'),
         },
         discogs: {
             token: document.getElementById('discogs-token').value,
