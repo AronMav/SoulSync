@@ -5685,12 +5685,6 @@ class MusicDatabase:
                     cursor.execute(f"ALTER TABLE {table} ADD COLUMN yandex_match_status TEXT")
                 if "yandex_last_attempted" not in columns:
                     cursor.execute(f"ALTER TABLE {table} ADD COLUMN yandex_last_attempted TIMESTAMP")
-                cursor.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{table}_yandex_id ON {table} (yandex_id)"
-                )
-                cursor.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{table}_yandex_status ON {table} (yandex_match_status)"
-                )
             except Exception as e:
                 logger.error(f"Error adding Yandex columns to {table}: {e}")
 

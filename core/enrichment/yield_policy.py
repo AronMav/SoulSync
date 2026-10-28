@@ -51,6 +51,7 @@ SERVICE_YIELD_NAMES = {
     'audiodb': 'audiodb',
     'discogs': 'discogs',
     'deezer': 'deezer',
+    'yandex': 'yandex',
     'jiosaavn': 'jiosaavn',
     'spotify': 'spotify-enrichment',
     'itunes': 'itunes-enrichment',
