@@ -257,9 +257,9 @@
             || document.querySelector('.music-player-panel');
         if (!player || player.querySelector('.nd-del-player')) return;
 
-        // Only show the button once something is actually playing. The id itself
-        // is deliberately NOT captured here — see currentPlayingId().
-        if (!currentPlayingId()) return;
+        // The button stays visible whenever the player bar exists: hiding it
+        // while nothing plays made the control look broken (Navidrome draws
+        // the bar before a track starts). The id is resolved on click.
 
         // The row is a flat list of `span.group` slots (volume, loop, lyrics,
         // queue, destroy), so match that shape instead of dropping a bare

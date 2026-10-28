@@ -3311,6 +3311,9 @@ async function loadSettingsData() {
         document.getElementById('itunes-country').value = settings.itunes?.country || 'US';
 
         // Populate Discogs settings
+        // Yandex Music: one token powers metadata, search, new releases and downloads
+        const _yandexTokenInput = document.getElementById('yandex-token');
+        if (_yandexTokenInput) _yandexTokenInput.value = settings.yandex?.token || '';
         document.getElementById('discogs-token').value = settings.discogs?.token || '';
 
         // Populate Metadata source setting. 'Spotify Free' is stored as
@@ -6763,6 +6766,9 @@ async function saveSettings(quiet = false) {
             country: document.getElementById('itunes-country').value || 'US',
             embed_tags: document.getElementById('embed-itunes').checked,
             tags: _collectServiceTags('itunes')
+        },
+        yandex: {
+            token: document.getElementById('yandex-token')?.value || '',
         },
         discogs: {
             token: document.getElementById('discogs-token').value,
